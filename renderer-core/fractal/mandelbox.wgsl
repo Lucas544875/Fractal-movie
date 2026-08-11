@@ -1,4 +1,4 @@
-const MAX_FRACTAL_ITERATIONS: u32 = 64u;
+const MAX_FRACTAL_ITERATIONS: u32 = 128u;
 
 // Mandelbox distance estimator ported from the portfolio WebGL page.
 // fractal_primary: x=scale, y=min radius², z=fixed radius², w=fold limit.

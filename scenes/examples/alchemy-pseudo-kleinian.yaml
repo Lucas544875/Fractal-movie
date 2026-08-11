@@ -1,0 +1,131 @@
+version: 1
+name: alchemy-pseudo-kleinian
+precision: f32
+seed: 20260811
+
+# Camera values are transcribed from alchemy.fract (Mandelbulber 2.26).
+camera:
+  position: [1.5525534530, 0.7731444559, 2.3163748925]
+  target: [1.9631059978, 1.3969453485, 2.0551372989]
+  up: [0.1818096677, 0.2756373131, 0.9439117100]
+  vertical_fov_degrees: 14.04
+  # Deliberately shallow macro focus: focus comes from the source settings,
+  # while aperture is art-directed for this renderer's thin-lens model.
+  aperture_radius: 0.005
+  focus_distance: 0.7787810564
+
+# Mandelbulber's formula IDs are Amazing Surf (73) and Mandelbox (8).
+# Amazing Surf is a Kali/PseudoKleinian-derived X/Y fold. The fixed Julia
+# recurrence uses the source julia_c multiplied by fractal_constant_factor 0.9.
+fractal:
+  kind: dsl
+  parameters:
+    iterations: 125
+    # Geometry stops at N=125, while Mandelbulber repeats the 120-iteration
+    # hybrid schedule and evaluates surface coloring with N*4 iterations.
+    orbit_period: 120
+    color_iterations: 500
+    bailout: 100.0
+    normal_epsilon: 2.5e-6
+    orbit:
+      - op: amazing-surf-fold
+        start_iteration: 0
+        stop_iteration: 20
+        limits: [0.985, 0.985]
+        minimum_radius_squared: 0.0
+        scale: 1.0
+        rotation_degrees: [0.0, 90.0, 0.0]
+      - op: mandelbox-julia-fold
+        start_iteration: 20
+        stop_iteration: 120
+        fold_limit: 1.0
+        min_radius_squared: 0.04
+        fixed_radius_squared: 1.0
+        scale: -1.15
+        constant: [1.8079716023, 1.3327508580, 1.9122450043]
+        rotation_degrees: [-1.811288, 1.112361, 7.052841]
+    material:
+      # The source gradient order is retained, but its broad blue-grey interval
+      # is narrowed and warmed to compensate for this DSL's different aux-color
+      # distribution. White/silver remains a short band that reads as inlaid
+      # metal and point highlights instead of covering whole surfaces.
+      base_color: [0.12, 0.045, 0.012]
+      accent_color: [1.0, 0.75, 0.12]
+      surface_palette:
+        - { position: 0.0,    color: [0.12, 0.055, 0.025] }
+        - { position: 0.1,    color: [0.38, 0.170, 0.060] }
+        - { position: 0.2,    color: [1.00, 0.780, 0.180] }
+        - { position: 0.3,    color: [0.88, 0.420, 0.070] }
+        - { position: 0.4,    color: [0.10, 0.040, 0.020] }
+        - { position: 0.4593, color: [0.34, 0.130, 0.045] }
+        - { position: 0.58,   color: [0.50, 0.340, 0.180] }
+        - { position: 0.60,   color: [0.75, 0.780, 0.820] }
+        - { position: 0.68,   color: [0.98, 0.980, 0.980] }
+        - { position: 0.72,   color: [0.25, 0.075, 0.020] }
+        - { position: 0.8,    color: [1.00, 0.780, 0.320] }
+        - { position: 0.9,    color: [0.64, 0.320, 0.055] }
+        - { position: 1.0,    color: [0.12, 0.055, 0.025] }
+      # alchemy.fract enables only aux-color in its extra-color controls.
+      # Mandelbox fold events therefore drive the palette; spatial color is off.
+      orbit_palette_weight: 1.0
+      palette_offset: 0.0
+      specular_color: [1.0, 1.0, 1.0]
+      background_bottom: [0.008, 0.012, 0.10]
+      background_top: [0.035, 0.059, 0.09]
+      color_frequency: 18.0
+      camera_palette_weight: 0.0
+      normal_palette_weight: 0.0
+      ambient_strength: 0.28
+      # light1_intensity=0.8 is folded into the three direct-light terms.
+      diffuse_strength: 0.8
+      # Mandelbulber uses 30 / width for its exponent: plastic width 0.1
+      # gives 300, while the default metallic width 1.0 gives 30.
+      # Raised above 0.32 * light1_intensity to survive thin-lens averaging as
+      # the source image's small white, gem-like highlights.
+      specular_strength: 0.65
+      shininess: 300.0
+      metallic_specular_strength: 3.2
+      metallic_shininess: 30.0
+      rim_strength: 0.0
+      fog_density: 0.065
+
+light:
+  # Derived from light1_rotation [25.76, 37.98, 0] in the source camera basis.
+  direction: [0.027485, -0.580573, 0.813744]
+
+render:
+  width: 1620
+  height: 1080
+  max_steps: 768
+  max_distance: 9.86698
+  epsilon: 2.0e-7
+  step_safety: 0.78
+  pixel_epsilon_multiplier: 0.72
+
+quality:
+  samples_per_pixel: 128
+  ambient_occlusion:
+    max_steps: 96
+    radius: 0.12
+    strength: 0.88
+  soft_shadow:
+    max_steps: 128
+    angular_radius_degrees: 2.2
+    max_distance: 1.8
+  reflection:
+    max_steps: 0
+    max_distance: 1.4
+    strength: 0.0
+    roughness: 0.025
+  tone_mapping:
+    enabled: true
+    operator: mandelbulber
+    exposure_stops: 0.0
+    white_point: 6.0
+    # Source values are brightness=1.4 and contrast=1.21. These compensated
+    # values retain more shadow detail because this renderer lacks the source's
+    # additive multi-ray AO light contribution.
+    brightness: 1.20
+    contrast: 1.08
+    gamma: 1.4
+    saturation: 0.82

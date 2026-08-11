@@ -19,9 +19,12 @@ pub use config::{
     AmbientOcclusionConfig, CameraConfig, FractalConfig, FractalKind, LightConfig,
     MAX_SAMPLES_PER_PIXEL, MAX_SECONDARY_RAY_STEPS, MIN_QUAD_CAMERA_DISTANCE, MandelboxConfig,
     MandelbulbConfig, Precision, QualityConfig, ReflectionConfig, RenderConfig, RenderSettings,
-    SoftShadowConfig, ToneMappingConfig,
+    SoftShadowConfig, ToneMappingConfig, ToneMappingOperator,
 };
-pub use dsl::{DslFractalConfig, DslMaterial, MAX_DSL_TRANSFORMS, OrbitTransform};
+pub use dsl::{
+    DslFractalConfig, DslMaterial, DslPaletteStop, MAX_DSL_COLOR_ITERATIONS, MAX_DSL_PALETTE_STOPS,
+    MAX_DSL_TRANSFORMS, OrbitTransform,
+};
 pub use fractal::{DistanceEstimator, HighPrecisionDistanceEstimator};
 pub use path::{ExponentialDivePath, PathTarget, TargetPicker, TargetSearchConfig};
 pub use precision::{Qf32, QfParseError, QfVec3};

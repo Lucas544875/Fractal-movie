@@ -6,8 +6,8 @@ use crate::{DslFractalConfig, QfVec3};
 pub const MAX_IMAGE_DIMENSION: u32 = 8_192;
 pub const MAX_PIXEL_COUNT: u64 = 33_554_432;
 pub const MAX_RAY_STEPS: u32 = 1_024;
-pub const MAX_FRACTAL_ITERATIONS: u32 = 96;
-pub const MAX_SAMPLES_PER_PIXEL: u32 = 64;
+pub const MAX_FRACTAL_ITERATIONS: u32 = 128;
+pub const MAX_SAMPLES_PER_PIXEL: u32 = 128;
 pub const MAX_SECONDARY_RAY_STEPS: u32 = 256;
 /// Deepest camera-to-target separation validated for the built-in quad-float
 /// Mandelbox path. One decade deeper reaches the representation's guard-bit
@@ -172,12 +172,26 @@ pub struct ReflectionConfig {
     pub roughness: f32,
 }
 
-/// Extended Reinhard photographic tone reproduction.
+/// Output transform applied after the sample accumulation pass.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ToneMappingOperator {
+    /// Luminance-preserving extended Reinhard photographic tone reproduction.
+    #[default]
+    ExtendedReinhard,
+    /// Mandelbulber's brightness, contrast, HDR tanh, saturation, then gamma pipeline.
+    Mandelbulber,
+}
+
 #[derive(Clone, Debug)]
 pub struct ToneMappingConfig {
     pub enabled: bool,
+    pub operator: ToneMappingOperator,
     pub exposure_stops: f32,
     pub white_point: f32,
+    pub brightness: f32,
+    pub contrast: f32,
+    pub gamma: f32,
+    pub saturation: f32,
 }
 
 /// Offline sampling and secondary-light transport controls.
@@ -212,8 +226,13 @@ impl Default for QualityConfig {
             },
             tone_mapping: ToneMappingConfig {
                 enabled: false,
+                operator: ToneMappingOperator::ExtendedReinhard,
                 exposure_stops: 0.0,
                 white_point: 4.0,
+                brightness: 1.0,
+                contrast: 1.0,
+                gamma: 1.0,
+                saturation: 1.0,
             },
         }
     }
@@ -387,6 +406,14 @@ impl RenderConfig {
             bail!("tone_mapping.exposure_stops must be finite and in -20.0..=20.0");
         }
         finite_positive("tone_mapping.white_point", quality.tone_mapping.white_point)?;
+        finite_positive("tone_mapping.brightness", quality.tone_mapping.brightness)?;
+        finite_positive("tone_mapping.contrast", quality.tone_mapping.contrast)?;
+        finite_positive("tone_mapping.gamma", quality.tone_mapping.gamma)?;
+        if !quality.tone_mapping.saturation.is_finite()
+            || !(0.0..=4.0).contains(&quality.tone_mapping.saturation)
+        {
+            bail!("tone_mapping.saturation must be finite and in 0.0..=4.0");
+        }
         finite_coordinate("camera position", self.camera.position)?;
         finite_coordinate("camera target", self.camera.target)?;
         finite_vector("camera up", self.camera.up)?;

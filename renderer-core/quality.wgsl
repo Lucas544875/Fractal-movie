@@ -73,6 +73,36 @@ fn tone_map(color_value: vec3<f32>) -> vec3<f32> {
         return clamp(color, vec3<f32>(0.0), vec3<f32>(1.0));
     }
     color *= exp2(uniforms.tone_mapping.x);
+
+    // Mandelbulber 2.26's image pipeline operates in display-coded RGB:
+    // brightness -> contrast -> HDR tanh -> saturation -> gamma. The render
+    // target performs an sRGB transfer, so convert back to linear before return.
+    if uniforms.tone_mapping.w >= 0.5 {
+        color *= uniforms.image_adjustments.x;
+        color = max(
+            (color - vec3<f32>(0.5)) * uniforms.image_adjustments.y
+                + vec3<f32>(0.5),
+            vec3<f32>(0.0),
+        );
+        color = tanh(color);
+        let saturation_value = sqrt(dot(
+            color * color,
+            vec3<f32>(0.299, 0.587, 0.114),
+        ));
+        color = vec3<f32>(saturation_value)
+            + (color - vec3<f32>(saturation_value)) * uniforms.image_adjustments.w;
+        let display_color = pow(
+            clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)),
+            vec3<f32>(1.0 / uniforms.image_adjustments.z),
+        );
+        let low = display_color / vec3<f32>(12.92);
+        let high = pow(
+            (display_color + vec3<f32>(0.055)) / vec3<f32>(1.055),
+            vec3<f32>(2.4),
+        );
+        return select(high, low, display_color <= vec3<f32>(0.04045));
+    }
+
     let luminance = dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
     if luminance <= 1.0e-8 {
         return color;

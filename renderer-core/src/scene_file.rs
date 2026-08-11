@@ -5,9 +5,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AmbientOcclusionConfig, AnimationConfig, AnimationPath, CameraConfig, DslFractalConfig,
-    DslMaterial, ExponentialDivePath, FractalConfig, LightConfig, MandelboxConfig,
+    DslMaterial, DslPaletteStop, ExponentialDivePath, FractalConfig, LightConfig, MandelboxConfig,
     MandelbulbConfig, OrbitTransform, Precision, Qf32, QfVec3, QualityConfig, ReflectionConfig,
-    RenderConfig, RenderSettings, SoftShadowConfig, ToneMappingConfig, VideoConfig,
+    RenderConfig, RenderSettings, SoftShadowConfig, ToneMappingConfig, ToneMappingOperator,
+    VideoConfig,
 };
 
 pub const CURRENT_SCENE_VERSION: u32 = 1;
@@ -127,6 +128,10 @@ struct SceneMandelbox {
 struct SceneDslFractal {
     iterations: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    orbit_period: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    color_iterations: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     bailout: Option<f32>,
     normal_epsilon: f32,
     orbit: Vec<SceneOrbitTransform>,
@@ -137,6 +142,24 @@ struct SceneDslFractal {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "kebab-case", deny_unknown_fields)]
 enum SceneOrbitTransform {
+    AmazingSurfFold {
+        start_iteration: u32,
+        stop_iteration: u32,
+        limits: [f32; 2],
+        minimum_radius_squared: f32,
+        scale: f32,
+        rotation_degrees: [f32; 3],
+    },
+    MandelboxJuliaFold {
+        start_iteration: u32,
+        stop_iteration: u32,
+        fold_limit: f32,
+        min_radius_squared: f32,
+        fixed_radius_squared: f32,
+        scale: f32,
+        constant: [f32; 3],
+        rotation_degrees: [f32; 3],
+    },
     BoxFold {
         limit: f32,
     },
@@ -146,6 +169,10 @@ enum SceneOrbitTransform {
     },
     ScaleAddPoint {
         scale: f32,
+    },
+    ScaleAddConstant {
+        scale: f32,
+        constant: [f32; 3],
     },
     Rotate {
         axis: [f32; 3],
@@ -165,14 +192,26 @@ struct SceneDslMaterial {
     background_bottom: [f32; 3],
     background_top: [f32; 3],
     color_frequency: f32,
+    surface_palette: Vec<SceneDslPaletteStop>,
+    orbit_palette_weight: f32,
+    palette_offset: f32,
     camera_palette_weight: f32,
     normal_palette_weight: f32,
     ambient_strength: f32,
     diffuse_strength: f32,
     specular_strength: f32,
     shininess: f32,
+    metallic_specular_strength: f32,
+    metallic_shininess: f32,
     rim_strength: f32,
     fog_density: f32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SceneDslPaletteStop {
+    position: f32,
+    color: [f32; 3],
 }
 
 impl Default for SceneDslMaterial {
@@ -262,8 +301,21 @@ impl Default for SceneReflection {
 #[serde(default, deny_unknown_fields)]
 struct SceneToneMapping {
     enabled: bool,
+    operator: SceneToneMappingOperator,
     exposure_stops: f32,
     white_point: f32,
+    brightness: f32,
+    contrast: f32,
+    gamma: f32,
+    saturation: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum SceneToneMappingOperator {
+    #[default]
+    ExtendedReinhard,
+    Mandelbulber,
 }
 
 impl Default for SceneToneMapping {
@@ -355,6 +407,8 @@ impl TryFrom<SceneDocument> for LoadedScene {
             }),
             SceneFractal::Dsl(config) => FractalConfig::Dsl(DslFractalConfig {
                 iterations: config.iterations,
+                orbit_period: config.orbit_period,
+                color_iterations: config.color_iterations.unwrap_or(config.iterations),
                 bailout: config.bailout,
                 normal_epsilon: config.normal_epsilon,
                 orbit: config.orbit.into_iter().map(OrbitTransform::from).collect(),
@@ -438,6 +492,9 @@ impl From<&LoadedScene> for SceneDocument {
             }),
             FractalConfig::Dsl(config) => SceneFractal::Dsl(SceneDslFractal {
                 iterations: config.iterations,
+                orbit_period: config.orbit_period,
+                color_iterations: (config.color_iterations != config.iterations)
+                    .then_some(config.color_iterations),
                 bailout: config.bailout,
                 normal_epsilon: config.normal_epsilon,
                 orbit: config.orbit.iter().map(SceneOrbitTransform::from).collect(),
@@ -486,6 +543,40 @@ impl From<&LoadedScene> for SceneDocument {
 impl From<SceneOrbitTransform> for OrbitTransform {
     fn from(transform: SceneOrbitTransform) -> Self {
         match transform {
+            SceneOrbitTransform::AmazingSurfFold {
+                start_iteration,
+                stop_iteration,
+                limits,
+                minimum_radius_squared,
+                scale,
+                rotation_degrees,
+            } => Self::AmazingSurfFold {
+                start_iteration,
+                stop_iteration,
+                limits,
+                minimum_radius_squared,
+                scale,
+                rotation_degrees,
+            },
+            SceneOrbitTransform::MandelboxJuliaFold {
+                start_iteration,
+                stop_iteration,
+                fold_limit,
+                min_radius_squared,
+                fixed_radius_squared,
+                scale,
+                constant,
+                rotation_degrees,
+            } => Self::MandelboxJuliaFold {
+                start_iteration,
+                stop_iteration,
+                fold_limit,
+                min_radius_squared,
+                fixed_radius_squared,
+                scale,
+                constant,
+                rotation_degrees,
+            },
             SceneOrbitTransform::BoxFold { limit } => Self::BoxFold { limit },
             SceneOrbitTransform::SphereFold {
                 min_radius_squared,
@@ -495,6 +586,9 @@ impl From<SceneOrbitTransform> for OrbitTransform {
                 fixed_radius_squared,
             },
             SceneOrbitTransform::ScaleAddPoint { scale } => Self::ScaleAddPoint { scale },
+            SceneOrbitTransform::ScaleAddConstant { scale, constant } => {
+                Self::ScaleAddConstant { scale, constant }
+            }
             SceneOrbitTransform::Rotate { axis, degrees } => Self::Rotate { axis, degrees },
             SceneOrbitTransform::Translate { offset } => Self::Translate { offset },
         }
@@ -504,6 +598,40 @@ impl From<SceneOrbitTransform> for OrbitTransform {
 impl From<&OrbitTransform> for SceneOrbitTransform {
     fn from(transform: &OrbitTransform) -> Self {
         match transform {
+            OrbitTransform::AmazingSurfFold {
+                start_iteration,
+                stop_iteration,
+                limits,
+                minimum_radius_squared,
+                scale,
+                rotation_degrees,
+            } => Self::AmazingSurfFold {
+                start_iteration: *start_iteration,
+                stop_iteration: *stop_iteration,
+                limits: *limits,
+                minimum_radius_squared: *minimum_radius_squared,
+                scale: *scale,
+                rotation_degrees: *rotation_degrees,
+            },
+            OrbitTransform::MandelboxJuliaFold {
+                start_iteration,
+                stop_iteration,
+                fold_limit,
+                min_radius_squared,
+                fixed_radius_squared,
+                scale,
+                constant,
+                rotation_degrees,
+            } => Self::MandelboxJuliaFold {
+                start_iteration: *start_iteration,
+                stop_iteration: *stop_iteration,
+                fold_limit: *fold_limit,
+                min_radius_squared: *min_radius_squared,
+                fixed_radius_squared: *fixed_radius_squared,
+                scale: *scale,
+                constant: *constant,
+                rotation_degrees: *rotation_degrees,
+            },
             OrbitTransform::BoxFold { limit } => Self::BoxFold { limit: *limit },
             OrbitTransform::SphereFold {
                 min_radius_squared,
@@ -513,6 +641,10 @@ impl From<&OrbitTransform> for SceneOrbitTransform {
                 fixed_radius_squared: *fixed_radius_squared,
             },
             OrbitTransform::ScaleAddPoint { scale } => Self::ScaleAddPoint { scale: *scale },
+            OrbitTransform::ScaleAddConstant { scale, constant } => Self::ScaleAddConstant {
+                scale: *scale,
+                constant: *constant,
+            },
             OrbitTransform::Rotate { axis, degrees } => Self::Rotate {
                 axis: *axis,
                 degrees: *degrees,
@@ -531,12 +663,24 @@ impl From<SceneDslMaterial> for DslMaterial {
             background_bottom: material.background_bottom,
             background_top: material.background_top,
             color_frequency: material.color_frequency,
+            surface_palette: material
+                .surface_palette
+                .into_iter()
+                .map(|stop| DslPaletteStop {
+                    position: stop.position,
+                    color: stop.color,
+                })
+                .collect(),
+            orbit_palette_weight: material.orbit_palette_weight,
+            palette_offset: material.palette_offset,
             camera_palette_weight: material.camera_palette_weight,
             normal_palette_weight: material.normal_palette_weight,
             ambient_strength: material.ambient_strength,
             diffuse_strength: material.diffuse_strength,
             specular_strength: material.specular_strength,
             shininess: material.shininess,
+            metallic_specular_strength: material.metallic_specular_strength,
+            metallic_shininess: material.metallic_shininess,
             rim_strength: material.rim_strength,
             fog_density: material.fog_density,
         }
@@ -552,12 +696,24 @@ impl From<&DslMaterial> for SceneDslMaterial {
             background_bottom: material.background_bottom,
             background_top: material.background_top,
             color_frequency: material.color_frequency,
+            surface_palette: material
+                .surface_palette
+                .iter()
+                .map(|stop| SceneDslPaletteStop {
+                    position: stop.position,
+                    color: stop.color,
+                })
+                .collect(),
+            orbit_palette_weight: material.orbit_palette_weight,
+            palette_offset: material.palette_offset,
             camera_palette_weight: material.camera_palette_weight,
             normal_palette_weight: material.normal_palette_weight,
             ambient_strength: material.ambient_strength,
             diffuse_strength: material.diffuse_strength,
             specular_strength: material.specular_strength,
             shininess: material.shininess,
+            metallic_specular_strength: material.metallic_specular_strength,
+            metallic_shininess: material.metallic_shininess,
             rim_strength: material.rim_strength,
             fog_density: material.fog_density,
         }
@@ -586,8 +742,18 @@ impl From<SceneQuality> for QualityConfig {
             },
             tone_mapping: ToneMappingConfig {
                 enabled: quality.tone_mapping.enabled,
+                operator: match quality.tone_mapping.operator {
+                    SceneToneMappingOperator::ExtendedReinhard => {
+                        ToneMappingOperator::ExtendedReinhard
+                    }
+                    SceneToneMappingOperator::Mandelbulber => ToneMappingOperator::Mandelbulber,
+                },
                 exposure_stops: quality.tone_mapping.exposure_stops,
                 white_point: quality.tone_mapping.white_point,
+                brightness: quality.tone_mapping.brightness,
+                contrast: quality.tone_mapping.contrast,
+                gamma: quality.tone_mapping.gamma,
+                saturation: quality.tone_mapping.saturation,
             },
         }
     }
@@ -640,8 +806,16 @@ impl From<&ToneMappingConfig> for SceneToneMapping {
     fn from(config: &ToneMappingConfig) -> Self {
         Self {
             enabled: config.enabled,
+            operator: match config.operator {
+                ToneMappingOperator::ExtendedReinhard => SceneToneMappingOperator::ExtendedReinhard,
+                ToneMappingOperator::Mandelbulber => SceneToneMappingOperator::Mandelbulber,
+            },
             exposure_stops: config.exposure_stops,
             white_point: config.white_point,
+            brightness: config.brightness,
+            contrast: config.contrast,
+            gamma: config.gamma,
+            saturation: config.saturation,
         }
     }
 }
@@ -763,7 +937,7 @@ fn validate_scene_name(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::FractalKind;
+    use crate::{DistanceEstimator, FractalKind};
 
     const MANDELBULB: &str = include_str!("../../scenes/examples/mandelbulb.yaml");
     const MANDELBOX: &str = include_str!("../../scenes/examples/mandelbox.yaml");
@@ -775,6 +949,8 @@ mod tests {
         include_str!("../../scenes/examples/twisted-mandelbox-dsl.yaml");
     const MANDELBOX_FIRST_DESCENT_YOUTUBE: &str =
         include_str!("../../scenes/examples/mandelbox-first-descent-youtube.yaml");
+    const ALCHEMY_PSEUDO_KLEINIAN: &str =
+        include_str!("../../scenes/examples/alchemy-pseudo-kleinian.yaml");
 
     #[test]
     fn parses_both_example_scenes() {
@@ -889,6 +1065,50 @@ mod tests {
                 .abs()
                 < 1.0e-6
         );
+    }
+
+    #[test]
+    fn alchemy_scene_preserves_the_mandelbulber_hybrid_schedule() {
+        let scene =
+            parse_scene(ALCHEMY_PSEUDO_KLEINIAN).expect("Alchemy scene must parse and validate");
+        let FractalConfig::Dsl(fractal) = &scene.config.fractal else {
+            panic!("Alchemy scene must use the typed DSL");
+        };
+
+        assert_eq!(scene.name, "alchemy-pseudo-kleinian");
+        assert_eq!(fractal.iterations, 125);
+        assert_eq!(fractal.orbit_period, Some(120));
+        assert_eq!(fractal.color_iterations, 500);
+        assert_eq!(fractal.orbit.len(), 2);
+        assert_eq!(fractal.material.surface_palette.len(), 13);
+        assert_eq!(scene.config.render.width, 405);
+        assert_eq!(scene.config.render.height, 270);
+        assert_eq!(scene.config.quality.samples_per_pixel, 128);
+        assert!((scene.config.camera.aperture_radius - 0.005).abs() < 1.0e-7);
+        assert!((scene.config.camera.focus_distance - 0.778_781_06).abs() < 1.0e-7);
+        assert_eq!(
+            scene.config.quality.tone_mapping.operator,
+            ToneMappingOperator::Mandelbulber
+        );
+        assert!((scene.config.quality.tone_mapping.brightness - 1.2).abs() < 1.0e-7);
+        assert!((scene.config.quality.tone_mapping.contrast - 1.08).abs() < 1.0e-7);
+        assert!((scene.config.quality.tone_mapping.gamma - 1.4).abs() < 1.0e-7);
+        assert!((scene.config.quality.tone_mapping.saturation - 0.82).abs() < 1.0e-7);
+
+        let source = fractal.generate_wgsl().expect("hybrid WGSL must generate");
+        assert!(source.contains("scheduled_iteration = iteration % 120u"));
+        assert!(source.contains("scheduled_iteration >= 0u && scheduled_iteration < 20u"));
+        assert!(source.contains("scheduled_iteration >= 20u && scheduled_iteration < 120u"));
+        assert!(source.contains("dsl_orbit(p, 500u, false).color_coordinate"));
+        assert!(source.contains("auxiliary_color += select"));
+
+        let target_distance =
+            fractal.distance_estimate(scene.config.camera.target.to_f32().map(f64::from));
+        assert!(target_distance.is_finite() && target_distance < 1.0e-7);
+
+        let yaml = scene.to_yaml().expect("Alchemy scene must serialize");
+        let reparsed = parse_scene(&yaml).expect("serialized Alchemy scene must parse");
+        assert_eq!(reparsed.config.fractal.kind(), FractalKind::Dsl);
     }
 
     #[test]

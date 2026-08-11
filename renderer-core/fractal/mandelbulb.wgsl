@@ -1,4 +1,4 @@
-const MAX_FRACTAL_ITERATIONS: u32 = 64u;
+const MAX_FRACTAL_ITERATIONS: u32 = 128u;
 
 // Distance-estimator contract. Other fractals can replace this file while the
 // ray marcher, camera, and shading code stay fixed.

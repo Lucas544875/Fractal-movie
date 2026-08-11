@@ -4,10 +4,14 @@ use anyhow::{Context, Result, anyhow};
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use crate::{RenderConfig, shader};
+use crate::{RenderConfig, ToneMappingOperator, shader};
 
 const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 const BYTES_PER_PIXEL: u32 = 4;
+/// Bounds one GPU submission so expensive offline scenes do not trip the
+/// operating system's graphics watchdog. Fragment positions remain global
+/// because scissoring does not change the render target coordinate system.
+const MAX_FRAGMENT_INVOCATIONS_PER_SUBMISSION: u32 = 131_072;
 
 /// Controls which adapter may be used by [`Renderer`].
 #[derive(Clone, Debug, Default)]
@@ -70,8 +74,10 @@ struct RenderUniforms {
     soft_shadow: [f32; 4],
     // x: strength, y: roughness, z: maximum trace distance
     reflection: [f32; 4],
-    // x: exposure stops, y: white point, z: enabled
+    // x: exposure stops, y: white point, z: enabled, w: operator
     tone_mapping: [f32; 4],
+    // x: brightness, y: contrast, z: gamma, w: saturation
+    image_adjustments: [f32; 4],
     // x: samples, y: AO steps, z: shadow steps, w: reflection steps
     quality_limits: [u32; 4],
 }
@@ -157,7 +163,16 @@ impl RenderUniforms {
                 config.quality.tone_mapping.exposure_stops,
                 config.quality.tone_mapping.white_point,
                 u32::from(config.quality.tone_mapping.enabled) as f32,
-                0.0,
+                match config.quality.tone_mapping.operator {
+                    ToneMappingOperator::ExtendedReinhard => 0.0,
+                    ToneMappingOperator::Mandelbulber => 1.0,
+                },
+            ],
+            image_adjustments: [
+                config.quality.tone_mapping.brightness,
+                config.quality.tone_mapping.contrast,
+                config.quality.tone_mapping.gamma,
+                config.quality.tone_mapping.saturation,
             ],
             quality_limits: [
                 config.quality.samples_per_pixel,
@@ -427,34 +442,55 @@ impl Renderer {
         let view = self
             .target
             .create_view(&wgpu::TextureViewDescriptor::default());
+        for (strip_index, (strip_y, strip_height)) in
+            render_strips(self.config.render.width, self.config.render.height)
+                .into_iter()
+                .enumerate()
+        {
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("raymarch-strip-command-encoder"),
+                });
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    // `None` avoids debug-marker entry points on old headless
+                    // Vulkan loaders while preserving resource labels elsewhere.
+                    label: None,
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: if strip_index == 0 {
+                                wgpu::LoadOp::Clear(wgpu::Color::BLACK)
+                            } else {
+                                wgpu::LoadOp::Load
+                            },
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&self.render_pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_scissor_rect(0, strip_y, self.config.render.width, strip_height);
+                pass.draw(0..3, 0..1);
+            }
+            self.queue.submit([encoder.finish()]);
+            self.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .context("failed while waiting for a GPU render strip")?;
+        }
+
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("raymarch-command-encoder"),
+                label: Some("raymarch-readback-command-encoder"),
             });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                // `None` avoids debug-marker entry points on old headless
-                // Vulkan loaders while preserving resource labels elsewhere.
-                label: None,
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.render_pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.draw(0..3, 0..1);
-        }
         encoder.copy_texture_to_buffer(
             self.target.as_image_copy(),
             wgpu::TexelCopyBufferInfo {
@@ -500,6 +536,14 @@ impl Renderer {
             pixels,
         })
     }
+}
+
+fn render_strips(width: u32, height: u32) -> Vec<(u32, u32)> {
+    let strip_height = (MAX_FRAGMENT_INVOCATIONS_PER_SUBMISSION / width).max(1);
+    (0..height)
+        .step_by(strip_height as usize)
+        .map(|y| (y, strip_height.min(height - y)))
+        .collect()
 }
 
 fn create_instance() -> (wgpu::Instance, wgpu::Backends) {
@@ -616,6 +660,31 @@ mod tests {
         assert_eq!(padded_bytes_per_row(64), 256);
         assert_eq!(padded_bytes_per_row(65), 512);
         assert_eq!(padded_bytes_per_row(640), 2_560);
+    }
+
+    #[test]
+    fn render_height_is_split_into_watchdog_safe_strips() {
+        assert_eq!(
+            render_strips(1_620, 1_080),
+            vec![
+                (0, 80),
+                (80, 80),
+                (160, 80),
+                (240, 80),
+                (320, 80),
+                (400, 80),
+                (480, 80),
+                (560, 80),
+                (640, 80),
+                (720, 80),
+                (800, 80),
+                (880, 80),
+                (960, 80),
+                (1_040, 40),
+            ]
+        );
+        assert_eq!(render_strips(256, 256), vec![(0, 256)]);
+        assert_eq!(render_strips(200_000, 2), vec![(0, 1), (1, 1)]);
     }
 
     #[test]

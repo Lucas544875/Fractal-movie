@@ -284,7 +284,7 @@ camera:
   focus_distance: 11.0   # lens面から合焦面までの距離
 
 quality:
-  samples_per_pixel: 16  # 1..64
+  samples_per_pixel: 16  # 1..128
   ambient_occlusion:
     max_steps: 64        # 0でoff、上限256
     radius: 1.25
@@ -300,6 +300,7 @@ quality:
     roughness: 0.08
   tone_mapping:
     enabled: true
+    operator: extended-reinhard
     exposure_stops: -0.35
     white_point: 3.0
 ```
@@ -307,6 +308,8 @@ quality:
 camera rayは画素内をjitterし、`aperture_radius`の円板上から`focus_distance`の合焦面へ向け直します。円形開口なので、焦点外のhighlightは円形ボケとして蓄積されます。soft shadowはdirectional lightの角半径内、AOは法線半球内、rough reflectionは反射方向の周囲を同じ決定的seedから分散samplingします。noiseが見える場合はまず`samples_per_pixel`を増やしてください。被写界深度を強くするには`aperture_radius`を増やし、合焦位置は`focus_distance`で調整します。
 
 quad-float animationではcamera distanceの変化に合わせ、`focus_distance`、`aperture_radius`、AO半径、shadow/reflection trace距離を同じ比率で自動scaleします。このため1e-26までzoomしても、world単位の効果範囲だけがoverview scaleに取り残されません。sampling上限と二次ray step上限はCPU validationとWGSLの固定長loopで一致させています。
+
+`tone_mapping.operator`は既定の`extended-reinhard`に加え、`mandelbulber`を選択できます。後者はMandelbulber 2.26と同じく、`brightness`、`contrast`、HDR `tanh`、`saturation`、`gamma`の順に処理し、最後にsRGB render targetへ正しく渡します。既存sceneはoperatorを省略しても従来のReinhard表示を維持します。
 
 RTX 3070 / GL backend、320x180の実測では、16 sppのf32静止画が0.72秒、8 sppで全効果を有効にしたquad-float距離1e-26の最終frameが1.52秒でした。GL driverでquad-float pipelineを初めて作る際は約60秒のshader compileが発生しましたが、animation中は同じpipelineを全frameで再利用するためframe時間には含まれません。数値はGPU・backend・driverで変わります。
 
@@ -394,6 +397,30 @@ WGPU_BACKEND=gl cargo run --release -p fractal-renderer-cli -- render \
 ```
 
 途中から再開する場合は`--resume`、PNGを再利用してMP4だけ作り直す場合は`--resume --video-overwrite`を使います。[YouTubeの解像度とaspect ratioの案内](https://support.google.com/youtube/answer/6375112?co=GENIE.Platform%3DDesktop&hl=ja)にある標準16:9の2560x1440を採用し、[推奨upload encode設定](https://support.google.com/youtube/answer/1722171?hl=ja)に合わせて撮影時と同じ60 fps、MP4、H.264、4:2:0、fast-start構成にしています。YouTube側で再圧縮されるため、sceneのCRFは配信用bitrateではなく入力masterの品質を優先しています。
+
+## Alchemy PseudoKleinian scene
+
+`scenes/examples/alchemy-pseudo-kleinian.yaml`は、Mandelbulber 2.26の`alchemy.fract`と参照画像を基にした3:2の静止画sceneです。設定ファイルのformula ID 73は[公式enumではAmazing Surf](https://github.com/buddhi1980/mandelbulber2/blob/2.26/mandelbulber2/formula/definition/all_fractal_list_enums.hpp)、ID 8はMandelboxです。[Amazing Surfの公式実装](https://github.com/buddhi1980/mandelbulber2/blob/2.26/mandelbulber2/formula/definition/fractal_amazing_surf.cpp)はKaliによるPseudoKleinian派生のX/Y foldであるため、単一のMandelboxへ近似せず、120回周期のhybrid sequenceをgeometryではN=125まで評価します。
+
+```text
+iteration   0..19   Amazing Surf + Y 90° rotation
+iteration  20..119  rotated Mandelbox + fixed Julia constant
+iteration 120..124  Amazing Surf + Y 90° rotation
+```
+
+DSLへ`amazing-surf-fold`と`mandelbox-julia-fold`を追加し、それぞれに閉区間ではなく`start_iteration <= i < stop_iteration`の実行範囲と`orbit_period`を持たせています。camera、target、up、FOV、focus distance、Julia constant、fold、scale、rotationは元設定から移植しました。
+
+[公式のfractal coloring](https://github.com/buddhi1980/mandelbulber2/blob/2.26/mandelbulber2/src/fractal_coloring.cpp)と[surface color shader](https://github.com/buddhi1980/mandelbulber2/blob/2.26/mandelbulber2/src/shader_surface_color.cpp)に合わせ、着色時だけN×4=500回まで周期を継続し、各軸のbox foldとsphere foldから補助色を累積します。元gradientの色順を維持しつつ、実装間で異なる補助色分布を補うため、銅・古金色を広げて銀・白金色を狭い帯へ再配分しました。[公式specular shader](https://github.com/buddhi1980/mandelbulber2/blob/2.26/mandelbulber2/src/shader_specular_highlight_combined.cpp)と同じく、細い白色plastic highlightと広い表面色metallic highlightを別々に評価します。
+
+光源方向は`light1_rotation: [25.76, 37.98, 0]`を元camera basisで変換した値を使用し、直接光量0.8もdiffuseと金属反射へ反映しています。画像階調は[公式の画像処理順序](https://github.com/buddhi1980/mandelbulber2/blob/2.26/mandelbulber2/src/cimage.cpp)を再利用可能な`mandelbulber` tone operatorとして実装し、Alchemy sceneではこのレンダラーのAO差に合わせてbrightness、contrast、saturationを補正しました。被写界深度はfocus distanceを維持したままapertureを0.005まで弱めています。
+
+sceneの標準解像度は元の幅・高さを各1/4にした405x270、samplingは128 sppです。RTX 3070での実測は約5秒です。
+
+```bash
+WGPU_BACKEND=gl cargo run --release -p fractal-renderer-cli -- render \
+  scenes/examples/alchemy-pseudo-kleinian.yaml \
+  --output output/alchemy-pseudo-kleinian.png --overwrite
+```
 
 ## ディレクトリ構成
 

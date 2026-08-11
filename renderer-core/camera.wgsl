@@ -26,8 +26,10 @@ struct RenderUniforms {
     soft_shadow: vec4<f32>,
     // x: strength, y: roughness, z: maximum trace distance
     reflection: vec4<f32>,
-    // x: exposure stops, y: white point, z: enabled
+    // x: exposure stops, y: white point, z: enabled, w: operator
     tone_mapping: vec4<f32>,
+    // x: brightness, y: contrast, z: gamma, w: saturation
+    image_adjustments: vec4<f32>,
     // x: samples/pixel, y: AO steps, z: shadow steps, w: reflection steps
     quality_limits: vec4<u32>,
 }

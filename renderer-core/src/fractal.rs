@@ -50,9 +50,84 @@ impl DistanceEstimator for DslFractalConfig {
         let mut z = point;
         let mut derivative = 1.0_f64;
 
-        for _ in 0..self.iterations {
+        for iteration in 0..self.iterations {
+            let scheduled_iteration = self
+                .orbit_period
+                .map_or(iteration, |period| iteration % period);
             for transform in &self.orbit {
                 match transform {
+                    OrbitTransform::AmazingSurfFold {
+                        start_iteration,
+                        stop_iteration,
+                        limits,
+                        minimum_radius_squared,
+                        scale,
+                        rotation_degrees,
+                    } => {
+                        if scheduled_iteration < *start_iteration
+                            || scheduled_iteration >= *stop_iteration
+                        {
+                            continue;
+                        }
+                        for axis in 0..2 {
+                            let limit = f64::from(limits[axis]);
+                            z[axis] = (z[axis] + limit).abs() - (z[axis] - limit).abs() - z[axis];
+                        }
+                        let divisor =
+                            dot(z, z).clamp(f64::from(*minimum_radius_squared).max(1.0e-24), 1.0);
+                        let multiplier = f64::from(*scale) / divisor;
+                        z = scale_vector(z, multiplier);
+                        derivative = derivative * multiplier.abs() + 1.0;
+                        for (axis, degrees) in [
+                            ([1.0, 0.0, 0.0], rotation_degrees[0]),
+                            ([0.0, 1.0, 0.0], rotation_degrees[1]),
+                            ([0.0, 0.0, 1.0], rotation_degrees[2]),
+                        ] {
+                            z = rotate(z, axis, f64::from(degrees).to_radians());
+                        }
+                    }
+                    OrbitTransform::MandelboxJuliaFold {
+                        start_iteration,
+                        stop_iteration,
+                        fold_limit,
+                        min_radius_squared,
+                        fixed_radius_squared,
+                        scale,
+                        constant,
+                        rotation_degrees,
+                    } => {
+                        if scheduled_iteration < *start_iteration
+                            || scheduled_iteration >= *stop_iteration
+                        {
+                            continue;
+                        }
+                        let limit = f64::from(*fold_limit);
+                        for component in &mut z {
+                            *component = component.clamp(-limit, limit) * 2.0 - *component;
+                        }
+                        let radius_squared = dot(z, z);
+                        let minimum = f64::from(*min_radius_squared);
+                        let fixed = f64::from(*fixed_radius_squared);
+                        if radius_squared < minimum {
+                            let factor = fixed / minimum;
+                            z = scale_vector(z, factor);
+                            derivative *= factor;
+                        } else if radius_squared < fixed {
+                            let factor = fixed / radius_squared.max(1.0e-24);
+                            z = scale_vector(z, factor);
+                            derivative *= factor;
+                        }
+                        for (axis, degrees) in [
+                            ([1.0, 0.0, 0.0], rotation_degrees[0]),
+                            ([0.0, 1.0, 0.0], rotation_degrees[1]),
+                            ([0.0, 0.0, 1.0], rotation_degrees[2]),
+                        ] {
+                            z = rotate(z, axis, f64::from(degrees).to_radians());
+                        }
+                        let scale = f64::from(*scale);
+                        z = add(scale_vector(z, scale), constant.map(f64::from));
+                        derivative = derivative * scale.abs() + 1.0;
+                    }
                     OrbitTransform::BoxFold { limit } => {
                         let limit = f64::from(*limit);
                         for component in &mut z {
@@ -79,6 +154,11 @@ impl DistanceEstimator for DslFractalConfig {
                     OrbitTransform::ScaleAddPoint { scale } => {
                         let scale = f64::from(*scale);
                         z = add(scale_vector(z, scale), point);
+                        derivative = derivative * scale.abs() + 1.0;
+                    }
+                    OrbitTransform::ScaleAddConstant { scale, constant } => {
+                        let scale = f64::from(*scale);
+                        z = add(scale_vector(z, scale), constant.map(f64::from));
                         derivative = derivative * scale.abs() + 1.0;
                     }
                     OrbitTransform::Rotate { axis, degrees } => {

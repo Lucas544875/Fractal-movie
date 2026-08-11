@@ -1,6 +1,6 @@
 const MAX_RAY_STEPS: u32 = 1024u;
 const MAX_SECONDARY_RAY_STEPS: u32 = 256u;
-const MAX_SAMPLES_PER_PIXEL: u32 = 64u;
+const MAX_SAMPLES_PER_PIXEL: u32 = 128u;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,

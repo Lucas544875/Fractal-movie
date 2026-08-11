@@ -1,4 +1,4 @@
-const MAX_FRACTAL_ITERATIONS: u32 = 96u;
+const MAX_FRACTAL_ITERATIONS: u32 = 128u;
 
 fn qf_box_fold(value: Qf32, limit: f32) -> Qf32 {
     let upper = qf_from_f32(limit);
