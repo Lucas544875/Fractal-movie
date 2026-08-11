@@ -11,7 +11,7 @@ camera:
   vertical_fov_degrees: 14.04
   # Deliberately shallow macro focus: focus comes from the source settings,
   # while aperture is art-directed for this renderer's thin-lens model.
-  aperture_radius: 0.005
+  aperture_radius: 0.015
   focus_distance: 0.7787810564
 
 # Mandelbulber's formula IDs are Amazing Surf (73) and Mandelbox (8).
@@ -82,7 +82,7 @@ fractal:
       # gives 300, while the default metallic width 1.0 gives 30.
       # Raised above 0.32 * light1_intensity to survive thin-lens averaging as
       # the source image's small white, gem-like highlights.
-      specular_strength: 0.65
+      specular_strength: 0.8
       shininess: 300.0
       metallic_specular_strength: 3.2
       metallic_shininess: 30.0
