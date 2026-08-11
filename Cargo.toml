@@ -14,5 +14,6 @@ bytemuck = { version = "1.24.0", features = ["derive"] }
 clap = { version = "4.5.54", features = ["derive"] }
 image = { version = "0.25.9", default-features = false, features = ["png"] }
 pollster = "0.4.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_yaml_ng = "0.10.0"
 wgpu = "30.0.0"
-

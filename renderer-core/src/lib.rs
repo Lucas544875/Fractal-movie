@@ -5,6 +5,7 @@ mod fractal;
 mod path;
 mod renderer;
 mod scene;
+mod scene_file;
 mod shader;
 
 pub use config::{
@@ -14,4 +15,5 @@ pub use config::{
 pub use fractal::DistanceEstimator;
 pub use path::{ExponentialDivePath, PathTarget, TargetPicker, TargetSearchConfig};
 pub use renderer::{RenderedImage, Renderer, RendererOptions, adapter_is_software};
+pub use scene_file::{CURRENT_SCENE_VERSION, LoadedScene, load_scene, parse_scene};
 pub use wgpu::{AdapterInfo, Backend, DeviceType};

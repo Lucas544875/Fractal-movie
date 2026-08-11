@@ -1,0 +1,33 @@
+version: 1
+name: mandelbox
+precision: f32
+seed: 12345
+
+camera:
+  # Known reachable surface point and incoming direction from the portfolio.
+  position: [11.417633, -1.764267, 5.605854]
+  target: [2.212921, 1.099011, 0.307275]
+  up: [0.0, 0.0, 1.0]
+  vertical_fov_degrees: 30.0
+
+fractal:
+  kind: mandelbox
+  parameters:
+    scale: -2.18
+    min_radius_squared: 0.60
+    fixed_radius_squared: 2.65
+    fold_limit: 1.14
+    iterations: 16
+    bound_radius: 4.2
+
+light:
+  direction: [2.0, 1.0, 1.0]
+
+render:
+  width: 640
+  height: 360
+  max_steps: 280
+  max_distance: 100.0
+  epsilon: 5.0e-8
+  step_safety: 0.93
+  pixel_epsilon_multiplier: 1.5

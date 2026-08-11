@@ -4,7 +4,10 @@ use std::{path::Path, path::PathBuf, process::ExitCode, time::Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use fractal_renderer_core::{RenderConfig, Renderer, RendererOptions, adapter_is_software};
+use fractal_renderer_core::{
+    FractalConfig, FractalKind, MandelboxConfig, MandelbulbConfig, RenderConfig, Renderer,
+    RendererOptions, adapter_is_software, load_scene,
+};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum FractalName {
@@ -25,27 +28,31 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Render a built-in fractal scene to one PNG file.
+    /// Render a YAML scene or built-in preset to one PNG file.
     Render {
+        /// Versioned YAML scene file. Omit to use a built-in preset.
+        #[arg(value_name = "SCENE")]
+        scene: Option<PathBuf>,
+
         /// Output PNG path.
         #[arg(long)]
         output: Option<PathBuf>,
 
-        /// Fractal scene to render.
-        #[arg(long, value_enum, default_value_t = FractalName::Mandelbulb)]
-        fractal: FractalName,
+        /// Override the scene's fractal using its default parameters.
+        #[arg(long, value_enum)]
+        fractal: Option<FractalName>,
 
-        /// Deterministic seed used by scene and camera-path generation.
-        #[arg(long, default_value_t = 12_345)]
-        seed: u32,
+        /// Override the deterministic scene seed.
+        #[arg(long)]
+        seed: Option<u32>,
 
-        /// Image width in pixels.
-        #[arg(long, default_value_t = 640)]
-        width: u32,
+        /// Override image width in pixels.
+        #[arg(long)]
+        width: Option<u32>,
 
-        /// Image height in pixels.
-        #[arg(long, default_value_t = 360)]
-        height: u32,
+        /// Override image height in pixels.
+        #[arg(long)]
+        height: Option<u32>,
 
         /// Permit CPU/software rendering when no hardware GPU is available.
         #[arg(long)]
@@ -74,6 +81,7 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Render {
+            scene,
             output,
             fractal,
             seed,
@@ -81,7 +89,8 @@ fn run() -> Result<()> {
             height,
             allow_software,
             adapter,
-        } => render(
+        } => render(RenderRequest {
+            scene,
             output,
             fractal,
             seed,
@@ -89,37 +98,48 @@ fn run() -> Result<()> {
             height,
             allow_software,
             adapter,
-        ),
+        }),
         Command::GpuInfo => gpu_info(),
     }
 }
 
-fn render(
-    output_path: Option<PathBuf>,
-    fractal: FractalName,
-    seed: u32,
-    width: u32,
-    height: u32,
+struct RenderRequest {
+    scene: Option<PathBuf>,
+    output: Option<PathBuf>,
+    fractal: Option<FractalName>,
+    seed: Option<u32>,
+    width: Option<u32>,
+    height: Option<u32>,
     allow_software: bool,
-    adapter_name: Option<String>,
-) -> Result<()> {
-    let mut config = match fractal {
-        FractalName::Mandelbulb => RenderConfig::default(),
-        FractalName::Mandelbox => RenderConfig::mandelbox(seed),
-    };
-    config.seed = seed;
-    config.render.width = width;
-    config.render.height = height;
-    let output_path = output_path.unwrap_or_else(|| match fractal {
-        FractalName::Mandelbulb => PathBuf::from("output/phase1/mandelbulb.png"),
-        FractalName::Mandelbox => PathBuf::from("output/phase1/mandelbox.png"),
-    });
+    adapter: Option<String>,
+}
+
+struct PreparedScene {
+    name: String,
+    config: RenderConfig,
+    default_output: PathBuf,
+}
+
+fn render(request: RenderRequest) -> Result<()> {
+    let prepared = prepare_scene(
+        request.scene.as_deref(),
+        request.fractal,
+        request.seed,
+        request.width,
+        request.height,
+    )?;
+    let scene_name = prepared.name;
+    let config = prepared.config;
+    let output_path = request.output.unwrap_or(prepared.default_output);
+    let fractal_kind = config.fractal.kind();
+    let width = config.render.width;
+    let height = config.render.height;
 
     let renderer = pollster::block_on(Renderer::new_with_options(
         config,
         RendererOptions {
-            allow_software_adapter: allow_software,
-            adapter_name,
+            allow_software_adapter: request.allow_software,
+            adapter_name: request.adapter,
         },
     ))
     .context("could not initialize the offscreen renderer")?;
@@ -136,7 +156,8 @@ fn render(
             "software (CPU)"
         }
     );
-    println!("Fractal: {fractal:?}");
+    println!("Scene: {scene_name}");
+    println!("Fractal: {}", fractal_label(fractal_kind));
     println!("Resolution: {width}x{height}");
     println!("Frames: 1");
     println!("Rendering frame 1/1");
@@ -145,7 +166,7 @@ fn render(
     let frame_start = Instant::now();
     let image = renderer
         .render_frame(0, 0.0)
-        .with_context(|| format!("failed to render {fractal:?} frame 0"))?;
+        .with_context(|| format!("failed to render {scene_name} frame 0"))?;
     let frame_time = frame_start.elapsed();
     println!("Frame render time: {:.3}s", frame_time.as_secs_f64());
 
@@ -156,6 +177,88 @@ fn render(
     println!("Total render time: {:.3}s", total_time.as_secs_f64());
     println!("Average frame time: {:.3}s", frame_time.as_secs_f64());
     Ok(())
+}
+
+fn prepare_scene(
+    scene_path: Option<&Path>,
+    fractal_override: Option<FractalName>,
+    seed_override: Option<u32>,
+    width_override: Option<u32>,
+    height_override: Option<u32>,
+) -> Result<PreparedScene> {
+    let has_scene_file = scene_path.is_some();
+    let (name, mut config) = if let Some(path) = scene_path {
+        let scene = load_scene(path)?;
+        (scene.name, scene.config)
+    } else {
+        let seed = seed_override.unwrap_or(12_345);
+        let fractal = fractal_override.unwrap_or(FractalName::Mandelbulb);
+        (fractal.label().to_owned(), fractal.built_in_config(seed))
+    };
+
+    if has_scene_file {
+        if let Some(fractal) = fractal_override {
+            config.fractal = fractal.default_parameters();
+        }
+        if let Some(seed) = seed_override {
+            config.seed = seed;
+        }
+    }
+    if let Some(width) = width_override {
+        config.render.width = width;
+    }
+    if let Some(height) = height_override {
+        config.render.height = height;
+    }
+    config
+        .validate()
+        .context("render configuration is invalid after applying CLI overrides")?;
+
+    let default_output = if has_scene_file {
+        PathBuf::from("output")
+            .join(&name)
+            .join(format!("{name}.png"))
+    } else {
+        PathBuf::from("output/phase1").join(format!("{name}.png"))
+    };
+    Ok(PreparedScene {
+        name,
+        config,
+        default_output,
+    })
+}
+
+impl FractalName {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Mandelbulb => "mandelbulb",
+            Self::Mandelbox => "mandelbox",
+        }
+    }
+
+    fn built_in_config(self, seed: u32) -> RenderConfig {
+        match self {
+            Self::Mandelbulb => RenderConfig {
+                seed,
+                ..RenderConfig::default()
+            },
+            Self::Mandelbox => RenderConfig::mandelbox(seed),
+        }
+    }
+
+    fn default_parameters(self) -> FractalConfig {
+        match self {
+            Self::Mandelbulb => FractalConfig::Mandelbulb(MandelbulbConfig::default()),
+            Self::Mandelbox => FractalConfig::Mandelbox(MandelboxConfig::default()),
+        }
+    }
+}
+
+const fn fractal_label(kind: FractalKind) -> &'static str {
+    match kind {
+        FractalKind::Mandelbulb => "mandelbulb",
+        FractalKind::Mandelbox => "mandelbox",
+    }
 }
 
 fn gpu_info() -> Result<()> {
@@ -201,4 +304,52 @@ fn gpu_info() -> Result<()> {
         println!("WGPU_BACKEND: {}", backends.to_string_lossy());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn built_in_defaults_remain_backwards_compatible() {
+        let scene = prepare_scene(None, None, None, None, None).expect("preset must be valid");
+        assert_eq!(scene.name, "mandelbulb");
+        assert_eq!(scene.config.seed, 12_345);
+        assert_eq!(scene.config.render.width, 640);
+        assert_eq!(
+            scene.default_output,
+            PathBuf::from("output/phase1/mandelbulb.png")
+        );
+    }
+
+    #[test]
+    fn scene_values_are_preserved_unless_explicitly_overridden() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scenes/examples/mandelbox.yaml");
+        let scene = prepare_scene(Some(&path), None, None, Some(800), None)
+            .expect("example scene must be valid");
+        assert_eq!(scene.name, "mandelbox");
+        assert_eq!(scene.config.seed, 12_345);
+        assert_eq!(scene.config.render.width, 800);
+        assert_eq!(scene.config.render.height, 360);
+        assert_eq!(scene.config.fractal.kind(), FractalKind::Mandelbox);
+        assert_eq!(
+            scene.default_output,
+            PathBuf::from("output/mandelbox/mandelbox.png")
+        );
+    }
+
+    #[test]
+    fn explicit_fractal_and_seed_overrides_apply_to_scene_files() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scenes/examples/mandelbox.yaml");
+        let scene = prepare_scene(
+            Some(&path),
+            Some(FractalName::Mandelbulb),
+            Some(99),
+            None,
+            None,
+        )
+        .expect("overridden scene must be valid");
+        assert_eq!(scene.config.seed, 99);
+        assert_eq!(scene.config.fractal.kind(), FractalKind::Mandelbulb);
+    }
 }

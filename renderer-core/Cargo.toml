@@ -8,5 +8,6 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 bytemuck.workspace = true
+serde.workspace = true
+serde_yaml_ng.workspace = true
 wgpu.workspace = true
-

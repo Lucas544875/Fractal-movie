@@ -1,0 +1,29 @@
+version: 1
+name: mandelbulb
+precision: f32
+seed: 12345
+
+camera:
+  position: [2.5, 1.7, 2.5]
+  target: [0.0, 0.0, 0.0]
+  up: [0.0, 1.0, 0.0]
+  vertical_fov_degrees: 38.0
+
+fractal:
+  kind: mandelbulb
+  parameters:
+    power: 8.0
+    iterations: 16
+    bailout: 4.0
+
+light:
+  direction: [-0.45, 0.75, 0.55]
+
+render:
+  width: 640
+  height: 360
+  max_steps: 256
+  max_distance: 100.0
+  epsilon: 0.0001
+  step_safety: 1.0
+  pixel_epsilon_multiplier: 0.0
