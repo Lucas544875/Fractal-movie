@@ -4,9 +4,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AnimationConfig, AnimationPath, CameraConfig, ExponentialDivePath, FractalConfig, LightConfig,
-    MandelboxConfig, MandelbulbConfig, Precision, Qf32, QfVec3, RenderConfig, RenderSettings,
-    VideoConfig,
+    AmbientOcclusionConfig, AnimationConfig, AnimationPath, CameraConfig, ExponentialDivePath,
+    FractalConfig, LightConfig, MandelboxConfig, MandelbulbConfig, Precision, Qf32, QfVec3,
+    QualityConfig, ReflectionConfig, RenderConfig, RenderSettings, SoftShadowConfig,
+    ToneMappingConfig, VideoConfig,
 };
 
 pub const CURRENT_SCENE_VERSION: u32 = 1;
@@ -55,6 +56,8 @@ struct SceneDocument {
     fractal: SceneFractal,
     light: SceneLight,
     render: SceneRender,
+    #[serde(default)]
+    quality: SceneQuality,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     animation: Option<SceneAnimation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -76,6 +79,10 @@ struct SceneCamera {
     target: [SceneScalar; 3],
     up: [f32; 3],
     vertical_fov_degrees: f32,
+    #[serde(default)]
+    aperture_radius: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    focus_distance: Option<f32>,
 }
 
 /// Coordinate scalars accept convenient YAML numbers, exact decimal strings,
@@ -130,6 +137,79 @@ struct SceneRender {
     epsilon: f32,
     step_safety: f32,
     pixel_epsilon_multiplier: f32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+struct SceneQuality {
+    samples_per_pixel: u32,
+    ambient_occlusion: SceneAmbientOcclusion,
+    soft_shadow: SceneSoftShadow,
+    reflection: SceneReflection,
+    tone_mapping: SceneToneMapping,
+}
+
+impl Default for SceneQuality {
+    fn default() -> Self {
+        Self::from(&QualityConfig::default())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+struct SceneAmbientOcclusion {
+    max_steps: u32,
+    radius: f32,
+    strength: f32,
+}
+
+impl Default for SceneAmbientOcclusion {
+    fn default() -> Self {
+        Self::from(&QualityConfig::default().ambient_occlusion)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+struct SceneSoftShadow {
+    max_steps: u32,
+    angular_radius_degrees: f32,
+    max_distance: f32,
+}
+
+impl Default for SceneSoftShadow {
+    fn default() -> Self {
+        Self::from(&QualityConfig::default().soft_shadow)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+struct SceneReflection {
+    max_steps: u32,
+    max_distance: f32,
+    strength: f32,
+    roughness: f32,
+}
+
+impl Default for SceneReflection {
+    fn default() -> Self {
+        Self::from(&QualityConfig::default().reflection)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+struct SceneToneMapping {
+    enabled: bool,
+    exposure_stops: f32,
+    white_point: f32,
+}
+
+impl Default for SceneToneMapping {
+    fn default() -> Self {
+        Self::from(&QualityConfig::default().tone_mapping)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -188,6 +268,16 @@ impl TryFrom<SceneDocument> for LoadedScene {
             ScenePrecision::F32 => Precision::F32,
             ScenePrecision::QuadFloat => Precision::QuadFloat,
         };
+        let camera_position = parse_coordinate(document.camera.position, precision)
+            .context("invalid camera position")?;
+        let camera_target =
+            parse_coordinate(document.camera.target, precision).context("invalid camera target")?;
+        let focus_distance = document.camera.focus_distance.unwrap_or_else(|| {
+            (camera_target - camera_position)
+                .length_squared()
+                .sqrt()
+                .to_f32()
+        });
 
         let fractal = match document.fractal {
             SceneFractal::Mandelbulb(config) => FractalConfig::Mandelbulb(MandelbulbConfig {
@@ -207,12 +297,12 @@ impl TryFrom<SceneDocument> for LoadedScene {
         let config = RenderConfig {
             precision,
             camera: CameraConfig {
-                position: parse_coordinate(document.camera.position, precision)
-                    .context("invalid camera position")?,
-                target: parse_coordinate(document.camera.target, precision)
-                    .context("invalid camera target")?,
+                position: camera_position,
+                target: camera_target,
                 up: document.camera.up,
                 vertical_fov_degrees: document.camera.vertical_fov_degrees,
+                aperture_radius: document.camera.aperture_radius,
+                focus_distance,
             },
             fractal,
             light: LightConfig {
@@ -227,6 +317,7 @@ impl TryFrom<SceneDocument> for LoadedScene {
                 step_safety: document.render.step_safety,
                 pixel_epsilon_multiplier: document.render.pixel_epsilon_multiplier,
             },
+            quality: QualityConfig::from(document.quality),
             seed: document.seed,
         };
         config
@@ -295,6 +386,8 @@ impl From<&LoadedScene> for SceneDocument {
                 target: serialize_coordinate(scene.config.camera.target, scene.config.precision),
                 up: scene.config.camera.up,
                 vertical_fov_degrees: scene.config.camera.vertical_fov_degrees,
+                aperture_radius: scene.config.camera.aperture_radius,
+                focus_distance: Some(scene.config.camera.focus_distance),
             },
             fractal,
             light: SceneLight {
@@ -309,8 +402,91 @@ impl From<&LoadedScene> for SceneDocument {
                 step_safety: scene.config.render.step_safety,
                 pixel_epsilon_multiplier: scene.config.render.pixel_epsilon_multiplier,
             },
+            quality: SceneQuality::from(&scene.config.quality),
             animation: scene.animation.as_ref().map(SceneAnimation::from),
             video: scene.video.as_ref().map(SceneVideo::from),
+        }
+    }
+}
+
+impl From<SceneQuality> for QualityConfig {
+    fn from(quality: SceneQuality) -> Self {
+        Self {
+            samples_per_pixel: quality.samples_per_pixel,
+            ambient_occlusion: AmbientOcclusionConfig {
+                max_steps: quality.ambient_occlusion.max_steps,
+                radius: quality.ambient_occlusion.radius,
+                strength: quality.ambient_occlusion.strength,
+            },
+            soft_shadow: SoftShadowConfig {
+                max_steps: quality.soft_shadow.max_steps,
+                angular_radius_degrees: quality.soft_shadow.angular_radius_degrees,
+                max_distance: quality.soft_shadow.max_distance,
+            },
+            reflection: ReflectionConfig {
+                max_steps: quality.reflection.max_steps,
+                max_distance: quality.reflection.max_distance,
+                strength: quality.reflection.strength,
+                roughness: quality.reflection.roughness,
+            },
+            tone_mapping: ToneMappingConfig {
+                enabled: quality.tone_mapping.enabled,
+                exposure_stops: quality.tone_mapping.exposure_stops,
+                white_point: quality.tone_mapping.white_point,
+            },
+        }
+    }
+}
+
+impl From<&QualityConfig> for SceneQuality {
+    fn from(quality: &QualityConfig) -> Self {
+        Self {
+            samples_per_pixel: quality.samples_per_pixel,
+            ambient_occlusion: SceneAmbientOcclusion::from(&quality.ambient_occlusion),
+            soft_shadow: SceneSoftShadow::from(&quality.soft_shadow),
+            reflection: SceneReflection::from(&quality.reflection),
+            tone_mapping: SceneToneMapping::from(&quality.tone_mapping),
+        }
+    }
+}
+
+impl From<&AmbientOcclusionConfig> for SceneAmbientOcclusion {
+    fn from(config: &AmbientOcclusionConfig) -> Self {
+        Self {
+            max_steps: config.max_steps,
+            radius: config.radius,
+            strength: config.strength,
+        }
+    }
+}
+
+impl From<&SoftShadowConfig> for SceneSoftShadow {
+    fn from(config: &SoftShadowConfig) -> Self {
+        Self {
+            max_steps: config.max_steps,
+            angular_radius_degrees: config.angular_radius_degrees,
+            max_distance: config.max_distance,
+        }
+    }
+}
+
+impl From<&ReflectionConfig> for SceneReflection {
+    fn from(config: &ReflectionConfig) -> Self {
+        Self {
+            max_steps: config.max_steps,
+            max_distance: config.max_distance,
+            strength: config.strength,
+            roughness: config.roughness,
+        }
+    }
+}
+
+impl From<&ToneMappingConfig> for SceneToneMapping {
+    fn from(config: &ToneMappingConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            exposure_stops: config.exposure_stops,
+            white_point: config.white_point,
         }
     }
 }
@@ -450,6 +626,9 @@ mod tests {
         let box_scene = parse_scene(MANDELBOX).expect("Mandelbox example must parse");
         assert_eq!(box_scene.name, "mandelbox");
         assert_eq!(box_scene.config.fractal.kind(), FractalKind::Mandelbox);
+        assert_eq!(box_scene.config.quality.samples_per_pixel, 16);
+        assert_eq!(box_scene.config.camera.aperture_radius, 0.12);
+        assert!(box_scene.config.quality.tone_mapping.enabled);
     }
 
     #[test]
@@ -464,6 +643,14 @@ mod tests {
         );
         assert_eq!(reparsed.config.camera.target, original.config.camera.target);
         assert_eq!(reparsed.config.render.width, original.config.render.width);
+        assert_eq!(
+            reparsed.config.quality.samples_per_pixel,
+            original.config.quality.samples_per_pixel
+        );
+        assert_eq!(
+            reparsed.config.camera.focus_distance,
+            original.config.camera.focus_distance
+        );
         assert_eq!(
             reparsed.config.fractal.kind(),
             original.config.fractal.kind()
@@ -552,6 +739,17 @@ mod tests {
             final_frame.camera_distance,
             Qf32::from_str("1e-26").unwrap()
         );
+        let deep_distance = final_frame.camera_distance.to_f32();
+        assert_eq!(final_frame.config.camera.focus_distance, deep_distance);
+        assert!(
+            (final_frame.config.camera.aperture_radius / deep_distance - 0.06 / 11.0).abs()
+                < 1.0e-6
+        );
+        assert!(
+            (final_frame.config.quality.ambient_occlusion.radius / deep_distance - 1.25 / 11.0)
+                .abs()
+                < 1.0e-6
+        );
 
         let yaml = scene.to_yaml().expect("animation scene must serialize");
         let reparsed = parse_scene(&yaml).expect("serialized animation must parse");
@@ -584,7 +782,11 @@ mod tests {
 
     #[test]
     fn rejects_animation_beyond_the_measured_quad_depth() {
-        let yaml = MANDELBOX_QUAD_ZOOM.replacen("1e-26", "1e-27", 1);
+        let yaml = MANDELBOX_QUAD_ZOOM.replacen(
+            "minimum_distance: \"1e-26\"",
+            "minimum_distance: \"1e-27\"",
+            1,
+        );
         let error = parse_scene(&yaml).expect_err("unverified depth must fail");
         assert!(
             error

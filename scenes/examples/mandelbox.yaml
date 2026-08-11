@@ -9,6 +9,9 @@ camera:
   target: [2.212921, 1.099011, 0.307275]
   up: [0.0, 0.0, 1.0]
   vertical_fov_degrees: 30.0
+  # Thin-lens depth of field. Set aperture_radius to 0.0 for a pinhole camera.
+  aperture_radius: 0.12
+  focus_distance: 11.0
 
 fractal:
   kind: mandelbox
@@ -31,3 +34,25 @@ render:
   epsilon: 5.0e-8
   step_safety: 0.93
   pixel_epsilon_multiplier: 1.5
+
+# Phase 5 offline-quality effects. samples_per_pixel controls convergence for
+# antialiasing, depth of field, area-light shadows, AO, and rough reflections.
+quality:
+  samples_per_pixel: 16
+  ambient_occlusion:
+    max_steps: 64
+    radius: 1.25
+    strength: 0.72
+  soft_shadow:
+    max_steps: 96
+    angular_radius_degrees: 1.5
+    max_distance: 16.0
+  reflection:
+    max_steps: 96
+    max_distance: 14.0
+    strength: 0.12
+    roughness: 0.08
+  tone_mapping:
+    enabled: true
+    exposure_stops: -0.35
+    white_point: 3.0

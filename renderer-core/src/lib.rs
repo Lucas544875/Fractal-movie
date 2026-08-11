@@ -15,8 +15,10 @@ pub use animation::{
     AnimationConfig, AnimationFrame, AnimationPath, MAX_ANIMATION_FPS, MAX_ANIMATION_FRAMES,
 };
 pub use config::{
-    CameraConfig, FractalConfig, FractalKind, LightConfig, MIN_QUAD_CAMERA_DISTANCE,
-    MandelboxConfig, MandelbulbConfig, Precision, RenderConfig, RenderSettings,
+    AmbientOcclusionConfig, CameraConfig, FractalConfig, FractalKind, LightConfig,
+    MAX_SAMPLES_PER_PIXEL, MAX_SECONDARY_RAY_STEPS, MIN_QUAD_CAMERA_DISTANCE, MandelboxConfig,
+    MandelbulbConfig, Precision, QualityConfig, ReflectionConfig, RenderConfig, RenderSettings,
+    SoftShadowConfig, ToneMappingConfig,
 };
 pub use fractal::{DistanceEstimator, HighPrecisionDistanceEstimator};
 pub use path::{ExponentialDivePath, PathTarget, TargetPicker, TargetSearchConfig};

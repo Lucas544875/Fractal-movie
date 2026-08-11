@@ -13,13 +13,15 @@ Rust、wgpu、WGSL で3次元フラクタルを描画する、ウィンドウ不
 - scene定義のFPS/frame countによるquad-float animationとフレーム単位の動的DE調整
 - `frame_%06d.png`連番、検証付きresume、任意フレーム出力、明示的overwrite
 - scene/CLIで設定できるFFmpeg動画encodeと原子的な動画出力
+- HDR sample accumulation、AO、面積を持つdirectional lightのsoft shadow、1 bounce reflection
+- 薄レンズcameraによる被写界深度・円形ボケとextended Reinhard tone mapping
 - `Rgba8UnormSrgb` オフスクリーン texture から row alignment を考慮した readback
 - PNG 出力を GPU renderer から分離
 - 解像度、ray steps、fractal iterations、NaN/Inf などの事前 validation
 - WGSL validation error を文脈付きエラーとして報告
 - GPU 名、解像度、フレーム時間、合計時間のログ
 
-Phase 4まで実装済みで、PNG連番とFFmpeg動画encodeをCLIから一続きで実行できます。
+Phase 5まで実装済みで、offline品質の光学・ライティング効果を含むPNG連番とFFmpeg動画encodeをCLIから一続きで実行できます。
 
 ## 必要環境
 
@@ -112,7 +114,7 @@ cargo run --release -p fractal-renderer-cli -- \
   render scenes/examples/mandelbulb.yaml
 ```
 
-主要フィールドは `fractal.kind/parameters`、`camera.position/target/up/vertical_fov_degrees`、`light.direction`、`render.width/height/max_steps/max_distance/epsilon/step_safety/pixel_epsilon_multiplier`、`animation`、`video`、`seed`、`precision` です。未知の version・フィールドや範囲外の値はエラーにし、自由な WGSL 全体は scene に埋め込みません。
+主要フィールドは `fractal.kind/parameters`、`camera.position/target/up/vertical_fov_degrees/aperture_radius/focus_distance`、`light.direction`、`render.width/height/max_steps/max_distance/epsilon/step_safety/pixel_epsilon_multiplier`、`quality`、`animation`、`video`、`seed`、`precision` です。未知の version・フィールドや範囲外の値はエラーにし、自由な WGSL 全体は scene に埋め込みません。
 
 scene の値は、明示した CLI オプションだけで上書きできます。
 
@@ -215,7 +217,7 @@ cargo run --release -p fractal-renderer-cli -- render \
 
 各PNGは一時ファイルへのencode完了後にrenameされるため、中断時に未完成のフレームを完成済みとして扱いません。quad-float Mandelboxでは各フレームのcamera distanceに合わせてDE反復数、`max_distance`、`epsilon`を再計算し、GPU pipeline・texture・readback bufferは連番全体で再利用します。経路は`renderer-core/src/path.rs`、timelineとcamera合成は`renderer-core/src/animation.rs`に分離してあり、予定している経路選択アルゴリズムからも再利用できます。
 
-RTX 3070 / GL backendの320x180回帰テストでは、同一rendererで始点・中間・終点を連続描画し、距離1e-26の終点まで有効な色分布を確認しています。実測した単一フレーム時間は0.42〜0.45秒でした。
+RTX 3070 / GL backendの320x180回帰テストでは、同一rendererで始点・中間・終点を連続描画し、距離1e-26の終点まで有効な色分布を確認しています。Phase 3時点の1 spp・追加効果offでは、実測した単一フレーム時間は0.42〜0.45秒でした。
 
 ## FFmpeg による動画生成（Phase 4・実装済み）
 
@@ -270,6 +272,51 @@ cargo run --release -p fractal-renderer-cli -- render \
 
 FFmpegの存在とversionは長時間renderの開始前に確認します。encode開始前には全PNGを完全decodeし、欠落・破損・解像度不一致があればFFmpegを起動しません。動画は同じcontainer拡張子を持つ一時ファイルへ生成して成功後にrenameするため、FFmpeg失敗時もPNG連番と既存動画を削除・破損しません。
 
+## Offline quality（Phase 5・実装済み）
+
+`scenes/examples/mandelbox.yaml`は16 sppの静止画、`scenes/examples/mandelbox-quad-zoom.yaml`は8 sppの動画向け設定例です。全sampleはlinear HDRで加算・平均し、tone mappingを1画素につき最後の1回だけ適用します。`Rgba8UnormSrgb`への書き込み時にGPUがlinearからsRGBへ変換するため、shader内でgammaを二重適用しません。
+
+```yaml
+camera:
+  # ほかのcamera fieldは省略
+  aperture_radius: 0.12  # world単位。0.0でpinhole camera
+  focus_distance: 11.0   # lens面から合焦面までの距離
+
+quality:
+  samples_per_pixel: 16  # 1..64
+  ambient_occlusion:
+    max_steps: 64        # 0でoff、上限256
+    radius: 1.25
+    strength: 0.72
+  soft_shadow:
+    max_steps: 96        # 0でoff、上限256
+    angular_radius_degrees: 1.5
+    max_distance: 16.0
+  reflection:
+    max_steps: 96        # 0またはstrength 0でoff、上限256
+    max_distance: 14.0
+    strength: 0.12
+    roughness: 0.08
+  tone_mapping:
+    enabled: true
+    exposure_stops: -0.35
+    white_point: 3.0
+```
+
+camera rayは画素内をjitterし、`aperture_radius`の円板上から`focus_distance`の合焦面へ向け直します。円形開口なので、焦点外のhighlightは円形ボケとして蓄積されます。soft shadowはdirectional lightの角半径内、AOは法線半球内、rough reflectionは反射方向の周囲を同じ決定的seedから分散samplingします。noiseが見える場合はまず`samples_per_pixel`を増やしてください。被写界深度を強くするには`aperture_radius`を増やし、合焦位置は`focus_distance`で調整します。
+
+quad-float animationではcamera distanceの変化に合わせ、`focus_distance`、`aperture_radius`、AO半径、shadow/reflection trace距離を同じ比率で自動scaleします。このため1e-26までzoomしても、world単位の効果範囲だけがoverview scaleに取り残されません。sampling上限と二次ray step上限はCPU validationとWGSLの固定長loopで一致させています。
+
+RTX 3070 / GL backend、320x180の実測では、16 sppのf32静止画が0.72秒、8 sppで全効果を有効にしたquad-float距離1e-26の最終frameが1.52秒でした。GL driverでquad-float pipelineを初めて作る際は約60秒のshader compileが発生しましたが、animation中は同じpipelineを全frameで再利用するためframe時間には含まれません。数値はGPU・backend・driverで変わります。
+
+設計と実装では次の一次文献を参照しました。
+
+- Cook, Porter, Carpenter, [Distributed Ray Tracing](https://graphics.pixar.com/library/DistributedRayTracing/paper.pdf)（画素・lens・light・反射方向の分散sampling、被写界深度、soft shadow）
+- Whitted, [An Improved Illumination Model for Shaded Display](https://doi.org/10.1145/358876.358882)（shadow rayとspecular secondary ray）
+- Hart, [Sphere Tracing: A Geometric Method for the Antialiased Ray Tracing of Implicit Surfaces](https://doi.org/10.1007/s003710050084)（SDF/DEの一次・二次visibility query）
+- Bunnell, [Dynamic Ambient Occlusion and Indirect Lighting](https://developer.nvidia.com/gpugems/gpugems2/part-ii-shading-lighting-and-shadows/chapter-14-dynamic-ambient-occlusion-and)（法線半球に対するaccessibilityとしてのAO）
+- Reinhard et al., [Photographic Tone Reproduction for Digital Images](https://www-old.cs.utah.edu/docs/techreports/2002/pdf/UUCS-02-001.pdf)（white pointを持つextended global operator）
+
 ## ディレクトリ構成
 
 ```text
@@ -277,6 +324,7 @@ FFmpegの存在とversionは長時間renderの開始前に確認します。enco
 ├── Cargo.toml                    # Cargo workspace
 ├── renderer-core/
 │   ├── camera.wgsl              # camera ray と共通関数
+│   ├── quality.wgsl             # sampling、方向分布、HDR tone mapping
 │   ├── raymarch.wgsl            # fullscreen triangle と sphere tracing
 │   ├── shading.wgsl             # normal と lighting
 │   ├── fractal/
@@ -305,5 +353,5 @@ FFmpegの存在とversionは長時間renderの開始前に確認します。enco
 2. Phase 2.5（完了）: 4×`f32` quad-float、`QfVec3`、高精度camera/DE/path、精度・性能検証
 3. Phase 3（完了）: quad-float対応animation、指数ズーム、連番、resume、`--frame`、`--overwrite`
 4. Phase 4（完了）: configurable FFmpeg integration、検証付き動画encode
-5. Phase 5: accumulation、AO、soft shadow、reflection、HDR/tone mapping
+5. Phase 5（完了）: HDR accumulation、AO、soft shadow、reflection、thin-lens DOF、tone mapping
 6. Phase 6: fractal DSL/AST、限定的な WGSL 生成と validation

@@ -562,6 +562,24 @@ fn print_renderer_summary(renderer: &Renderer, config: &RenderConfig) {
         "Resolution: {}x{}",
         config.render.width, config.render.height
     );
+    println!(
+        "Quality: {} spp, DOF={}, AO={}, soft-shadow={}, reflection={}, tone-mapping={}",
+        config.quality.samples_per_pixel,
+        enabled_label(config.camera.aperture_radius > 0.0),
+        enabled_label(
+            config.quality.ambient_occlusion.max_steps > 0
+                && config.quality.ambient_occlusion.strength > 0.0
+        ),
+        enabled_label(config.quality.soft_shadow.max_steps > 0),
+        enabled_label(
+            config.quality.reflection.max_steps > 0 && config.quality.reflection.strength > 0.0
+        ),
+        enabled_label(config.quality.tone_mapping.enabled),
+    );
+}
+
+const fn enabled_label(enabled: bool) -> &'static str {
+    if enabled { "on" } else { "off" }
 }
 
 fn animation_frame_path(directory: &Path, frame_index: u32) -> PathBuf {

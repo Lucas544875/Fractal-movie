@@ -1,4 +1,5 @@
 const CAMERA: &str = include_str!("../camera.wgsl");
+const QUALITY: &str = include_str!("../quality.wgsl");
 const MANDELBULB: &str = include_str!("../fractal/mandelbulb.wgsl");
 const MANDELBOX: &str = include_str!("../fractal/mandelbox.wgsl");
 const MANDELBOX_QUAD: &str = include_str!("../fractal/mandelbox_quad.wgsl");
@@ -21,6 +22,7 @@ pub(crate) fn fractal_source(kind: FractalKind, precision: Precision) -> String 
         debug_assert_eq!(kind, FractalKind::Mandelbox);
         return [
             CAMERA,
+            QUALITY,
             QUAD_FLOAT,
             QUAD_FLOAT_VEC3,
             MANDELBOX_QUAD,
@@ -33,7 +35,7 @@ pub(crate) fn fractal_source(kind: FractalKind, precision: Precision) -> String 
         FractalKind::Mandelbulb => MANDELBULB,
         FractalKind::Mandelbox => MANDELBOX,
     };
-    [CAMERA, fractal, SHADING, RAYMARCH].join("\n")
+    [CAMERA, QUALITY, fractal, SHADING, RAYMARCH].join("\n")
 }
 
 #[cfg(test)]

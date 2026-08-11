@@ -62,6 +62,18 @@ struct RenderUniforms {
     camera_target_qf_x: [f32; 4],
     camera_target_qf_y: [f32; 4],
     camera_target_qf_z: [f32; 4],
+    // x: aperture radius, y: focus distance
+    camera_lens: [f32; 4],
+    // x: AO radius, y: AO strength
+    ambient_occlusion: [f32; 4],
+    // x: angular radius (radians), y: maximum trace distance
+    soft_shadow: [f32; 4],
+    // x: strength, y: roughness, z: maximum trace distance
+    reflection: [f32; 4],
+    // x: exposure stops, y: white point, z: enabled
+    tone_mapping: [f32; 4],
+    // x: samples, y: AO steps, z: shadow steps, w: reflection steps
+    quality_limits: [u32; 4],
 }
 
 impl RenderUniforms {
@@ -113,6 +125,46 @@ impl RenderUniforms {
             camera_target_qf_x: config.camera.target.x.limbs(),
             camera_target_qf_y: config.camera.target.y.limbs(),
             camera_target_qf_z: config.camera.target.z.limbs(),
+            camera_lens: [
+                config.camera.aperture_radius,
+                config.camera.focus_distance,
+                0.0,
+                0.0,
+            ],
+            ambient_occlusion: [
+                config.quality.ambient_occlusion.radius,
+                config.quality.ambient_occlusion.strength,
+                0.0,
+                0.0,
+            ],
+            soft_shadow: [
+                config
+                    .quality
+                    .soft_shadow
+                    .angular_radius_degrees
+                    .to_radians(),
+                config.quality.soft_shadow.max_distance,
+                0.0,
+                0.0,
+            ],
+            reflection: [
+                config.quality.reflection.strength,
+                config.quality.reflection.roughness,
+                config.quality.reflection.max_distance,
+                0.0,
+            ],
+            tone_mapping: [
+                config.quality.tone_mapping.exposure_stops,
+                config.quality.tone_mapping.white_point,
+                u32::from(config.quality.tone_mapping.enabled) as f32,
+                0.0,
+            ],
+            quality_limits: [
+                config.quality.samples_per_pixel,
+                config.quality.ambient_occlusion.max_steps,
+                config.quality.soft_shadow.max_steps,
+                config.quality.reflection.max_steps,
+            ],
         }
     }
 }

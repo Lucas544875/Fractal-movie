@@ -17,6 +17,10 @@ camera:
     - [0.0, 0.0, 0.0, 0.0]
   up: [0.0, 0.0, 1.0]
   vertical_fov_degrees: 30.0
+  # The animation sampler scales both values with camera distance, preserving
+  # the same relative focus plane and aperture through the 1e-26 dive.
+  aperture_radius: 0.06
+  focus_distance: 11.0
 
 fractal:
   kind: mandelbox
@@ -41,6 +45,26 @@ render:
   epsilon: 1.1e-6
   step_safety: 0.9
   pixel_epsilon_multiplier: 1.5
+
+quality:
+  samples_per_pixel: 8
+  ambient_occlusion:
+    max_steps: 48
+    radius: 1.25
+    strength: 0.65
+  soft_shadow:
+    max_steps: 64
+    angular_radius_degrees: 1.25
+    max_distance: 16.0
+  reflection:
+    max_steps: 64
+    max_distance: 14.0
+    strength: 0.10
+    roughness: 0.06
+  tone_mapping:
+    enabled: true
+    exposure_stops: -0.35
+    white_point: 3.0
 
 animation:
   fps: 60

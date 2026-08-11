@@ -1,7 +1,7 @@
 use crate::{
     CameraConfig, ExponentialDivePath, FractalConfig, LightConfig, MIN_QUAD_CAMERA_DISTANCE,
-    MandelboxConfig, PathTarget, Precision, Qf32, QfVec3, RenderConfig, RenderSettings,
-    TargetPicker, TargetSearchConfig,
+    MandelboxConfig, PathTarget, Precision, Qf32, QfVec3, QualityConfig, RenderConfig,
+    RenderSettings, TargetPicker, TargetSearchConfig,
 };
 
 const MANDELBOX_LIGHT: [f32; 3] = [2.0, 1.0, 1.0];
@@ -50,6 +50,8 @@ impl RenderConfig {
                 target: QfVec3::from_f32(target.point.to_f32()),
                 up: [0.0, 0.0, 1.0],
                 vertical_fov_degrees: 30.0,
+                aperture_radius: 0.0,
+                focus_distance: 11.0,
             },
             fractal: FractalConfig::Mandelbox(fractal),
             light: LightConfig {
@@ -64,6 +66,7 @@ impl RenderConfig {
                 step_safety: 0.93,
                 pixel_epsilon_multiplier: 1.5,
             },
+            quality: QualityConfig::default(),
             seed,
         }
     }
@@ -100,6 +103,8 @@ impl RenderConfig {
                 target: target.point,
                 up: [0.0, 0.0, 1.0],
                 vertical_fov_degrees: 30.0,
+                aperture_radius: 0.0,
+                focus_distance: camera_distance.to_f32(),
             },
             fractal: FractalConfig::Mandelbox(fractal),
             light: LightConfig {
@@ -114,6 +119,7 @@ impl RenderConfig {
                 step_safety: 0.9,
                 pixel_epsilon_multiplier: 1.5,
             },
+            quality: QualityConfig::default(),
             seed,
         };
         config.tune_mandelbox_quad_zoom(camera_distance).ok()?;
@@ -145,6 +151,17 @@ impl RenderConfig {
         fractal.iterations = quad_iterations_for_distance(camera_distance, fractal.scale);
         self.render.max_distance = distance_f32 * 4.0;
         self.render.epsilon = (distance_f32 * 1.0e-7).max(1.0e-30);
+        let old_focus_distance = self.camera.focus_distance;
+        let zoom_scale = if old_focus_distance.is_finite() && old_focus_distance > 0.0 {
+            distance_f32 / old_focus_distance
+        } else {
+            1.0
+        };
+        self.camera.focus_distance = distance_f32;
+        self.camera.aperture_radius *= zoom_scale;
+        self.quality.ambient_occlusion.radius *= zoom_scale;
+        self.quality.soft_shadow.max_distance *= zoom_scale;
+        self.quality.reflection.max_distance *= zoom_scale;
         Ok(())
     }
 }

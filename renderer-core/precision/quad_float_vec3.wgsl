@@ -55,24 +55,23 @@ fn qfv_uniform_target() -> QfVec3 {
     );
 }
 
+fn qfv_camera_basis() -> CameraBasis {
+    let difference = qfv_subtract(qfv_uniform_target(), qfv_uniform_position());
+    let scale = max(max(abs(difference.x.x), abs(difference.y.x)), abs(difference.z.x));
+    return camera_basis_from_forward(
+        qfv_to_f32(qfv_multiply(difference, qf_from_f32(1.0 / scale))),
+    );
+}
+
 fn qfv_camera_ray(pixel: vec2<f32>) -> vec3<f32> {
     let resolution = uniforms.resolution_time_frame.xy;
     var screen = (2.0 * pixel - resolution) / resolution.y;
     screen.y = -screen.y;
 
-    let difference = qfv_subtract(qfv_uniform_target(), qfv_uniform_position());
-    let scale = max(max(abs(difference.x.x), abs(difference.y.x)), abs(difference.z.x));
-    let forward = safe_normalize(qfv_to_f32(qfv_multiply(difference, qf_from_f32(1.0 / scale))), vec3<f32>(0.0, 0.0, -1.0));
-    var world_up = safe_normalize(uniforms.camera_up.xyz, vec3<f32>(0.0, 1.0, 0.0));
-    if abs(dot(forward, world_up)) > 0.999 {
-        world_up = select(
-            vec3<f32>(0.0, 1.0, 0.0),
-            vec3<f32>(1.0, 0.0, 0.0),
-            abs(forward.y) > 0.999,
-        );
-    }
-    let right = safe_normalize(cross(forward, world_up), vec3<f32>(1.0, 0.0, 0.0));
-    let up = cross(right, forward);
+    let basis = qfv_camera_basis();
     let focal_scale = tan(0.5 * uniforms.camera_position_fov.w);
-    return safe_normalize(forward + focal_scale * (screen.x * right + screen.y * up), forward);
+    return safe_normalize(
+        basis.forward + focal_scale * (screen.x * basis.right + screen.y * basis.up),
+        basis.forward,
+    );
 }

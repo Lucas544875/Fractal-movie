@@ -46,6 +46,8 @@ fn shade_fractal(
     normal: vec3<f32>,
     step_ratio: f32,
     light: vec3<f32>,
+    direct_visibility: f32,
+    ambient_visibility: f32,
 ) -> vec3<f32> {
     let diffuse = max(dot(normal, light), 0.0);
     let half_vector = safe_normalize(light - ray_direction, light);
@@ -55,9 +57,11 @@ fn shade_fractal(
     let height_color = 0.5 + 0.5 * sin(vec3<f32>(0.2, 1.7, 3.5) + p.z * 2.3);
     let base = mix(vec3<f32>(0.12, 0.22, 0.42), vec3<f32>(0.95, 0.38, 0.12), height_color);
     let march_occlusion = mix(1.0, 0.72, clamp(step_ratio, 0.0, 1.0));
-    return base * (0.16 + 0.84 * diffuse) * march_occlusion
-        + vec3<f32>(1.0, 0.82, 0.58) * specular * 0.55
-        + vec3<f32>(0.12, 0.22, 0.40) * rim * 0.32;
+    return base * (
+            0.16 * ambient_visibility + 0.84 * diffuse * direct_visibility
+        ) * march_occlusion
+        + vec3<f32>(1.0, 0.82, 0.58) * specular * 0.55 * direct_visibility
+        + vec3<f32>(0.12, 0.22, 0.40) * rim * 0.32 * ambient_visibility;
 }
 
 fn fractal_background(ray_direction: vec3<f32>) -> vec3<f32> {

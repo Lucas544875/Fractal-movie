@@ -101,10 +101,14 @@ fn shade_fractal(
     normal: vec3<f32>,
     step_ratio: f32,
     light: vec3<f32>,
+    direct_visibility: f32,
+    ambient_visibility: f32,
 ) -> vec3<f32> {
     let base = vec3<f32>(0.454, 0.301, 0.211);
     let diffuse = max(dot(light, normal), 0.0);
-    var color = base * (0.7 + 1.1 * diffuse);
+    var color = base * (
+        0.7 * ambient_visibility + 1.1 * diffuse * direct_visibility
+    );
     color += incandescent_source(p, vec3<f32>( 2.0, 0.0, 0.0));
     color += incandescent_source(p, vec3<f32>(-2.0, 0.0, 0.0));
     color += incandescent_source(p, vec3<f32>(0.0,  2.0, 0.0));
@@ -112,7 +116,7 @@ fn shade_fractal(
     color += incandescent_source(p, vec3<f32>(0.0, 0.0,  2.0));
     color += incandescent_source(p, vec3<f32>(0.0, 0.0, -2.0));
     color += smoothstep(0.0, 0.95, step_ratio) * vec3<f32>(1.0, 0.501, 0.2);
-    return pow(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(2.2));
+    return max(color, vec3<f32>(0.0));
 }
 
 fn fractal_background(ray_direction: vec3<f32>) -> vec3<f32> {

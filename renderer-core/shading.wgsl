@@ -22,5 +22,5 @@ fn shade_surface(
 ) -> vec3<f32> {
     let normal = estimate_normal(p, hit_epsilon);
     let light = safe_normalize(uniforms.light_direction.xyz, vec3<f32>(-0.4, 0.8, 0.5));
-    return shade_fractal(p, ray_direction, normal, step_ratio, light);
+    return shade_fractal(p, ray_direction, normal, step_ratio, light, 1.0, 1.0);
 }

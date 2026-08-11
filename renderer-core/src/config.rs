@@ -7,6 +7,8 @@ pub const MAX_IMAGE_DIMENSION: u32 = 8_192;
 pub const MAX_PIXEL_COUNT: u64 = 33_554_432;
 pub const MAX_RAY_STEPS: u32 = 1_024;
 pub const MAX_FRACTAL_ITERATIONS: u32 = 96;
+pub const MAX_SAMPLES_PER_PIXEL: u32 = 64;
+pub const MAX_SECONDARY_RAY_STEPS: u32 = 256;
 /// Deepest camera-to-target separation validated for the built-in quad-float
 /// Mandelbox path. One decade deeper reaches the representation's guard-bit
 /// boundary on the current GL backend.
@@ -20,6 +22,10 @@ pub struct CameraConfig {
     /// Mandelbox uses the original WebGL scene's Z-up convention.
     pub up: [f32; 3],
     pub vertical_fov_degrees: f32,
+    /// Thin-lens radius in world units. Zero selects the pinhole camera.
+    pub aperture_radius: f32,
+    /// Distance from the lens plane to the plane of sharp focus.
+    pub focus_distance: f32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -125,6 +131,78 @@ pub struct LightConfig {
     pub direction: [f32; 3],
 }
 
+/// Hemisphere visibility sampled around the surface normal.
+#[derive(Clone, Debug)]
+pub struct AmbientOcclusionConfig {
+    pub max_steps: u32,
+    pub radius: f32,
+    pub strength: f32,
+}
+
+/// A finite angular directional light, accumulated into a soft shadow.
+#[derive(Clone, Debug)]
+pub struct SoftShadowConfig {
+    pub max_steps: u32,
+    pub angular_radius_degrees: f32,
+    pub max_distance: f32,
+}
+
+/// One distributed specular bounce.
+#[derive(Clone, Debug)]
+pub struct ReflectionConfig {
+    pub max_steps: u32,
+    pub max_distance: f32,
+    pub strength: f32,
+    pub roughness: f32,
+}
+
+/// Extended Reinhard photographic tone reproduction.
+#[derive(Clone, Debug)]
+pub struct ToneMappingConfig {
+    pub enabled: bool,
+    pub exposure_stops: f32,
+    pub white_point: f32,
+}
+
+/// Offline sampling and secondary-light transport controls.
+#[derive(Clone, Debug)]
+pub struct QualityConfig {
+    pub samples_per_pixel: u32,
+    pub ambient_occlusion: AmbientOcclusionConfig,
+    pub soft_shadow: SoftShadowConfig,
+    pub reflection: ReflectionConfig,
+    pub tone_mapping: ToneMappingConfig,
+}
+
+impl Default for QualityConfig {
+    fn default() -> Self {
+        Self {
+            samples_per_pixel: 1,
+            ambient_occlusion: AmbientOcclusionConfig {
+                max_steps: 0,
+                radius: 1.0,
+                strength: 0.0,
+            },
+            soft_shadow: SoftShadowConfig {
+                max_steps: 0,
+                angular_radius_degrees: 0.0,
+                max_distance: 10.0,
+            },
+            reflection: ReflectionConfig {
+                max_steps: 0,
+                max_distance: 10.0,
+                strength: 0.0,
+                roughness: 0.0,
+            },
+            tone_mapping: ToneMappingConfig {
+                enabled: false,
+                exposure_stops: 0.0,
+                white_point: 4.0,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RenderSettings {
     pub width: u32,
@@ -147,6 +225,7 @@ pub struct RenderConfig {
     pub fractal: FractalConfig,
     pub light: LightConfig,
     pub render: RenderSettings,
+    pub quality: QualityConfig,
     pub seed: u32,
 }
 
@@ -159,6 +238,8 @@ impl Default for RenderConfig {
                 target: QfVec3::ZERO,
                 up: [0.0, 1.0, 0.0],
                 vertical_fov_degrees: 38.0,
+                aperture_radius: 0.0,
+                focus_distance: 4.0,
             },
             fractal: FractalConfig::default(),
             light: LightConfig {
@@ -173,6 +254,7 @@ impl Default for RenderConfig {
                 step_safety: 1.0,
                 pixel_epsilon_multiplier: 0.0,
             },
+            quality: QualityConfig::default(),
             seed: 12_345,
         }
     }
@@ -254,6 +336,40 @@ impl RenderConfig {
         if !fov.is_finite() || !(1.0..179.0).contains(&fov) {
             bail!("vertical camera FOV must be finite and in 1.0..179.0 degrees");
         }
+        if !self.camera.aperture_radius.is_finite() || self.camera.aperture_radius < 0.0 {
+            bail!("camera aperture_radius must be finite and non-negative");
+        }
+        finite_positive("camera focus_distance", self.camera.focus_distance)?;
+        let quality = &self.quality;
+        if quality.samples_per_pixel == 0 || quality.samples_per_pixel > MAX_SAMPLES_PER_PIXEL {
+            bail!("samples_per_pixel must be in 1..={MAX_SAMPLES_PER_PIXEL}");
+        }
+        validate_secondary_steps(
+            "ambient_occlusion.max_steps",
+            quality.ambient_occlusion.max_steps,
+        )?;
+        finite_positive("ambient_occlusion.radius", quality.ambient_occlusion.radius)?;
+        finite_unit_interval(
+            "ambient_occlusion.strength",
+            quality.ambient_occlusion.strength,
+        )?;
+        validate_secondary_steps("soft_shadow.max_steps", quality.soft_shadow.max_steps)?;
+        if !quality.soft_shadow.angular_radius_degrees.is_finite()
+            || !(0.0..=45.0).contains(&quality.soft_shadow.angular_radius_degrees)
+        {
+            bail!("soft_shadow.angular_radius_degrees must be finite and in 0.0..=45.0");
+        }
+        finite_positive("soft_shadow.max_distance", quality.soft_shadow.max_distance)?;
+        validate_secondary_steps("reflection.max_steps", quality.reflection.max_steps)?;
+        finite_positive("reflection.max_distance", quality.reflection.max_distance)?;
+        finite_unit_interval("reflection.strength", quality.reflection.strength)?;
+        finite_unit_interval("reflection.roughness", quality.reflection.roughness)?;
+        if !quality.tone_mapping.exposure_stops.is_finite()
+            || !(-20.0..=20.0).contains(&quality.tone_mapping.exposure_stops)
+        {
+            bail!("tone_mapping.exposure_stops must be finite and in -20.0..=20.0");
+        }
+        finite_positive("tone_mapping.white_point", quality.tone_mapping.white_point)?;
         finite_coordinate("camera position", self.camera.position)?;
         finite_coordinate("camera target", self.camera.target)?;
         finite_vector("camera up", self.camera.up)?;
@@ -281,6 +397,20 @@ impl RenderConfig {
 fn finite_positive(name: &str, value: f32) -> Result<()> {
     if !value.is_finite() || value <= 0.0 {
         bail!("{name} must be finite and greater than zero");
+    }
+    Ok(())
+}
+
+fn finite_unit_interval(name: &str, value: f32) -> Result<()> {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        bail!("{name} must be finite and in 0.0..=1.0");
+    }
+    Ok(())
+}
+
+fn validate_secondary_steps(name: &str, value: u32) -> Result<()> {
+    if value > MAX_SECONDARY_RAY_STEPS {
+        bail!("{name} must not exceed {MAX_SECONDARY_RAY_STEPS}");
     }
     Ok(())
 }
@@ -334,6 +464,14 @@ mod tests {
         };
         fractal.iterations = MAX_FRACTAL_ITERATIONS + 1;
         assert!(config.validate().is_err());
+
+        config = RenderConfig::default();
+        config.quality.samples_per_pixel = MAX_SAMPLES_PER_PIXEL + 1;
+        assert!(config.validate().is_err());
+
+        config = RenderConfig::default();
+        config.quality.reflection.max_steps = MAX_SECONDARY_RAY_STEPS + 1;
+        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -350,6 +488,25 @@ mod tests {
     fn rejects_degenerate_camera() {
         let mut config = RenderConfig::default();
         config.camera.target = config.camera.position;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validates_phase_five_quality_controls() {
+        let mut config = RenderConfig::default();
+        config.camera.aperture_radius = 0.1;
+        config.camera.focus_distance = 4.0;
+        config.quality.samples_per_pixel = 16;
+        config.quality.ambient_occlusion.max_steps = 32;
+        config.quality.ambient_occlusion.strength = 0.8;
+        config.quality.soft_shadow.max_steps = 64;
+        config.quality.soft_shadow.angular_radius_degrees = 2.0;
+        config.quality.reflection.max_steps = 48;
+        config.quality.reflection.strength = 0.2;
+        config.quality.tone_mapping.enabled = true;
+        config.validate().expect("Phase 5 settings must validate");
+
+        config.quality.reflection.roughness = 1.1;
         assert!(config.validate().is_err());
     }
 }
