@@ -6,9 +6,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AmbientOcclusionConfig, AnimationConfig, AnimationPath, CameraConfig, DslFractalConfig,
     DslMaterial, DslPaletteStop, ExponentialDivePath, FractalConfig, LightConfig, MandelboxConfig,
-    MandelbulbConfig, OrbitTransform, Precision, Qf32, QfVec3, QualityConfig, ReflectionConfig,
-    RenderConfig, RenderSettings, SoftShadowConfig, ToneMappingConfig, ToneMappingOperator,
-    VideoConfig,
+    MandelbulbConfig, OrbitTransform, PostProcessConfig, Precision, Qf32, QfVec3, QualityConfig,
+    ReflectionConfig, RenderConfig, RenderSettings, SoftShadowConfig, ToneMappingConfig,
+    ToneMappingOperator, VideoConfig,
 };
 
 pub const CURRENT_SCENE_VERSION: u32 = 1;
@@ -246,6 +246,7 @@ struct SceneQuality {
     soft_shadow: SceneSoftShadow,
     reflection: SceneReflection,
     tone_mapping: SceneToneMapping,
+    post_process: ScenePostProcess,
 }
 
 impl Default for SceneQuality {
@@ -321,6 +322,23 @@ enum SceneToneMappingOperator {
 impl Default for SceneToneMapping {
     fn default() -> Self {
         Self::from(&QualityConfig::default().tone_mapping)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+struct ScenePostProcess {
+    enabled: bool,
+    exposure_stops: f32,
+    contrast: f32,
+    saturation: f32,
+    gamma: f32,
+    vignette_strength: f32,
+}
+
+impl Default for ScenePostProcess {
+    fn default() -> Self {
+        Self::from(&QualityConfig::default().post_process)
     }
 }
 
@@ -755,6 +773,14 @@ impl From<SceneQuality> for QualityConfig {
                 gamma: quality.tone_mapping.gamma,
                 saturation: quality.tone_mapping.saturation,
             },
+            post_process: PostProcessConfig {
+                enabled: quality.post_process.enabled,
+                exposure_stops: quality.post_process.exposure_stops,
+                contrast: quality.post_process.contrast,
+                saturation: quality.post_process.saturation,
+                gamma: quality.post_process.gamma,
+                vignette_strength: quality.post_process.vignette_strength,
+            },
         }
     }
 }
@@ -767,6 +793,7 @@ impl From<&QualityConfig> for SceneQuality {
             soft_shadow: SceneSoftShadow::from(&quality.soft_shadow),
             reflection: SceneReflection::from(&quality.reflection),
             tone_mapping: SceneToneMapping::from(&quality.tone_mapping),
+            post_process: ScenePostProcess::from(&quality.post_process),
         }
     }
 }
@@ -816,6 +843,19 @@ impl From<&ToneMappingConfig> for SceneToneMapping {
             contrast: config.contrast,
             gamma: config.gamma,
             saturation: config.saturation,
+        }
+    }
+}
+
+impl From<&PostProcessConfig> for ScenePostProcess {
+    fn from(config: &PostProcessConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            exposure_stops: config.exposure_stops,
+            contrast: config.contrast,
+            saturation: config.saturation,
+            gamma: config.gamma,
+            vignette_strength: config.vignette_strength,
         }
     }
 }
@@ -1081,10 +1121,10 @@ mod tests {
         assert_eq!(fractal.color_iterations, 500);
         assert_eq!(fractal.orbit.len(), 2);
         assert_eq!(fractal.material.surface_palette.len(), 13);
-        assert_eq!(scene.config.render.width, 405);
-        assert_eq!(scene.config.render.height, 270);
+        assert_eq!(scene.config.render.width, 1620);
+        assert_eq!(scene.config.render.height, 1080);
         assert_eq!(scene.config.quality.samples_per_pixel, 128);
-        assert!((scene.config.camera.aperture_radius - 0.005).abs() < 1.0e-7);
+        assert!((scene.config.camera.aperture_radius - 0.015).abs() < 1.0e-7);
         assert!((scene.config.camera.focus_distance - 0.778_781_06).abs() < 1.0e-7);
         assert_eq!(
             scene.config.quality.tone_mapping.operator,
@@ -1094,6 +1134,12 @@ mod tests {
         assert!((scene.config.quality.tone_mapping.contrast - 1.08).abs() < 1.0e-7);
         assert!((scene.config.quality.tone_mapping.gamma - 1.4).abs() < 1.0e-7);
         assert!((scene.config.quality.tone_mapping.saturation - 0.82).abs() < 1.0e-7);
+        assert!(scene.config.quality.post_process.enabled);
+        assert!((scene.config.quality.post_process.exposure_stops - 0.05).abs() < 1.0e-7);
+        assert!((scene.config.quality.post_process.contrast - 0.96).abs() < 1.0e-7);
+        assert!((scene.config.quality.post_process.saturation - 0.92).abs() < 1.0e-7);
+        assert!((scene.config.quality.post_process.gamma - 1.0).abs() < 1.0e-7);
+        assert!((scene.config.quality.post_process.vignette_strength - 0.08).abs() < 1.0e-7);
 
         let source = fractal.generate_wgsl().expect("hybrid WGSL must generate");
         assert!(source.contains("scheduled_iteration = iteration % 120u"));

@@ -63,6 +63,7 @@ mod tests {
             assert!(source.contains("fn fractal_normal_epsilon("));
             assert!(source.contains("fn fractal_background("));
             assert!(source.contains("fn apply_fractal_atmosphere("));
+            assert!(source.contains("fn apply_post_process("));
             assert!(source.contains("fn vs_main("));
             assert!(source.contains("fn fs_main("));
         }

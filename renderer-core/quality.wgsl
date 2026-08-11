@@ -67,6 +67,24 @@ fn sample_direction_disk(
     );
 }
 
+fn linear_to_srgb(color: vec3<f32>) -> vec3<f32> {
+    let value = clamp(color, vec3<f32>(0.0), vec3<f32>(1.0));
+    let low = value * vec3<f32>(12.92);
+    let high = vec3<f32>(1.055) * pow(value, vec3<f32>(1.0 / 2.4))
+        - vec3<f32>(0.055);
+    return select(high, low, value <= vec3<f32>(0.0031308));
+}
+
+fn srgb_to_linear(color: vec3<f32>) -> vec3<f32> {
+    let value = clamp(color, vec3<f32>(0.0), vec3<f32>(1.0));
+    let low = value / vec3<f32>(12.92);
+    let high = pow(
+        (value + vec3<f32>(0.055)) / vec3<f32>(1.055),
+        vec3<f32>(2.4),
+    );
+    return select(high, low, value <= vec3<f32>(0.04045));
+}
+
 fn tone_map(color_value: vec3<f32>) -> vec3<f32> {
     var color = max(color_value, vec3<f32>(0.0));
     if uniforms.tone_mapping.z < 0.5 {
@@ -95,12 +113,7 @@ fn tone_map(color_value: vec3<f32>) -> vec3<f32> {
             clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)),
             vec3<f32>(1.0 / uniforms.image_adjustments.z),
         );
-        let low = display_color / vec3<f32>(12.92);
-        let high = pow(
-            (display_color + vec3<f32>(0.055)) / vec3<f32>(1.055),
-            vec3<f32>(2.4),
-        );
-        return select(high, low, display_color <= vec3<f32>(0.04045));
+        return srgb_to_linear(display_color);
     }
 
     let luminance = dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
@@ -114,4 +127,38 @@ fn tone_map(color_value: vec3<f32>) -> vec3<f32> {
     let mapped_luminance = luminance * (1.0 + luminance / white_squared)
         / (1.0 + luminance);
     return max(color * (mapped_luminance / luminance), vec3<f32>(0.0));
+}
+
+fn apply_post_process(
+    hdr_color: vec3<f32>,
+    fragment_position: vec2<f32>,
+) -> vec3<f32> {
+    if uniforms.post_process_effects.x < 0.5 {
+        return tone_map(hdr_color);
+    }
+
+    // Exposure belongs in scene-linear HDR before tone reproduction.
+    let exposed_color = hdr_color * exp2(uniforms.post_process.x);
+    var display_color = linear_to_srgb(tone_map(exposed_color));
+
+    // The remaining controls are display-referred so that 1.0 is a neutral,
+    // predictable value regardless of the selected tone-map operator.
+    display_color = (display_color - vec3<f32>(0.5)) * uniforms.post_process.y
+        + vec3<f32>(0.5);
+    let luminance = dot(display_color, vec3<f32>(0.2126, 0.7152, 0.0722));
+    display_color = mix(
+        vec3<f32>(luminance),
+        display_color,
+        uniforms.post_process.z,
+    );
+    display_color = pow(
+        clamp(display_color, vec3<f32>(0.0), vec3<f32>(1.0)),
+        vec3<f32>(1.0 / uniforms.post_process.w),
+    );
+
+    let uv = fragment_position / uniforms.resolution_time_frame.xy;
+    let vignette_radius = length(uv * 2.0 - vec2<f32>(1.0));
+    let vignette = 1.0 - uniforms.post_process_effects.y
+        * smoothstep(0.5, 1.4, vignette_radius);
+    return srgb_to_linear(display_color * vignette);
 }

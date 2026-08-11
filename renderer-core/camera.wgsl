@@ -30,6 +30,10 @@ struct RenderUniforms {
     tone_mapping: vec4<f32>,
     // x: brightness, y: contrast, z: gamma, w: saturation
     image_adjustments: vec4<f32>,
+    // x: exposure stops, y: contrast, z: saturation, w: gamma
+    post_process: vec4<f32>,
+    // x: enabled, y: vignette strength
+    post_process_effects: vec4<f32>,
     // x: samples/pixel, y: AO steps, z: shadow steps, w: reflection steps
     quality_limits: vec4<u32>,
 }

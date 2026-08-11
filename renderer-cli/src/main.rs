@@ -563,7 +563,7 @@ fn print_renderer_summary(renderer: &Renderer, config: &RenderConfig) {
         config.render.width, config.render.height
     );
     println!(
-        "Quality: {} spp, DOF={}, AO={}, soft-shadow={}, reflection={}, tone-mapping={}",
+        "Quality: {} spp, DOF={}, AO={}, soft-shadow={}, reflection={}, tone-mapping={}, post-process={}",
         config.quality.samples_per_pixel,
         enabled_label(config.camera.aperture_radius > 0.0),
         enabled_label(
@@ -575,6 +575,7 @@ fn print_renderer_summary(renderer: &Renderer, config: &RenderConfig) {
             config.quality.reflection.max_steps > 0 && config.quality.reflection.strength > 0.0
         ),
         enabled_label(config.quality.tone_mapping.enabled),
+        enabled_label(config.quality.post_process.enabled),
     );
 }
 

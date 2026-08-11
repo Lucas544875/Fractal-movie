@@ -129,3 +129,12 @@ quality:
     contrast: 1.08
     gamma: 1.4
     saturation: 0.82
+  # Operator-independent final grade. These controls can be used with either
+  # tone-map operator, or with tone mapping disabled.
+  post_process:
+    enabled: true
+    exposure_stops: 0.05
+    contrast: 0.96
+    saturation: 0.92
+    gamma: 1.0
+    vignette_strength: 0.08

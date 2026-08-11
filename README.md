@@ -303,6 +303,13 @@ quality:
     operator: extended-reinhard
     exposure_stops: -0.35
     white_point: 3.0
+  post_process:
+    enabled: true
+    exposure_stops: 0.0    # tone mapping前の追加露出（-20..20 EV）
+    contrast: 1.0          # 0..4、1.0で変化なし
+    saturation: 1.0        # 0..4、1.0で変化なし
+    gamma: 1.0             # 0.1..4、1.0で変化なし
+    vignette_strength: 0.0 # 0..1
 ```
 
 camera rayは画素内をjitterし、`aperture_radius`の円板上から`focus_distance`の合焦面へ向け直します。円形開口なので、焦点外のhighlightは円形ボケとして蓄積されます。soft shadowはdirectional lightの角半径内、AOは法線半球内、rough reflectionは反射方向の周囲を同じ決定的seedから分散samplingします。noiseが見える場合はまず`samples_per_pixel`を増やしてください。被写界深度を強くするには`aperture_radius`を増やし、合焦位置は`focus_distance`で調整します。
@@ -310,6 +317,8 @@ camera rayは画素内をjitterし、`aperture_radius`の円板上から`focus_d
 quad-float animationではcamera distanceの変化に合わせ、`focus_distance`、`aperture_radius`、AO半径、shadow/reflection trace距離を同じ比率で自動scaleします。このため1e-26までzoomしても、world単位の効果範囲だけがoverview scaleに取り残されません。sampling上限と二次ray step上限はCPU validationとWGSLの固定長loopで一致させています。
 
 `tone_mapping.operator`は既定の`extended-reinhard`に加え、`mandelbulber`を選択できます。後者はMandelbulber 2.26と同じく、`brightness`、`contrast`、HDR `tanh`、`saturation`、`gamma`の順に処理し、最後にsRGB render targetへ正しく渡します。既存sceneはoperatorを省略しても従来のReinhard表示を維持します。
+
+`post_process`はtone operatorから独立した最終カラーグレードです。linear HDR上で`exposure_stops`を適用してからtone mappingし、表示sRGB上でcontrast、Rec. 709輝度基準のsaturation、gamma、vignetteの順に処理します。その後linearへ戻すため、sRGB render targetによる変換と二重gammaになりません。既定値は`enabled: false`で、各中立値は上の例のとおりです。`tone_mapping.exposure_stops`も有効な場合は露出が加算されるため、最終調整を`post_process`へ集約するsceneでは前者を`0.0`にしてください。
 
 RTX 3070 / GL backend、320x180の実測では、16 sppのf32静止画が0.72秒、8 sppで全効果を有効にしたquad-float距離1e-26の最終frameが1.52秒でした。GL driverでquad-float pipelineを初めて作る際は約60秒のshader compileが発生しましたが、animation中は同じpipelineを全frameで再利用するためframe時間には含まれません。数値はGPU・backend・driverで変わります。
 
@@ -412,14 +421,15 @@ DSLへ`amazing-surf-fold`と`mandelbox-julia-fold`を追加し、それぞれに
 
 [公式のfractal coloring](https://github.com/buddhi1980/mandelbulber2/blob/2.26/mandelbulber2/src/fractal_coloring.cpp)と[surface color shader](https://github.com/buddhi1980/mandelbulber2/blob/2.26/mandelbulber2/src/shader_surface_color.cpp)に合わせ、着色時だけN×4=500回まで周期を継続し、各軸のbox foldとsphere foldから補助色を累積します。元gradientの色順を維持しつつ、実装間で異なる補助色分布を補うため、銅・古金色を広げて銀・白金色を狭い帯へ再配分しました。[公式specular shader](https://github.com/buddhi1980/mandelbulber2/blob/2.26/mandelbulber2/src/shader_specular_highlight_combined.cpp)と同じく、細い白色plastic highlightと広い表面色metallic highlightを別々に評価します。
 
-光源方向は`light1_rotation: [25.76, 37.98, 0]`を元camera basisで変換した値を使用し、直接光量0.8もdiffuseと金属反射へ反映しています。画像階調は[公式の画像処理順序](https://github.com/buddhi1980/mandelbulber2/blob/2.26/mandelbulber2/src/cimage.cpp)を再利用可能な`mandelbulber` tone operatorとして実装し、Alchemy sceneではこのレンダラーのAO差に合わせてbrightness、contrast、saturationを補正しました。被写界深度はfocus distanceを維持したままapertureを0.005まで弱めています。
+光源方向は`light1_rotation: [25.76, 37.98, 0]`を元camera basisで変換した値を使用し、直接光量0.8もdiffuseと金属反射へ反映しています。画像階調は[公式の画像処理順序](https://github.com/buddhi1980/mandelbulber2/blob/2.26/mandelbulber2/src/cimage.cpp)を再利用可能な`mandelbulber` tone operatorとして実装し、Alchemy sceneではこのレンダラーのAO差に合わせてbrightness、contrast、saturationを補正しました。さらにoperator非依存の`post_process`でわずかな追加露出、彩度、contrast、vignetteを調整しています。被写界深度はfocus distanceを維持したままapertureを0.015に設定しています。
 
-sceneの標準解像度は元の幅・高さを各1/4にした405x270、samplingは128 sppです。RTX 3070での実測は約5秒です。
+sceneの標準解像度は元画像と同じ1620x1080、samplingは128 sppです。まず構図と色を確認する場合は下のように405x270へoverrideできます。RTX 3070 / GL backendでのpreview実測は約4.8秒です。
 
 ```bash
 WGPU_BACKEND=gl cargo run --release -p fractal-renderer-cli -- render \
   scenes/examples/alchemy-pseudo-kleinian.yaml \
-  --output output/alchemy-pseudo-kleinian.png --overwrite
+  --width 405 --height 270 \
+  --output output/alchemy-pseudo-kleinian-preview.png --overwrite
 ```
 
 ## ディレクトリ構成

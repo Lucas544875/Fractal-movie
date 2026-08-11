@@ -78,6 +78,10 @@ struct RenderUniforms {
     tone_mapping: [f32; 4],
     // x: brightness, y: contrast, z: gamma, w: saturation
     image_adjustments: [f32; 4],
+    // x: exposure stops, y: contrast, z: saturation, w: gamma
+    post_process: [f32; 4],
+    // x: enabled, y: vignette strength
+    post_process_effects: [f32; 4],
     // x: samples, y: AO steps, z: shadow steps, w: reflection steps
     quality_limits: [u32; 4],
 }
@@ -173,6 +177,18 @@ impl RenderUniforms {
                 config.quality.tone_mapping.contrast,
                 config.quality.tone_mapping.gamma,
                 config.quality.tone_mapping.saturation,
+            ],
+            post_process: [
+                config.quality.post_process.exposure_stops,
+                config.quality.post_process.contrast,
+                config.quality.post_process.saturation,
+                config.quality.post_process.gamma,
+            ],
+            post_process_effects: [
+                u32::from(config.quality.post_process.enabled) as f32,
+                config.quality.post_process.vignette_strength,
+                0.0,
+                0.0,
             ],
             quality_limits: [
                 config.quality.samples_per_pixel,
@@ -805,6 +821,12 @@ mod tests {
         .config;
         config.render.width = 96;
         config.render.height = 54;
+        config.quality.post_process.enabled = true;
+        config.quality.post_process.exposure_stops = 0.25;
+        config.quality.post_process.contrast = 1.1;
+        config.quality.post_process.saturation = 0.9;
+        config.quality.post_process.gamma = 1.05;
+        config.quality.post_process.vignette_strength = 0.15;
         let renderer = pollster::block_on(Renderer::new(config)).expect("DSL renderer");
         let image = renderer.render_frame(0, 0.0).expect("DSL image");
         let unique_colors = unique_rgb_colors(image.pixels());

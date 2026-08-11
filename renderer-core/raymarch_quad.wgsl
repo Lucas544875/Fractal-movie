@@ -246,5 +246,5 @@ fn fs_main(@builtin(position) fragment_position: vec4<f32>) -> @location(0) vec4
         accumulated += shade_sample_qf(fragment_position.xy, sample_index);
     }
     let hdr_color = accumulated / max(f32(sample_count), 1.0);
-    return vec4<f32>(tone_map(hdr_color), 1.0);
+    return vec4<f32>(apply_post_process(hdr_color, fragment_position.xy), 1.0);
 }

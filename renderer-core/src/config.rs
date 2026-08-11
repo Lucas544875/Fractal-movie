@@ -194,6 +194,19 @@ pub struct ToneMappingConfig {
     pub saturation: f32,
 }
 
+/// Final artistic color grade applied independently of the tone-map operator.
+/// Exposure is evaluated in linear HDR; the remaining controls are evaluated
+/// in display-referred sRGB and converted back for the sRGB render target.
+#[derive(Clone, Debug)]
+pub struct PostProcessConfig {
+    pub enabled: bool,
+    pub exposure_stops: f32,
+    pub contrast: f32,
+    pub saturation: f32,
+    pub gamma: f32,
+    pub vignette_strength: f32,
+}
+
 /// Offline sampling and secondary-light transport controls.
 #[derive(Clone, Debug)]
 pub struct QualityConfig {
@@ -202,6 +215,7 @@ pub struct QualityConfig {
     pub soft_shadow: SoftShadowConfig,
     pub reflection: ReflectionConfig,
     pub tone_mapping: ToneMappingConfig,
+    pub post_process: PostProcessConfig,
 }
 
 impl Default for QualityConfig {
@@ -233,6 +247,14 @@ impl Default for QualityConfig {
                 contrast: 1.0,
                 gamma: 1.0,
                 saturation: 1.0,
+            },
+            post_process: PostProcessConfig {
+                enabled: false,
+                exposure_stops: 0.0,
+                contrast: 1.0,
+                saturation: 1.0,
+                gamma: 1.0,
+                vignette_strength: 0.0,
             },
         }
     }
@@ -414,6 +436,30 @@ impl RenderConfig {
         {
             bail!("tone_mapping.saturation must be finite and in 0.0..=4.0");
         }
+        if !quality.post_process.exposure_stops.is_finite()
+            || !(-20.0..=20.0).contains(&quality.post_process.exposure_stops)
+        {
+            bail!("post_process.exposure_stops must be finite and in -20.0..=20.0");
+        }
+        if !quality.post_process.contrast.is_finite()
+            || !(0.0..=4.0).contains(&quality.post_process.contrast)
+        {
+            bail!("post_process.contrast must be finite and in 0.0..=4.0");
+        }
+        if !quality.post_process.saturation.is_finite()
+            || !(0.0..=4.0).contains(&quality.post_process.saturation)
+        {
+            bail!("post_process.saturation must be finite and in 0.0..=4.0");
+        }
+        if !quality.post_process.gamma.is_finite()
+            || !(0.1..=4.0).contains(&quality.post_process.gamma)
+        {
+            bail!("post_process.gamma must be finite and in 0.1..=4.0");
+        }
+        finite_unit_interval(
+            "post_process.vignette_strength",
+            quality.post_process.vignette_strength,
+        )?;
         finite_coordinate("camera position", self.camera.position)?;
         finite_coordinate("camera target", self.camera.target)?;
         finite_vector("camera up", self.camera.up)?;
@@ -548,9 +594,31 @@ mod tests {
         config.quality.reflection.max_steps = 48;
         config.quality.reflection.strength = 0.2;
         config.quality.tone_mapping.enabled = true;
+        config.quality.post_process.enabled = true;
+        config.quality.post_process.exposure_stops = 0.5;
+        config.quality.post_process.contrast = 1.1;
+        config.quality.post_process.saturation = 0.9;
+        config.quality.post_process.gamma = 1.05;
+        config.quality.post_process.vignette_strength = 0.2;
         config.validate().expect("Phase 5 settings must validate");
 
         config.quality.reflection.roughness = 1.1;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_post_process_controls() {
+        let mut config = RenderConfig::default();
+
+        config.quality.post_process.gamma = 0.0;
+        assert!(config.validate().is_err());
+        config.quality.post_process.gamma = 1.0;
+
+        config.quality.post_process.vignette_strength = 1.1;
+        assert!(config.validate().is_err());
+        config.quality.post_process.vignette_strength = 0.0;
+
+        config.quality.post_process.exposure_stops = f32::NAN;
         assert!(config.validate().is_err());
     }
 
