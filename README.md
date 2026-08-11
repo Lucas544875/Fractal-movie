@@ -12,20 +12,21 @@ Rust、wgpu、WGSL で3次元フラクタルを描画する、ウィンドウ不
 - overview から深部へ進む指数ズーム経路モデル
 - scene定義のFPS/frame countによるquad-float animationとフレーム単位の動的DE調整
 - `frame_%06d.png`連番、検証付きresume、任意フレーム出力、明示的overwrite
+- scene/CLIで設定できるFFmpeg動画encodeと原子的な動画出力
 - `Rgba8UnormSrgb` オフスクリーン texture から row alignment を考慮した readback
 - PNG 出力を GPU renderer から分離
 - 解像度、ray steps、fractal iterations、NaN/Inf などの事前 validation
 - WGSL validation error を文脈付きエラーとして報告
 - GPU 名、解像度、フレーム時間、合計時間のログ
 
-FFmpeg 自動実行は Phase 4 の対象です。Phase 3 のPNG連番はCLIから利用できます。
+Phase 4まで実装済みで、PNG連番とFFmpeg動画encodeをCLIから一続きで実行できます。
 
 ## 必要環境
 
 - Rust 1.87 以上（`rust-toolchain.toml` は検証済みの 1.97.1 を指定）
 - Vulkan / Direct3D 12 / Metal / OpenGL ES のいずれかを利用できる wgpu 対応 driver
 - PNG 1枚の出力には FFmpeg は不要
-- 後述の動画変換には FFmpeg
+- `video`を有効にした動画変換にはFFmpeg（実行ファイルは`--ffmpeg`で指定可能）
 
 Linux の headless 環境では Vulkan loader と対象 GPU の Vulkan driver が必要です。レンダラーはハードウェア GPU を既定で必須とし、llvmpipe/lavapipe などの software adapter へ暗黙にフォールバックしません。選択結果は起動時の `Adapter:` と `Acceleration:` で確認できます。
 
@@ -111,7 +112,7 @@ cargo run --release -p fractal-renderer-cli -- \
   render scenes/examples/mandelbulb.yaml
 ```
 
-主要フィールドは `fractal.kind/parameters`、`camera.position/target/up/vertical_fov_degrees`、`light.direction`、`render.width/height/max_steps/max_distance/epsilon/step_safety/pixel_epsilon_multiplier`、`seed`、`precision` です。未知の version・フィールドや範囲外の値はエラーにし、自由な WGSL 全体は scene に埋め込みません。
+主要フィールドは `fractal.kind/parameters`、`camera.position/target/up/vertical_fov_degrees`、`light.direction`、`render.width/height/max_steps/max_distance/epsilon/step_safety/pixel_epsilon_multiplier`、`animation`、`video`、`seed`、`precision` です。未知の version・フィールドや範囲外の値はエラーにし、自由な WGSL 全体は scene に埋め込みません。
 
 scene の値は、明示した CLI オプションだけで上書きできます。
 
@@ -191,7 +192,7 @@ cargo run --release -p fractal-renderer-cli -- render \
   scenes/examples/mandelbox-quad-zoom.yaml
 ```
 
-出力先は既定で`output/mandelbox-quad-zoom/`、ファイル名は`frame_000000.png`〜`frame_001620.png`です。別のディレクトリへ出す場合、animation sceneの`--output`はPNGファイルではなくディレクトリを指定します。
+出力先は既定で`output/mandelbox-quad-zoom/`、ファイル名は`frame_000000.png`〜`frame_001620.png`です。別のディレクトリへ出す場合、animation sceneの`--output`はPNGファイルではなくディレクトリを指定します。このサンプルにはPhase 4の`video`設定もあるため、連番完了後に`output/mandelbox-quad-zoom.mp4`も生成します。PNGだけが必要な場合は`--no-video`を指定します。
 
 深いフレームだけを確認・再生成できます。
 
@@ -216,20 +217,58 @@ cargo run --release -p fractal-renderer-cli -- render \
 
 RTX 3070 / GL backendの320x180回帰テストでは、同一rendererで始点・中間・終点を連続描画し、距離1e-26の終点まで有効な色分布を確認しています。実測した単一フレーム時間は0.42〜0.45秒でした。
 
-## FFmpeg による動画生成（Phase 4）
+## FFmpeg による動画生成（Phase 4・実装済み）
 
-Phase 3 の連番画像が `frame_%06d.png` として生成された後は、renderer と codec を分離したまま次のように MP4 化できます。
+animation sceneへ任意の`video`セクションを追加すると、全PNGの生成・decode・解像度検証後にFFmpegを実行します。省略フィールドには次の既定値を使えます。
+
+```yaml
+video:
+  codec: libx264
+  pixel_format: yuv420p
+  crf: 18
+  preset: slow
+  faststart: true
+```
+
+内部では次と同等の引数をshellを介さずFFmpegへ渡し、sceneのFPSとframe countを固定します。
 
 ```bash
 ffmpeg \
   -framerate 60 \
+  -start_number 0 \
   -i output/scene-name/frame_%06d.png \
+  -frames:v 1621 \
   -c:v libx264 \
   -pix_fmt yuv420p \
+  -crf 18 \
+  -preset slow \
+  -movflags +faststart \
   output/scene-name.mp4
 ```
 
-Phase 4 ではこの subprocess 呼び出しと codec options を scene/CLI 設定へ追加します。FFmpeg が失敗しても生成済み PNG は削除しない設計にします。
+sceneに`video`がないanimationでも`--video`で既定設定を有効化できます。各項目と出力先はCLIから上書きできます。
+
+```bash
+cargo run --release -p fractal-renderer-cli -- render \
+  scenes/examples/mandelbox-quad-zoom.yaml \
+  --video-output output/mandelbox-custom.mp4 \
+  --video-codec libx264 \
+  --video-pixel-format yuv420p \
+  --video-crf 20 \
+  --video-preset medium
+```
+
+中断後にPNGを再利用して動画だけ作り直す場合は、`--resume --video-overwrite`を組み合わせます。`--overwrite`はPNGと動画の両方を再生成します。
+
+```bash
+cargo run --release -p fractal-renderer-cli -- render \
+  scenes/examples/mandelbox-quad-zoom.yaml \
+  --resume --video-overwrite
+```
+
+`--frame`は部分シーケンスなので、scene由来の動画encodeを自動的にskipします。`--frame`と明示的な`--video`または動画overrideを同時指定した場合はエラーにします。`yuv420p`は縦横とも偶数の解像度を事前要求します。
+
+FFmpegの存在とversionは長時間renderの開始前に確認します。encode開始前には全PNGを完全decodeし、欠落・破損・解像度不一致があればFFmpegを起動しません。動画は同じcontainer拡張子を持つ一時ファイルへ生成して成功後にrenameするため、FFmpeg失敗時もPNG連番と既存動画を削除・破損しません。
 
 ## ディレクトリ構成
 
@@ -249,12 +288,13 @@ Phase 4 ではこの subprocess 呼び出しと codec options を scene/CLI 設�
 │       ├── fractal.rs           # CPU DistanceEstimator
 │       ├── path.rs              # target search / dive path
 │       ├── animation.rs         # timeline / quad-float camera合成
+│       ├── video.rs             # codec設定とscene validation
 │       ├── precision/            # CPU Qf32 / QfVec3
 │       ├── scene.rs             # scene presets
 │       ├── scene_file.rs        # versioned YAML schema / validation
 │       └── ...                  # config、wgpu、readback
 ├── renderer-cli/
-│   └── src/                      # CLI と PNG encoder
+│   └── src/                      # CLI、PNG encoder、FFmpeg subprocess
 ├── scenes/examples/             # version 1 のサンプル scene
 └── output/                       # 生成物（Git 管理外）
 ```
@@ -264,6 +304,6 @@ Phase 4 ではこの subprocess 呼び出しと codec options を scene/CLI 設�
 1. Phase 2（完了）: YAML scene schema、読み込み、validation
 2. Phase 2.5（完了）: 4×`f32` quad-float、`QfVec3`、高精度camera/DE/path、精度・性能検証
 3. Phase 3（完了）: quad-float対応animation、指数ズーム、連番、resume、`--frame`、`--overwrite`
-4. Phase 4: configurable FFmpeg integration
+4. Phase 4（完了）: configurable FFmpeg integration、検証付き動画encode
 5. Phase 5: accumulation、AO、soft shadow、reflection、HDR/tone mapping
 6. Phase 6: fractal DSL/AST、限定的な WGSL 生成と validation

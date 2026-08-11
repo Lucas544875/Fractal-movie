@@ -1,4 +1,5 @@
 mod output;
+mod video;
 
 use std::{path::Path, path::PathBuf, process::ExitCode, time::Instant};
 
@@ -6,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use fractal_renderer_core::{
     AnimationConfig, FractalConfig, FractalKind, MIN_QUAD_CAMERA_DISTANCE, MandelboxConfig,
-    MandelbulbConfig, Precision, Qf32, RenderConfig, Renderer, RendererOptions,
+    MandelbulbConfig, Precision, Qf32, RenderConfig, Renderer, RendererOptions, VideoConfig,
     adapter_is_software, load_scene,
 };
 
@@ -34,6 +35,7 @@ struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Render a static PNG or a scene-defined PNG sequence.
     Render {
@@ -56,6 +58,50 @@ enum Command {
         /// Replace existing output PNG files.
         #[arg(long, conflicts_with = "resume")]
         overwrite: bool,
+
+        /// Encode the complete animation sequence with FFmpeg.
+        #[arg(long, conflicts_with = "no_video")]
+        video: bool,
+
+        /// Disable a scene-defined video encode.
+        #[arg(long)]
+        no_video: bool,
+
+        /// Output video path. Defaults to the frame directory with .mp4.
+        #[arg(long, value_name = "FILE", conflicts_with = "no_video")]
+        video_output: Option<PathBuf>,
+
+        /// Override the FFmpeg video encoder, for example libx264.
+        #[arg(long, value_name = "NAME", conflicts_with = "no_video")]
+        video_codec: Option<String>,
+
+        /// Override the encoded pixel format, for example yuv420p.
+        #[arg(long, value_name = "FORMAT", conflicts_with = "no_video")]
+        video_pixel_format: Option<String>,
+
+        /// Override the codec constant-quality value.
+        #[arg(long, value_name = "VALUE", conflicts_with = "no_video")]
+        video_crf: Option<u8>,
+
+        /// Override the codec preset.
+        #[arg(long, value_name = "NAME", conflicts_with = "no_video")]
+        video_preset: Option<String>,
+
+        /// Enable MP4/MOV fast-start metadata relocation.
+        #[arg(long, conflicts_with_all = ["no_video", "no_video_faststart"])]
+        video_faststart: bool,
+
+        /// Disable fast-start metadata relocation.
+        #[arg(long, conflicts_with = "no_video")]
+        no_video_faststart: bool,
+
+        /// Replace an existing video without replacing PNG frames.
+        #[arg(long, conflicts_with = "no_video")]
+        video_overwrite: bool,
+
+        /// FFmpeg executable or path.
+        #[arg(long, value_name = "PATH", conflicts_with = "no_video")]
+        ffmpeg: Option<PathBuf>,
 
         /// Override the scene's fractal using its default parameters.
         #[arg(long, value_enum)]
@@ -113,6 +159,17 @@ fn run() -> Result<()> {
             frame,
             resume,
             overwrite,
+            video,
+            no_video,
+            video_output,
+            video_codec,
+            video_pixel_format,
+            video_crf,
+            video_preset,
+            video_faststart,
+            no_video_faststart,
+            video_overwrite,
+            ffmpeg,
             fractal,
             precision,
             camera_distance,
@@ -127,6 +184,17 @@ fn run() -> Result<()> {
             frame,
             resume,
             overwrite,
+            video,
+            no_video,
+            video_output,
+            video_codec,
+            video_pixel_format,
+            video_crf,
+            video_preset,
+            video_faststart,
+            no_video_faststart,
+            video_overwrite,
+            ffmpeg,
             fractal,
             precision,
             camera_distance,
@@ -140,12 +208,24 @@ fn run() -> Result<()> {
     }
 }
 
+#[derive(Default)]
 struct RenderRequest {
     scene: Option<PathBuf>,
     output: Option<PathBuf>,
     frame: Option<u32>,
     resume: bool,
     overwrite: bool,
+    video: bool,
+    no_video: bool,
+    video_output: Option<PathBuf>,
+    video_codec: Option<String>,
+    video_pixel_format: Option<String>,
+    video_crf: Option<u8>,
+    video_preset: Option<String>,
+    video_faststart: bool,
+    no_video_faststart: bool,
+    video_overwrite: bool,
+    ffmpeg: Option<PathBuf>,
     fractal: Option<FractalName>,
     precision: Option<PrecisionName>,
     camera_distance: Option<Qf32>,
@@ -156,11 +236,94 @@ struct RenderRequest {
     adapter: Option<String>,
 }
 
+impl RenderRequest {
+    fn has_video_configuration_option(&self) -> bool {
+        self.video
+            || self.video_output.is_some()
+            || self.video_codec.is_some()
+            || self.video_pixel_format.is_some()
+            || self.video_crf.is_some()
+            || self.video_preset.is_some()
+            || self.video_faststart
+            || self.no_video_faststart
+            || self.ffmpeg.is_some()
+    }
+
+    fn has_any_video_option(&self) -> bool {
+        self.no_video || self.video_overwrite || self.has_video_configuration_option()
+    }
+}
+
 struct PreparedScene {
     name: String,
     config: RenderConfig,
     animation: Option<AnimationConfig>,
+    video: Option<VideoConfig>,
     default_output: PathBuf,
+}
+
+fn resolve_video_job(
+    scene_video: Option<&VideoConfig>,
+    animation: &AnimationConfig,
+    render_config: &RenderConfig,
+    frames_directory: &Path,
+    request: &RenderRequest,
+) -> Result<Option<video::VideoJob>> {
+    if request.no_video {
+        return Ok(None);
+    }
+    let explicitly_requested = request.has_video_configuration_option();
+    if request.frame.is_some() {
+        if explicitly_requested || request.video_overwrite {
+            bail!("video encoding requires the complete sequence and cannot be used with --frame");
+        }
+        return Ok(None);
+    }
+    if scene_video.is_none() && !explicitly_requested {
+        if request.video_overwrite {
+            bail!("--video-overwrite requires scene video settings or --video");
+        }
+        return Ok(None);
+    }
+
+    let mut config = scene_video.cloned().unwrap_or_default();
+    if let Some(codec) = &request.video_codec {
+        config.codec.clone_from(codec);
+    }
+    if let Some(pixel_format) = &request.video_pixel_format {
+        config.pixel_format.clone_from(pixel_format);
+    }
+    if let Some(crf) = request.video_crf {
+        config.crf = crf;
+    }
+    if let Some(preset) = &request.video_preset {
+        config.preset.clone_from(preset);
+    }
+    if request.video_faststart {
+        config.faststart = true;
+    } else if request.no_video_faststart {
+        config.faststart = false;
+    }
+
+    let output_path = request
+        .video_output
+        .clone()
+        .unwrap_or_else(|| frames_directory.with_extension("mp4"));
+    let job = video::VideoJob {
+        ffmpeg: request
+            .ffmpeg
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("ffmpeg")),
+        frames_directory: frames_directory.to_owned(),
+        output_path,
+        fps: animation.fps,
+        frame_count: animation.frame_count,
+        config,
+        overwrite: request.overwrite || request.video_overwrite,
+    };
+    job.validate(render_config.render.width, render_config.render.height)
+        .context("invalid effective video configuration")?;
+    Ok(Some(job))
 }
 
 fn render(request: RenderRequest) -> Result<()> {
@@ -194,6 +357,9 @@ fn render_static(
     }
     if request.resume {
         bail!("--resume requires a scene with an animation section");
+    }
+    if request.has_any_video_option() {
+        bail!("video options require a scene with an animation section");
     }
     ensure_output_is_available(output_path, request.overwrite)?;
 
@@ -237,6 +403,18 @@ fn render_animation(
             output_directory.display()
         );
     }
+    let video_job = resolve_video_job(
+        prepared.video.as_ref(),
+        animation,
+        &prepared.config,
+        output_directory,
+        request,
+    )?;
+    let ffmpeg_version = video_job
+        .as_ref()
+        .map(video::VideoJob::ffmpeg_version)
+        .transpose()
+        .context("FFmpeg is unavailable for the requested video encode")?;
 
     let requested_frames = if let Some(frame) = request.frame {
         if frame >= animation.frame_count {
@@ -264,52 +442,92 @@ fn render_animation(
         animation.fps, animation.frame_count
     );
     println!("Output: {}", output_directory.display());
+    if request.frame.is_some()
+        && prepared.video.is_some()
+        && !request.no_video
+        && !request.has_video_configuration_option()
+    {
+        println!("Video: skipped because --frame renders only part of the sequence");
+    }
+    if let (Some(job), Some(version)) = (&video_job, &ffmpeg_version) {
+        println!("FFmpeg: {version}");
+        println!(
+            "Video: {} (codec={}, pixel_format={}, crf={}, preset={})",
+            job.output_path.display(),
+            job.config.codec,
+            job.config.pixel_format,
+            job.config.crf,
+            job.config.preset
+        );
+    }
     if skipped_frames > 0 {
         println!("Resume: skipped {skipped_frames} valid existing frame(s)");
     }
     if pending_frames.is_empty() {
         println!("Nothing to render; every requested frame is already complete.");
-        return Ok(());
-    }
+    } else {
+        let initial_frame = animation.sample(&prepared.config, pending_frames[0])?;
+        let renderer = create_renderer(initial_frame.config.clone(), request)?;
+        print_renderer_summary(&renderer, &initial_frame.config);
+        println!("Frames to render: {}", pending_frames.len());
 
-    let initial_frame = animation.sample(&prepared.config, pending_frames[0])?;
-    let renderer = create_renderer(initial_frame.config.clone(), request)?;
-    print_renderer_summary(&renderer, &initial_frame.config);
-    println!("Frames to render: {}", pending_frames.len());
+        let total_start = Instant::now();
+        let mut accumulated_frame_seconds = 0.0;
+        for frame_index in pending_frames.iter().copied() {
+            let sample = animation
+                .sample(&prepared.config, frame_index)
+                .with_context(|| format!("could not sample animation frame {frame_index}"))?;
+            println!(
+                "Rendering frame {}/{} (t={:.6}s, distance={:.6e})",
+                frame_index + 1,
+                animation.frame_count,
+                sample.time_seconds,
+                sample.camera_distance.to_f64()
+            );
+            let frame_start = Instant::now();
+            let image = renderer
+                .render_frame_with_config(&sample.config, sample.index, sample.time_seconds as f32)
+                .with_context(|| {
+                    format!("failed to render {} frame {frame_index}", prepared.name)
+                })?;
+            let frame_seconds = frame_start.elapsed().as_secs_f64();
+            accumulated_frame_seconds += frame_seconds;
+            println!("Frame render time: {frame_seconds:.3}s");
 
-    let total_start = Instant::now();
-    let mut accumulated_frame_seconds = 0.0;
-    for frame_index in pending_frames.iter().copied() {
-        let sample = animation
-            .sample(&prepared.config, frame_index)
-            .with_context(|| format!("could not sample animation frame {frame_index}"))?;
+            let frame_path = animation_frame_path(output_directory, frame_index);
+            output::save_png(&frame_path, &image, request.overwrite)
+                .with_context(|| format!("failed to write {}", frame_path.display()))?;
+            println!("Saved: {}", frame_path.display());
+        }
+
+        let total_seconds = total_start.elapsed().as_secs_f64();
+        println!("Total render time: {total_seconds:.3}s");
         println!(
-            "Rendering frame {}/{} (t={:.6}s, distance={:.6e})",
-            frame_index + 1,
-            animation.frame_count,
-            sample.time_seconds,
-            sample.camera_distance.to_f64()
+            "Average frame time: {:.3}s",
+            accumulated_frame_seconds / pending_frames.len() as f64
         );
-        let frame_start = Instant::now();
-        let image = renderer
-            .render_frame_with_config(&sample.config, sample.index, sample.time_seconds as f32)
-            .with_context(|| format!("failed to render {} frame {frame_index}", prepared.name))?;
-        let frame_seconds = frame_start.elapsed().as_secs_f64();
-        accumulated_frame_seconds += frame_seconds;
-        println!("Frame render time: {frame_seconds:.3}s");
-
-        let frame_path = animation_frame_path(output_directory, frame_index);
-        output::save_png(&frame_path, &image, request.overwrite)
-            .with_context(|| format!("failed to write {}", frame_path.display()))?;
-        println!("Saved: {}", frame_path.display());
     }
 
-    let total_seconds = total_start.elapsed().as_secs_f64();
-    println!("Total render time: {total_seconds:.3}s");
-    println!(
-        "Average frame time: {:.3}s",
-        accumulated_frame_seconds / pending_frames.len() as f64
-    );
+    if let Some(job) = &video_job {
+        println!(
+            "Validating {} PNG frame(s) for FFmpeg",
+            animation.frame_count
+        );
+        validate_complete_sequence(
+            output_directory,
+            animation.frame_count,
+            prepared.config.render.width,
+            prepared.config.render.height,
+        )?;
+        println!("Encoding video: {}", job.output_path.display());
+        let encode_start = Instant::now();
+        job.encode().context("video encoding failed")?;
+        println!("Saved video: {}", job.output_path.display());
+        println!(
+            "Video encode time: {:.3}s",
+            encode_start.elapsed().as_secs_f64()
+        );
+    }
     Ok(())
 }
 
@@ -403,6 +621,34 @@ fn plan_animation_outputs(
     Ok((pending, skipped))
 }
 
+fn validate_complete_sequence(
+    directory: &Path,
+    frame_count: u32,
+    width: u32,
+    height: u32,
+) -> Result<()> {
+    for frame_index in 0..frame_count {
+        let path = animation_frame_path(directory, frame_index);
+        let dimensions = output::png_dimensions(&path).with_context(|| {
+            format!(
+                "animation frame {} is missing or invalid; PNG frames were preserved and FFmpeg was not started",
+                path.display()
+            )
+        })?;
+        if dimensions != (width, height) {
+            bail!(
+                "animation frame {} is {}x{}, expected {}x{}; PNG frames were preserved and FFmpeg was not started",
+                path.display(),
+                dimensions.0,
+                dimensions.1,
+                width,
+                height
+            );
+        }
+    }
+    Ok(())
+}
+
 fn prepare_scene(
     scene_path: Option<&Path>,
     fractal_override: Option<FractalName>,
@@ -413,14 +659,14 @@ fn prepare_scene(
     height_override: Option<u32>,
 ) -> Result<PreparedScene> {
     let has_scene_file = scene_path.is_some();
-    let (name, mut config, animation) = if let Some(path) = scene_path {
+    let (name, mut config, animation, video) = if let Some(path) = scene_path {
         if camera_distance.is_some() {
             bail!(
                 "--camera-distance is available only with the built-in quad-float Mandelbox preset"
             );
         }
         let scene = load_scene(path)?;
-        (scene.name, scene.config, scene.animation)
+        (scene.name, scene.config, scene.animation, scene.video)
     } else {
         let seed = seed_override.unwrap_or(12_345);
         let fractal = fractal_override.unwrap_or(FractalName::Mandelbulb);
@@ -434,7 +680,7 @@ fn prepare_scene(
                             "built-in quad-float Mandelbox camera distance must be finite and at least {MIN_QUAD_CAMERA_DISTANCE:e}"
                         )
                     })?;
-                ("mandelbox-quad".to_owned(), config, None)
+                ("mandelbox-quad".to_owned(), config, None, None)
             }
             (FractalName::Mandelbulb, PrecisionName::QuadFloat) => {
                 bail!("quad-float precision is currently supported only for Mandelbox scenes");
@@ -446,6 +692,7 @@ fn prepare_scene(
                 (
                     fractal.label().to_owned(),
                     fractal.built_in_config(seed),
+                    None,
                     None,
                 )
             }
@@ -477,7 +724,6 @@ fn prepare_scene(
             .validate(&config)
             .context("animation is invalid after applying CLI overrides")?;
     }
-
     let default_output = if animation.is_some() {
         PathBuf::from("output").join(&name)
     } else if has_scene_file {
@@ -491,6 +737,7 @@ fn prepare_scene(
         name,
         config,
         animation,
+        video,
         default_output,
     })
 }
@@ -594,6 +841,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use fractal_renderer_core::{AnimationPath, ExponentialDivePath};
 
     #[test]
     fn built_in_defaults_remain_backwards_compatible() {
@@ -700,6 +948,134 @@ mod tests {
     }
 
     #[test]
+    fn effective_video_rejects_odd_yuv420p_resolution_overrides() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../scenes/examples/mandelbox-quad-zoom.yaml");
+        let scene = prepare_scene(Some(&path), None, None, None, None, Some(80), Some(45)).unwrap();
+        let request = RenderRequest::default();
+        let error = resolve_video_job(
+            scene.video.as_ref(),
+            scene.animation.as_ref().unwrap(),
+            &scene.config,
+            Path::new("output/frames"),
+            &request,
+        )
+        .expect_err("odd yuv420p dimensions must fail before rendering");
+        assert!(error.to_string().contains("invalid effective video"));
+    }
+
+    #[test]
+    fn resolves_scene_video_defaults_and_cli_overrides() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../scenes/examples/mandelbox-quad-zoom.yaml");
+        let scene = prepare_scene(Some(&path), None, None, None, None, Some(80), Some(46)).unwrap();
+        let request = RenderRequest {
+            video_crf: Some(23),
+            no_video_faststart: true,
+            video_output: Some(PathBuf::from("/tmp/fractal-phase4-override.mp4")),
+            ..RenderRequest::default()
+        };
+        let job = resolve_video_job(
+            scene.video.as_ref(),
+            scene.animation.as_ref().unwrap(),
+            &scene.config,
+            Path::new("/tmp/fractal-phase4-frames"),
+            &request,
+        )
+        .unwrap()
+        .expect("scene video must be enabled");
+        assert_eq!(job.config.codec, "libx264");
+        assert_eq!(job.config.crf, 23);
+        assert!(!job.config.faststart);
+        assert_eq!(
+            job.output_path,
+            PathBuf::from("/tmp/fractal-phase4-override.mp4")
+        );
+    }
+
+    #[test]
+    fn single_frame_safely_skips_implicit_video_but_rejects_explicit_encode() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../scenes/examples/mandelbox-quad-zoom.yaml");
+        let scene = prepare_scene(Some(&path), None, None, None, None, Some(80), Some(46)).unwrap();
+        let request = RenderRequest {
+            frame: Some(0),
+            ..RenderRequest::default()
+        };
+        assert!(
+            resolve_video_job(
+                scene.video.as_ref(),
+                scene.animation.as_ref().unwrap(),
+                &scene.config,
+                Path::new("/tmp/fractal-phase4-frames"),
+                &request,
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        let request = RenderRequest {
+            frame: Some(0),
+            video: true,
+            ..RenderRequest::default()
+        };
+        assert!(
+            resolve_video_job(
+                scene.video.as_ref(),
+                scene.animation.as_ref().unwrap(),
+                &scene.config,
+                Path::new("/tmp/fractal-phase4-frames"),
+                &request,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a hardware GPU and FFmpeg"]
+    fn renders_and_encodes_a_short_sequence_end_to_end() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "fractal-renderer-phase4-{}-{nonce}",
+            std::process::id()
+        ));
+        let frames = root.join("frames");
+        let mut config = RenderConfig::mandelbox_quad(12_345, Qf32::from_f32(11.0)).unwrap();
+        config.render.width = 64;
+        config.render.height = 36;
+        let prepared = PreparedScene {
+            name: "phase4-smoke".to_owned(),
+            config,
+            animation: Some(AnimationConfig {
+                fps: 2,
+                frame_count: 3,
+                path: AnimationPath::ExponentialDive(ExponentialDivePath {
+                    overview_distance: Qf32::from_f32(11.0),
+                    minimum_distance: Qf32::from_f64(1.0e-14),
+                    overview_duration: 0.0,
+                    dive_duration: 1.0,
+                }),
+            }),
+            video: Some(VideoConfig {
+                preset: "ultrafast".to_owned(),
+                ..VideoConfig::default()
+            }),
+            default_output: frames.clone(),
+        };
+
+        render_animation(prepared, &RenderRequest::default(), &frames).unwrap();
+        for frame_index in 0..3_u32 {
+            assert!(animation_frame_path(&frames, frame_index).exists());
+        }
+        let movie = frames.with_extension("mp4");
+        assert!(std::fs::metadata(movie).unwrap().len() > 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn sequence_frame_names_are_ffmpeg_compatible() {
         assert_eq!(
             animation_frame_path(Path::new("frames"), 120),
@@ -733,6 +1109,7 @@ mod tests {
             plan_animation_outputs(&[0, 1], &directory, 4, 3, true, false).unwrap();
         assert_eq!(pending, vec![1]);
         assert_eq!(skipped, 1);
+        assert!(validate_complete_sequence(&directory, 2, 4, 3).is_err());
         assert!(plan_animation_outputs(&[0], &directory, 8, 3, true, false).is_err());
         assert!(plan_animation_outputs(&[0], &directory, 4, 3, false, false).is_err());
 

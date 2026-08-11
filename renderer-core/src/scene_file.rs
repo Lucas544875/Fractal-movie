@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AnimationConfig, AnimationPath, CameraConfig, ExponentialDivePath, FractalConfig, LightConfig,
     MandelboxConfig, MandelbulbConfig, Precision, Qf32, QfVec3, RenderConfig, RenderSettings,
+    VideoConfig,
 };
 
 pub const CURRENT_SCENE_VERSION: u32 = 1;
@@ -16,6 +17,7 @@ pub struct LoadedScene {
     pub name: String,
     pub config: RenderConfig,
     pub animation: Option<AnimationConfig>,
+    pub video: Option<VideoConfig>,
 }
 
 impl LoadedScene {
@@ -55,6 +57,8 @@ struct SceneDocument {
     render: SceneRender,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     animation: Option<SceneAnimation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    video: Option<SceneVideo>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
@@ -151,6 +155,23 @@ struct SceneExponentialDive {
     dive_duration: f64,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+struct SceneVideo {
+    codec: String,
+    pixel_format: String,
+    crf: u8,
+    preset: String,
+    faststart: bool,
+}
+
+impl Default for SceneVideo {
+    fn default() -> Self {
+        let config = VideoConfig::default();
+        Self::from(&config)
+    }
+}
+
 impl TryFrom<SceneDocument> for LoadedScene {
     type Error = anyhow::Error;
 
@@ -222,11 +243,21 @@ impl TryFrom<SceneDocument> for LoadedScene {
                 .validate(&config)
                 .context("animation configuration is invalid")?;
         }
+        let video = document.video.map(VideoConfig::from);
+        if let Some(video) = &video {
+            if animation.is_none() {
+                bail!("video configuration requires an animation section");
+            }
+            video
+                .validate_dimensions(config.render.width, config.render.height)
+                .context("video configuration is invalid")?;
+        }
 
         Ok(Self {
             name: document.name,
             config,
             animation,
+            video,
         })
     }
 }
@@ -279,6 +310,31 @@ impl From<&LoadedScene> for SceneDocument {
                 pixel_epsilon_multiplier: scene.config.render.pixel_epsilon_multiplier,
             },
             animation: scene.animation.as_ref().map(SceneAnimation::from),
+            video: scene.video.as_ref().map(SceneVideo::from),
+        }
+    }
+}
+
+impl From<SceneVideo> for VideoConfig {
+    fn from(video: SceneVideo) -> Self {
+        Self {
+            codec: video.codec,
+            pixel_format: video.pixel_format,
+            crf: video.crf,
+            preset: video.preset,
+            faststart: video.faststart,
+        }
+    }
+}
+
+impl From<&VideoConfig> for SceneVideo {
+    fn from(video: &VideoConfig) -> Self {
+        Self {
+            codec: video.codec.clone(),
+            pixel_format: video.pixel_format.clone(),
+            crf: video.crf,
+            preset: video.preset.clone(),
+            faststart: video.faststart,
         }
     }
 }
@@ -474,8 +530,13 @@ mod tests {
     fn parses_and_round_trips_quad_float_animation() {
         let scene = parse_scene(MANDELBOX_QUAD_ZOOM).expect("zoom scene must parse");
         let animation = scene.animation.as_ref().expect("animation must be present");
+        let video = scene
+            .video
+            .as_ref()
+            .expect("video settings must be present");
         assert_eq!(animation.fps, 60);
         assert_eq!(animation.frame_count, 1_621);
+        assert_eq!(video, &VideoConfig::default());
         let FractalConfig::Mandelbox(fractal) = &scene.config.fractal else {
             unreachable!();
         };
@@ -497,10 +558,28 @@ mod tests {
         let reparsed_animation = reparsed
             .animation
             .expect("animation must survive round trip");
+        assert_eq!(reparsed.video, Some(VideoConfig::default()));
         let reparsed_final = reparsed_animation
             .sample(&reparsed.config, reparsed_animation.frame_count - 1)
             .unwrap();
         assert_eq!(reparsed_final.camera_distance, final_frame.camera_distance);
+    }
+
+    #[test]
+    fn rejects_video_without_an_animation() {
+        let yaml = format!("{MANDELBULB}\nvideo: {{}}\n");
+        let error = parse_scene(&yaml).expect_err("static scenes cannot request video encoding");
+        assert!(error.to_string().contains("video configuration requires"));
+    }
+
+    #[test]
+    fn video_section_accepts_documented_defaults() {
+        let (scene_without_video, _) = MANDELBOX_QUAD_ZOOM
+            .split_once("\nvideo:\n")
+            .expect("example has a video section");
+        let yaml = format!("{scene_without_video}\nvideo: {{}}\n");
+        let scene = parse_scene(&yaml).expect("empty video section must use defaults");
+        assert_eq!(scene.video, Some(VideoConfig::default()));
     }
 
     #[test]

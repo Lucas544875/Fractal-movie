@@ -9,6 +9,7 @@ mod renderer;
 mod scene;
 mod scene_file;
 mod shader;
+mod video;
 
 pub use animation::{
     AnimationConfig, AnimationFrame, AnimationPath, MAX_ANIMATION_FPS, MAX_ANIMATION_FRAMES,
@@ -22,4 +23,5 @@ pub use path::{ExponentialDivePath, PathTarget, TargetPicker, TargetSearchConfig
 pub use precision::{Qf32, QfParseError, QfVec3};
 pub use renderer::{RenderedImage, Renderer, RendererOptions, adapter_is_software};
 pub use scene_file::{CURRENT_SCENE_VERSION, LoadedScene, load_scene, parse_scene};
+pub use video::{MAX_VIDEO_CRF, VideoConfig};
 pub use wgpu::{AdapterInfo, Backend, DeviceType};

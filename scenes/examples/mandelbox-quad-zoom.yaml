@@ -52,3 +52,10 @@ animation:
       minimum_distance: "1e-26"
       overview_duration: 4.0
       dive_duration: 23.0
+
+video:
+  codec: libx264
+  pixel_format: yuv420p
+  crf: 18
+  preset: slow
+  faststart: true
