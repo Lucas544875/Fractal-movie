@@ -9,6 +9,42 @@ use crate::{RenderConfig, shader};
 const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 const BYTES_PER_PIXEL: u32 = 4;
 
+/// Controls which adapter may be used by [`Renderer`].
+#[derive(Clone, Debug, Default)]
+pub struct RendererOptions {
+    /// Permit a CPU/software rasterizer such as llvmpipe.
+    ///
+    /// This is disabled by default so that a render never silently claims to
+    /// be GPU accelerated while actually running on the CPU.
+    pub allow_software_adapter: bool,
+    /// Case-insensitive substring used to select a particular adapter.
+    ///
+    /// When omitted, `WGPU_ADAPTER_NAME` is used if it is set. Otherwise the
+    /// highest-ranked hardware adapter is selected.
+    pub adapter_name: Option<String>,
+}
+
+/// Returns whether an adapter is known to be backed by software rendering.
+#[must_use]
+pub fn adapter_is_software(info: &wgpu::AdapterInfo) -> bool {
+    if info.device_type == wgpu::DeviceType::Cpu {
+        return true;
+    }
+
+    // Some drivers have historically reported `Other` instead of `Cpu`.
+    // Keep this list deliberately narrow to avoid rejecting virtualized GPUs.
+    let name = info.name.to_ascii_lowercase();
+    [
+        "llvmpipe",
+        "lavapipe",
+        "swiftshader",
+        "software rasterizer",
+        "microsoft basic render",
+    ]
+    .iter()
+    .any(|software_name| name.contains(software_name))
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct RenderUniforms {
@@ -105,17 +141,29 @@ pub struct Renderer {
 impl Renderer {
     /// Initializes a headless adapter, validates WGSL, and allocates resources.
     pub async fn new(config: RenderConfig) -> Result<Self> {
+        Self::new_with_options(config, RendererOptions::default()).await
+    }
+
+    /// Lists every adapter exposed by the enabled wgpu backends.
+    ///
+    /// `WGPU_BACKEND` is honored, so this can also be used to compare Vulkan
+    /// and OpenGL/GLES driver paths on Linux and WSL.
+    pub async fn available_adapters() -> Vec<wgpu::AdapterInfo> {
+        let (instance, backends) = create_instance();
+        instance
+            .enumerate_adapters(backends)
+            .await
+            .into_iter()
+            .map(|adapter| adapter.get_info())
+            .collect()
+    }
+
+    /// Initializes the renderer with an explicit adapter policy.
+    pub async fn new_with_options(config: RenderConfig, options: RendererOptions) -> Result<Self> {
         config.validate().context("invalid render configuration")?;
 
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                ..Default::default()
-            })
-            .await
-            .context("no compatible wgpu adapter was found")?;
+        let (instance, backends) = create_instance();
+        let adapter = select_adapter(&instance, backends, &options).await?;
         let adapter_info = adapter.get_info();
         let adapter_limits = adapter.limits();
         if config.render.width > adapter_limits.max_texture_dimension_2d
@@ -253,6 +301,12 @@ impl Renderer {
         &self.adapter_info
     }
 
+    /// Reports whether the selected adapter is backed by hardware.
+    #[must_use]
+    pub fn is_hardware_accelerated(&self) -> bool {
+        !adapter_is_software(&self.adapter_info)
+    }
+
     /// Renders one deterministic frame and reads it back from GPU memory.
     pub fn render_frame(&self, frame_index: u32, time_seconds: f32) -> Result<RenderedImage> {
         if !time_seconds.is_finite() || time_seconds < 0.0 {
@@ -340,6 +394,102 @@ impl Renderer {
     }
 }
 
+fn create_instance() -> (wgpu::Instance, wgpu::Backends) {
+    let descriptor = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+    let backends = descriptor.backends;
+    (wgpu::Instance::new(descriptor), backends)
+}
+
+async fn select_adapter(
+    instance: &wgpu::Instance,
+    backends: wgpu::Backends,
+    options: &RendererOptions,
+) -> Result<wgpu::Adapter> {
+    let adapters = instance.enumerate_adapters(backends).await;
+    let detected = adapters
+        .iter()
+        .map(|adapter| adapter.get_info())
+        .collect::<Vec<_>>();
+    let name_filter = options
+        .adapter_name
+        .clone()
+        .or_else(|| std::env::var("WGPU_ADAPTER_NAME").ok())
+        .filter(|name| !name.trim().is_empty());
+
+    let mut matching = adapters
+        .into_iter()
+        .filter(|adapter| {
+            name_filter.as_ref().is_none_or(|filter| {
+                adapter
+                    .get_info()
+                    .name
+                    .to_ascii_lowercase()
+                    .contains(&filter.to_ascii_lowercase())
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if matching.is_empty() {
+        let requested = name_filter
+            .as_deref()
+            .map(|name| format!(" matching '{name}'"))
+            .unwrap_or_default();
+        return Err(anyhow!(
+            "no compatible wgpu adapter{requested} was found; detected adapters: {}",
+            adapter_summary(&detected)
+        ));
+    }
+
+    if !options.allow_software_adapter {
+        let matching_infos = matching
+            .iter()
+            .map(|adapter| adapter.get_info())
+            .collect::<Vec<_>>();
+        matching.retain(|adapter| !adapter_is_software(&adapter.get_info()));
+        if matching.is_empty() {
+            return Err(anyhow!(
+                "GPU acceleration is unavailable: only software adapters were found ({}). \
+                 Fix the system GPU/driver exposure, or pass --allow-software only when CPU \
+                 rendering is intentional",
+                adapter_summary(&matching_infos)
+            ));
+        }
+    }
+
+    matching
+        .into_iter()
+        .max_by_key(|adapter| adapter_rank(&adapter.get_info()))
+        .context("no compatible wgpu adapter remained after applying the selection policy")
+}
+
+fn adapter_summary(infos: &[wgpu::AdapterInfo]) -> String {
+    if infos.is_empty() {
+        return "none".to_owned();
+    }
+
+    infos
+        .iter()
+        .map(|info| format!("{} ({:?}, {:?})", info.name, info.backend, info.device_type))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn adapter_rank(info: &wgpu::AdapterInfo) -> (u8, u8) {
+    let device_rank = match info.device_type {
+        wgpu::DeviceType::DiscreteGpu => 5,
+        wgpu::DeviceType::IntegratedGpu => 4,
+        wgpu::DeviceType::VirtualGpu => 3,
+        wgpu::DeviceType::Other => 2,
+        wgpu::DeviceType::Cpu => 1,
+    };
+    let backend_rank = match info.backend {
+        wgpu::Backend::Vulkan | wgpu::Backend::Metal | wgpu::Backend::Dx12 => 2,
+        wgpu::Backend::Gl => 1,
+        _ => 0,
+    };
+    (device_rank, backend_rank)
+}
+
 fn padded_bytes_per_row(width: u32) -> u32 {
     let unpadded = width * BYTES_PER_PIXEL;
     let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
@@ -355,5 +505,30 @@ mod tests {
         assert_eq!(padded_bytes_per_row(64), 256);
         assert_eq!(padded_bytes_per_row(65), 512);
         assert_eq!(padded_bytes_per_row(640), 2_560);
+    }
+
+    #[test]
+    fn identifies_cpu_and_known_software_adapters() {
+        let cpu = wgpu::AdapterInfo::new(wgpu::DeviceType::Cpu, wgpu::Backend::Vulkan);
+        assert!(adapter_is_software(&cpu));
+
+        let mut mislabeled = wgpu::AdapterInfo::new(wgpu::DeviceType::Other, wgpu::Backend::Vulkan);
+        mislabeled.name = "llvmpipe (LLVM 12.0.0)".to_owned();
+        assert!(adapter_is_software(&mislabeled));
+
+        let mut virtual_gpu =
+            wgpu::AdapterInfo::new(wgpu::DeviceType::VirtualGpu, wgpu::Backend::Gl);
+        virtual_gpu.name = "D3D12 (NVIDIA GeForce)".to_owned();
+        assert!(!adapter_is_software(&virtual_gpu));
+    }
+
+    #[test]
+    fn ranks_hardware_before_software() {
+        let discrete = wgpu::AdapterInfo::new(wgpu::DeviceType::DiscreteGpu, wgpu::Backend::Vulkan);
+        let integrated = wgpu::AdapterInfo::new(wgpu::DeviceType::IntegratedGpu, wgpu::Backend::Gl);
+        let cpu = wgpu::AdapterInfo::new(wgpu::DeviceType::Cpu, wgpu::Backend::Vulkan);
+
+        assert!(adapter_rank(&discrete) > adapter_rank(&integrated));
+        assert!(adapter_rank(&integrated) > adapter_rank(&cpu));
     }
 }

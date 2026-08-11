@@ -21,7 +21,7 @@ Rust、wgpu、WGSL で3次元フラクタルを描画する、ウィンドウ不
 - PNG 1枚の出力には FFmpeg は不要
 - 後述の動画変換には FFmpeg
 
-Linux の headless 環境では Vulkan loader と対象 GPU の Vulkan driver が必要です。利用可能な hardware adapter がない環境では、wgpu が software Vulkan adapter を選ぶ場合があります。選択結果は起動時の `GPU:` ログで確認できます。
+Linux の headless 環境では Vulkan loader と対象 GPU の Vulkan driver が必要です。レンダラーはハードウェア GPU を既定で必須とし、llvmpipe/lavapipe などの software adapter へ暗黙にフォールバックしません。選択結果は起動時の `Adapter:` と `Acceleration:` で確認できます。
 
 ## Build と検証
 
@@ -29,6 +29,35 @@ Linux の headless 環境では Vulkan loader と対象 GPU の Vulkan driver �
 cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+```
+
+## GPU の診断
+
+wgpu から見える全アダプターと、ハードウェアアクセラレーションの状態を表示します。
+
+```bash
+cargo run -p fractal-renderer-cli -- gpu-info
+```
+
+特定のアダプターを選ぶ場合は名前の一部を指定できます。
+
+```bash
+cargo run --release -p fractal-renderer-cli -- render --adapter NVIDIA
+```
+
+`WGPU_BACKEND` も利用できます。特に WSL でVulkanドライバーがGPUを公開せず、MesaのD3D12 OpenGL経路が利用可能な場合は、次の診断結果を比較してください。
+
+```bash
+WGPU_BACKEND=vulkan cargo run -p fractal-renderer-cli -- gpu-info
+WGPU_BACKEND=gl cargo run -p fractal-renderer-cli -- gpu-info
+```
+
+WSLではWindows側の対応GPUドライバー、WSL2、`/dev/dxg` が必要です。`nvidia-smi` が失敗する、または `/dev/dxg` が存在しない場合はRustアプリより下層でGPUが公開されていません。Windows側でGPUドライバーとWSLを更新し、`wsl --shutdown` 後に再起動してください。
+
+動作確認のためCPUレンダリングを意図的に許可する場合だけ `--allow-software` を指定できます。この場合はアクセラレーションされません。
+
+```bash
+cargo run -p fractal-renderer-cli -- render --allow-software
 ```
 
 ## Mandelbulb を1フレーム出力
@@ -101,4 +130,3 @@ Phase 4 ではこの subprocess 呼び出しと codec options を scene/CLI 設�
 3. Phase 4: configurable FFmpeg integration
 4. Phase 5: accumulation、AO、soft shadow、reflection、HDR/tone mapping
 5. Phase 6: fractal DSL/AST、限定的な WGSL 生成と validation
-
