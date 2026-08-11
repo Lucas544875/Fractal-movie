@@ -4,10 +4,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AmbientOcclusionConfig, AnimationConfig, AnimationPath, CameraConfig, ExponentialDivePath,
-    FractalConfig, LightConfig, MandelboxConfig, MandelbulbConfig, Precision, Qf32, QfVec3,
-    QualityConfig, ReflectionConfig, RenderConfig, RenderSettings, SoftShadowConfig,
-    ToneMappingConfig, VideoConfig,
+    AmbientOcclusionConfig, AnimationConfig, AnimationPath, CameraConfig, DslFractalConfig,
+    DslMaterial, ExponentialDivePath, FractalConfig, LightConfig, MandelboxConfig,
+    MandelbulbConfig, OrbitTransform, Precision, Qf32, QfVec3, QualityConfig, ReflectionConfig,
+    RenderConfig, RenderSettings, SoftShadowConfig, ToneMappingConfig, VideoConfig,
 };
 
 pub const CURRENT_SCENE_VERSION: u32 = 1;
@@ -100,6 +100,7 @@ enum SceneScalar {
 enum SceneFractal {
     Mandelbulb(SceneMandelbulb),
     Mandelbox(SceneMandelbox),
+    Dsl(SceneDslFractal),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -119,6 +120,63 @@ struct SceneMandelbox {
     fold_limit: f32,
     iterations: u32,
     bound_radius: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SceneDslFractal {
+    iterations: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bailout: Option<f32>,
+    normal_epsilon: f32,
+    orbit: Vec<SceneOrbitTransform>,
+    #[serde(default)]
+    material: SceneDslMaterial,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "op", rename_all = "kebab-case", deny_unknown_fields)]
+enum SceneOrbitTransform {
+    BoxFold {
+        limit: f32,
+    },
+    SphereFold {
+        min_radius_squared: f32,
+        fixed_radius_squared: f32,
+    },
+    ScaleAddPoint {
+        scale: f32,
+    },
+    Rotate {
+        axis: [f32; 3],
+        degrees: f32,
+    },
+    Translate {
+        offset: [f32; 3],
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+struct SceneDslMaterial {
+    base_color: [f32; 3],
+    accent_color: [f32; 3],
+    specular_color: [f32; 3],
+    background_bottom: [f32; 3],
+    background_top: [f32; 3],
+    color_frequency: f32,
+    ambient_strength: f32,
+    diffuse_strength: f32,
+    specular_strength: f32,
+    shininess: f32,
+    rim_strength: f32,
+    fog_density: f32,
+}
+
+impl Default for SceneDslMaterial {
+    fn default() -> Self {
+        Self::from(&DslMaterial::default())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -293,6 +351,13 @@ impl TryFrom<SceneDocument> for LoadedScene {
                 iterations: config.iterations,
                 bound_radius: config.bound_radius,
             }),
+            SceneFractal::Dsl(config) => FractalConfig::Dsl(DslFractalConfig {
+                iterations: config.iterations,
+                bailout: config.bailout,
+                normal_epsilon: config.normal_epsilon,
+                orbit: config.orbit.into_iter().map(OrbitTransform::from).collect(),
+                material: DslMaterial::from(config.material),
+            }),
         };
         let config = RenderConfig {
             precision,
@@ -369,6 +434,13 @@ impl From<&LoadedScene> for SceneDocument {
                 iterations: config.iterations,
                 bound_radius: config.bound_radius,
             }),
+            FractalConfig::Dsl(config) => SceneFractal::Dsl(SceneDslFractal {
+                iterations: config.iterations,
+                bailout: config.bailout,
+                normal_epsilon: config.normal_epsilon,
+                orbit: config.orbit.iter().map(SceneOrbitTransform::from).collect(),
+                material: SceneDslMaterial::from(&config.material),
+            }),
         };
         Self {
             version: CURRENT_SCENE_VERSION,
@@ -405,6 +477,83 @@ impl From<&LoadedScene> for SceneDocument {
             quality: SceneQuality::from(&scene.config.quality),
             animation: scene.animation.as_ref().map(SceneAnimation::from),
             video: scene.video.as_ref().map(SceneVideo::from),
+        }
+    }
+}
+
+impl From<SceneOrbitTransform> for OrbitTransform {
+    fn from(transform: SceneOrbitTransform) -> Self {
+        match transform {
+            SceneOrbitTransform::BoxFold { limit } => Self::BoxFold { limit },
+            SceneOrbitTransform::SphereFold {
+                min_radius_squared,
+                fixed_radius_squared,
+            } => Self::SphereFold {
+                min_radius_squared,
+                fixed_radius_squared,
+            },
+            SceneOrbitTransform::ScaleAddPoint { scale } => Self::ScaleAddPoint { scale },
+            SceneOrbitTransform::Rotate { axis, degrees } => Self::Rotate { axis, degrees },
+            SceneOrbitTransform::Translate { offset } => Self::Translate { offset },
+        }
+    }
+}
+
+impl From<&OrbitTransform> for SceneOrbitTransform {
+    fn from(transform: &OrbitTransform) -> Self {
+        match transform {
+            OrbitTransform::BoxFold { limit } => Self::BoxFold { limit: *limit },
+            OrbitTransform::SphereFold {
+                min_radius_squared,
+                fixed_radius_squared,
+            } => Self::SphereFold {
+                min_radius_squared: *min_radius_squared,
+                fixed_radius_squared: *fixed_radius_squared,
+            },
+            OrbitTransform::ScaleAddPoint { scale } => Self::ScaleAddPoint { scale: *scale },
+            OrbitTransform::Rotate { axis, degrees } => Self::Rotate {
+                axis: *axis,
+                degrees: *degrees,
+            },
+            OrbitTransform::Translate { offset } => Self::Translate { offset: *offset },
+        }
+    }
+}
+
+impl From<SceneDslMaterial> for DslMaterial {
+    fn from(material: SceneDslMaterial) -> Self {
+        Self {
+            base_color: material.base_color,
+            accent_color: material.accent_color,
+            specular_color: material.specular_color,
+            background_bottom: material.background_bottom,
+            background_top: material.background_top,
+            color_frequency: material.color_frequency,
+            ambient_strength: material.ambient_strength,
+            diffuse_strength: material.diffuse_strength,
+            specular_strength: material.specular_strength,
+            shininess: material.shininess,
+            rim_strength: material.rim_strength,
+            fog_density: material.fog_density,
+        }
+    }
+}
+
+impl From<&DslMaterial> for SceneDslMaterial {
+    fn from(material: &DslMaterial) -> Self {
+        Self {
+            base_color: material.base_color,
+            accent_color: material.accent_color,
+            specular_color: material.specular_color,
+            background_bottom: material.background_bottom,
+            background_top: material.background_top,
+            color_frequency: material.color_frequency,
+            ambient_strength: material.ambient_strength,
+            diffuse_strength: material.diffuse_strength,
+            specular_strength: material.specular_strength,
+            shininess: material.shininess,
+            rim_strength: material.rim_strength,
+            fog_density: material.fog_density,
         }
     }
 }
@@ -616,6 +765,8 @@ mod tests {
         include_str!("../../scenes/examples/mandelbox-quad-deep.yaml");
     const MANDELBOX_QUAD_ZOOM: &str =
         include_str!("../../scenes/examples/mandelbox-quad-zoom.yaml");
+    const TWISTED_MANDELBOX_DSL: &str =
+        include_str!("../../scenes/examples/twisted-mandelbox-dsl.yaml");
 
     #[test]
     fn parses_both_example_scenes() {
@@ -629,6 +780,15 @@ mod tests {
         assert_eq!(box_scene.config.quality.samples_per_pixel, 16);
         assert_eq!(box_scene.config.camera.aperture_radius, 0.12);
         assert!(box_scene.config.quality.tone_mapping.enabled);
+
+        let dsl = parse_scene(TWISTED_MANDELBOX_DSL).expect("DSL example must parse");
+        assert_eq!(dsl.name, "twisted-mandelbox-dsl");
+        assert_eq!(dsl.config.fractal.kind(), FractalKind::Dsl);
+        let FractalConfig::Dsl(program) = &dsl.config.fractal else {
+            unreachable!();
+        };
+        assert_eq!(program.orbit.len(), 4);
+        assert!(program.generate_wgsl().is_ok());
     }
 
     #[test]
@@ -665,6 +825,27 @@ mod tests {
 
         let unknown_field = format!("{MANDELBULB}\nunknown: true\n");
         let error = parse_scene(&unknown_field).expect_err("unknown field must fail");
+        assert!(error.to_string().contains("scene schema"));
+    }
+
+    #[test]
+    fn dsl_scene_round_trips_and_rejects_raw_shader_fields() {
+        let scene = parse_scene(TWISTED_MANDELBOX_DSL).expect("DSL example must parse");
+        let yaml = scene.to_yaml().expect("DSL scene must serialize");
+        let reparsed = parse_scene(&yaml).expect("serialized DSL scene must parse");
+        let (FractalConfig::Dsl(original), FractalConfig::Dsl(round_trip)) =
+            (&scene.config.fractal, &reparsed.config.fractal)
+        else {
+            panic!("DSL kind must survive round trip");
+        };
+        assert_eq!(round_trip, original);
+
+        let injected = TWISTED_MANDELBOX_DSL.replacen(
+            "iterations: 18",
+            "iterations: 18\n    wgsl: 'fn map() {}'",
+            1,
+        );
+        let error = parse_scene(&injected).expect_err("raw WGSL fields must be rejected");
         assert!(error.to_string().contains("scene schema"));
     }
 

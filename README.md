@@ -15,13 +15,14 @@ Rust、wgpu、WGSL で3次元フラクタルを描画する、ウィンドウ不
 - scene/CLIで設定できるFFmpeg動画encodeと原子的な動画出力
 - HDR sample accumulation、AO、面積を持つdirectional lightのsoft shadow、1 bounce reflection
 - 薄レンズcameraによる被写界深度・円形ボケとextended Reinhard tone mapping
+- 型付きfractal DSL/AST、限定orbit命令、CPU validation、WGSL code generation
 - `Rgba8UnormSrgb` オフスクリーン texture から row alignment を考慮した readback
 - PNG 出力を GPU renderer から分離
 - 解像度、ray steps、fractal iterations、NaN/Inf などの事前 validation
 - WGSL validation error を文脈付きエラーとして報告
 - GPU 名、解像度、フレーム時間、合計時間のログ
 
-Phase 5まで実装済みで、offline品質の光学・ライティング効果を含むPNG連番とFFmpeg動画encodeをCLIから一続きで実行できます。
+Phase 6まで実装済みで、型付きDSLから生成したフラクタルにもoffline品質の光学・ライティング効果、PNG連番、FFmpeg動画encodeを適用できます。
 
 ## 必要環境
 
@@ -317,6 +318,54 @@ RTX 3070 / GL backend、320x180の実測では、16 sppのf32静止画が0.72秒
 - Bunnell, [Dynamic Ambient Occlusion and Indirect Lighting](https://developer.nvidia.com/gpugems/gpugems2/part-ii-shading-lighting-and-shadows/chapter-14-dynamic-ambient-occlusion-and)（法線半球に対するaccessibilityとしてのAO）
 - Reinhard et al., [Photographic Tone Reproduction for Digital Images](https://www-old.cs.utah.edu/docs/techreports/2002/pdf/UUCS-02-001.pdf)（white pointを持つextended global operator）
 
+## Fractal DSL / AST（Phase 6・実装済み）
+
+`fractal.kind: dsl`は、YAMLを`DslFractalConfig`と`OrbitTransform`の型付きASTへ変換し、validation後に`map`、material、background、atmosphereのWGSLを生成します。任意のWGSL文字列、関数名、変数名、loopは入力できません。生成部分は共通のcamera、Phase 5 sampling、shading、ray marcherと合成されます。
+
+```yaml
+fractal:
+  kind: dsl
+  parameters:
+    iterations: 18
+    normal_epsilon: 5.0e-5
+    orbit:
+      - op: rotate
+        axis: [0.3, 0.8, 1.0]
+        degrees: 7.5
+      - op: box-fold
+        limit: 1.14
+      - op: sphere-fold
+        min_radius_squared: 0.60
+        fixed_radius_squared: 2.65
+      - op: scale-add-point
+        scale: -2.18
+    material:
+      base_color: [0.035, 0.16, 0.48]
+      accent_color: [1.25, 0.28, 0.035]
+      shininess: 56.0
+```
+
+利用可能なorbit命令は次の5種類です。
+
+- `box-fold`: 軸ごとのbox fold
+- `sphere-fold`: 最小・固定半径によるsphere foldとDE derivative更新
+- `scale-add-point`: `z = scale * z + p`とDE derivative更新
+- `rotate`: 任意axisのRodrigues rotation
+- `translate`: 定数offsetの加算
+
+DSLはf32専用です。`iterations`は1〜96、orbitは1〜16命令、`scale-add-point`は正確に1個、scaleの絶対値は1.000001〜4.0へ制限されます。色、半径、角度、移動量などもfiniteな範囲内か検証し、未知fieldと`wgsl`のようなraw shader fieldはscene schemaで拒否します。AST定数は生成WGSLへ埋め込まれるため、animation中にASTを変更して既存pipelineを再利用しようとした場合もrendererが拒否します。
+
+サンプルを次のコマンドで描画できます。
+
+```bash
+WGPU_BACKEND=gl cargo run --release -p fractal-renderer-cli -- render \
+  scenes/examples/twisted-mandelbox-dsl.yaml \
+  --output output/twisted-mandelbox-dsl.png \
+  --overwrite
+```
+
+Rust側の再利用可能なAST・generatorは`renderer-core/src/dsl.rs`、同じASTを解釈するCPU `DistanceEstimator`は`renderer-core/src/fractal.rs`、YAMLとの変換は`renderer-core/src/scene_file.rs`、shader moduleへの合成は`renderer-core/src/shader.rs`に分離しています。DSL programは既存の`TargetPicker`へそのまま渡せます。新しい安全な命令を追加するときは、AST variant、domain validation、CPU解釈、固定templateによるWGSL生成、scene変換を同時に追加します。
+
 ## ディレクトリ構成
 
 ```text
@@ -334,6 +383,7 @@ RTX 3070 / GL backend、320x180の実測では、16 sppのf32静止画が0.72秒
 │   ├── precision/                # WGSL Qf32 / QfVec3
 │   └── src/
 │       ├── fractal.rs           # CPU DistanceEstimator
+│       ├── dsl.rs               # typed AST / validation / WGSL generator
 │       ├── path.rs              # target search / dive path
 │       ├── animation.rs         # timeline / quad-float camera合成
 │       ├── video.rs             # codec設定とscene validation
@@ -354,4 +404,4 @@ RTX 3070 / GL backend、320x180の実測では、16 sppのf32静止画が0.72秒
 3. Phase 3（完了）: quad-float対応animation、指数ズーム、連番、resume、`--frame`、`--overwrite`
 4. Phase 4（完了）: configurable FFmpeg integration、検証付き動画encode
 5. Phase 5（完了）: HDR accumulation、AO、soft shadow、reflection、thin-lens DOF、tone mapping
-6. Phase 6: fractal DSL/AST、限定的な WGSL 生成と validation
+6. Phase 6（完了）: typed fractal DSL/AST、限定的なWGSL生成とvalidation

@@ -2,6 +2,7 @@
 
 mod animation;
 mod config;
+mod dsl;
 mod fractal;
 mod path;
 mod precision;
@@ -20,6 +21,7 @@ pub use config::{
     MandelbulbConfig, Precision, QualityConfig, ReflectionConfig, RenderConfig, RenderSettings,
     SoftShadowConfig, ToneMappingConfig,
 };
+pub use dsl::{DslFractalConfig, DslMaterial, MAX_DSL_TRANSFORMS, OrbitTransform};
 pub use fractal::{DistanceEstimator, HighPrecisionDistanceEstimator};
 pub use path::{ExponentialDivePath, PathTarget, TargetPicker, TargetSearchConfig};
 pub use precision::{Qf32, QfParseError, QfVec3};

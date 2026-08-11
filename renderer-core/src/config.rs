@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 
-use crate::QfVec3;
+use crate::{DslFractalConfig, QfVec3};
 
 /// Hard safety ceilings shared by validation and the bounded WGSL loops.
 pub const MAX_IMAGE_DIMENSION: u32 = 8_192;
@@ -32,6 +32,7 @@ pub struct CameraConfig {
 pub enum FractalKind {
     Mandelbulb,
     Mandelbox,
+    Dsl,
 }
 
 /// Coordinate precision used by the camera, ray marcher, and fractal DE.
@@ -88,6 +89,7 @@ impl Default for MandelboxConfig {
 pub enum FractalConfig {
     Mandelbulb(MandelbulbConfig),
     Mandelbox(MandelboxConfig),
+    Dsl(DslFractalConfig),
 }
 
 impl FractalConfig {
@@ -96,6 +98,7 @@ impl FractalConfig {
         match self {
             Self::Mandelbulb(_) => FractalKind::Mandelbulb,
             Self::Mandelbox(_) => FractalKind::Mandelbox,
+            Self::Dsl(_) => FractalKind::Dsl,
         }
     }
 
@@ -103,6 +106,7 @@ impl FractalConfig {
         match self {
             Self::Mandelbulb(config) => config.iterations,
             Self::Mandelbox(config) => config.iterations,
+            Self::Dsl(config) => config.iterations,
         }
     }
 
@@ -115,6 +119,18 @@ impl FractalConfig {
                 config.fixed_radius_squared,
                 config.fold_limit,
             ],
+            Self::Dsl(_) => [0.0; 4],
+        }
+    }
+
+    /// Built-ins read their parameters from uniforms. DSL constants are
+    /// embedded in generated WGSL and therefore require an identical AST when
+    /// a renderer pipeline is reused across animation frames.
+    pub(crate) fn shader_compatible_with(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Dsl(left), Self::Dsl(right)) => left == right,
+            (Self::Dsl(_), _) | (_, Self::Dsl(_)) => false,
+            _ => self.kind() == other.kind(),
         }
     }
 }
@@ -312,6 +328,7 @@ impl RenderConfig {
                     bail!("Mandelbox bound radius must be finite and greater than zero");
                 }
             }
+            FractalConfig::Dsl(config) => config.validate()?,
         }
         if self.precision == Precision::QuadFloat && self.fractal.kind() != FractalKind::Mandelbox {
             bail!("quad-float precision is currently supported only for Mandelbox scenes");
@@ -507,6 +524,28 @@ mod tests {
         config.validate().expect("Phase 5 settings must validate");
 
         config.quality.reflection.roughness = 1.1;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn dsl_pipeline_compatibility_requires_the_same_ast() {
+        let original = FractalConfig::Dsl(DslFractalConfig::default());
+        let identical = original.clone();
+        assert!(original.shader_compatible_with(&identical));
+
+        let mut changed_program = DslFractalConfig::default();
+        changed_program.material.shininess = 64.0;
+        let changed = FractalConfig::Dsl(changed_program);
+        assert!(!original.shader_compatible_with(&changed));
+        assert!(
+            !original.shader_compatible_with(&FractalConfig::Mandelbox(MandelboxConfig::default()))
+        );
+
+        let config = RenderConfig {
+            fractal: original,
+            precision: Precision::QuadFloat,
+            ..RenderConfig::default()
+        };
         assert!(config.validate().is_err());
     }
 }

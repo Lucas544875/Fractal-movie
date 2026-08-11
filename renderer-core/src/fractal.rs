@@ -1,4 +1,4 @@
-use crate::{MandelboxConfig, Qf32, QfVec3};
+use crate::{DslFractalConfig, MandelboxConfig, OrbitTransform, Qf32, QfVec3};
 
 /// CPU-side counterpart of a shader distance estimator.
 ///
@@ -42,6 +42,62 @@ impl DistanceEstimator for MandelboxConfig {
         }
 
         dot(z, z).sqrt() / derivative.abs()
+    }
+}
+
+impl DistanceEstimator for DslFractalConfig {
+    fn distance_estimate(&self, point: [f64; 3]) -> f64 {
+        let mut z = point;
+        let mut derivative = 1.0_f64;
+
+        for _ in 0..self.iterations {
+            for transform in &self.orbit {
+                match transform {
+                    OrbitTransform::BoxFold { limit } => {
+                        let limit = f64::from(*limit);
+                        for component in &mut z {
+                            *component = component.clamp(-limit, limit) * 2.0 - *component;
+                        }
+                    }
+                    OrbitTransform::SphereFold {
+                        min_radius_squared,
+                        fixed_radius_squared,
+                    } => {
+                        let minimum = f64::from(*min_radius_squared);
+                        let fixed = f64::from(*fixed_radius_squared);
+                        let radius_squared = dot(z, z);
+                        if radius_squared < minimum {
+                            let factor = fixed / minimum;
+                            z = scale_vector(z, factor);
+                            derivative *= factor;
+                        } else if radius_squared < fixed {
+                            let factor = fixed / radius_squared.max(1.0e-24);
+                            z = scale_vector(z, factor);
+                            derivative *= factor;
+                        }
+                    }
+                    OrbitTransform::ScaleAddPoint { scale } => {
+                        let scale = f64::from(*scale);
+                        z = add(scale_vector(z, scale), point);
+                        derivative = derivative * scale.abs() + 1.0;
+                    }
+                    OrbitTransform::Rotate { axis, degrees } => {
+                        z = rotate(z, axis.map(f64::from), f64::from(*degrees).to_radians());
+                    }
+                    OrbitTransform::Translate { offset } => {
+                        z = add(z, offset.map(f64::from));
+                    }
+                }
+            }
+            if self
+                .bailout
+                .is_some_and(|bailout| dot(z, z) > f64::from(bailout).powi(2))
+            {
+                break;
+            }
+        }
+
+        dot(z, z).sqrt() / derivative.abs().max(1.0e-24)
     }
 }
 
@@ -107,6 +163,32 @@ fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
+fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn rotate(value: [f64; 3], axis_value: [f64; 3], radians: f64) -> [f64; 3] {
+    let axis_length_squared = dot(axis_value, axis_value);
+    if axis_length_squared < 1.0e-24 {
+        return value;
+    }
+    let inverse_length = axis_length_squared.sqrt().recip();
+    let axis = scale_vector(axis_value, inverse_length);
+    let cosine = radians.cos();
+    let sine = radians.sin();
+    add(
+        add(
+            scale_vector(value, cosine),
+            scale_vector(cross(axis, value), sine),
+        ),
+        scale_vector(axis, dot(axis, value) * (1.0 - cosine)),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,5 +211,30 @@ mod tests {
             .distance_estimate_qf(QfVec3::from_f64(point))
             .to_f64();
         assert!((ordinary - precise).abs() < ordinary * 2.0e-6);
+    }
+
+    #[test]
+    fn default_dsl_estimator_matches_the_builtin_mandelbox() {
+        let built_in = MandelboxConfig::default();
+        let generated = DslFractalConfig::default();
+        for point in [[3.0, 1.25, 0.5], [-2.7, 0.4, 1.1], [0.3, -1.9, 2.4]] {
+            let expected = built_in.distance_estimate(point);
+            let actual = generated.distance_estimate(point);
+            assert!((actual - expected).abs() < expected.abs().max(1.0) * 1.0e-12);
+        }
+    }
+
+    #[test]
+    fn transformed_dsl_estimator_remains_finite() {
+        let mut generated = DslFractalConfig::default();
+        generated.orbit.insert(
+            0,
+            OrbitTransform::Rotate {
+                axis: [0.3, 0.8, 1.0],
+                degrees: 7.5,
+            },
+        );
+        let distance = generated.distance_estimate([4.0, 2.0, 1.0]);
+        assert!(distance.is_finite() && distance > 0.0);
     }
 }

@@ -799,6 +799,7 @@ const fn fractal_label(kind: FractalKind) -> &'static str {
     match kind {
         FractalKind::Mandelbulb => "mandelbulb",
         FractalKind::Mandelbox => "mandelbox",
+        FractalKind::Dsl => "generated DSL",
     }
 }
 

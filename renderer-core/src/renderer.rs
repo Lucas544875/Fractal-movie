@@ -295,12 +295,11 @@ impl Renderer {
         });
 
         let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let shader_source = shader::fractal_source(&config.fractal, config.precision)
+            .context("could not generate the fractal WGSL module")?;
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("fractal-shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Owned(shader::fractal_source(
-                config.fractal.kind(),
-                config.precision,
-            ))),
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(shader_source)),
         });
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("raymarch-render-pipeline"),
@@ -413,11 +412,11 @@ impl Renderer {
                 self.config.render.height
             ));
         }
-        if config.fractal.kind() != self.config.fractal.kind()
+        if !config.fractal.shader_compatible_with(&self.config.fractal)
             || config.precision != self.config.precision
         {
             return Err(anyhow!(
-                "per-frame fractal kind and precision must match the renderer pipeline"
+                "per-frame fractal shader configuration and precision must match the renderer pipeline"
             ));
         }
 
@@ -725,6 +724,25 @@ mod tests {
                 "animation frame {frame_index} produced only {unique_colors} RGB colors"
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires a hardware GPU"]
+    fn generated_dsl_shader_renders_with_phase_five_effects() {
+        let mut config = crate::parse_scene(include_str!(
+            "../../scenes/examples/twisted-mandelbox-dsl.yaml"
+        ))
+        .expect("DSL example")
+        .config;
+        config.render.width = 96;
+        config.render.height = 54;
+        let renderer = pollster::block_on(Renderer::new(config)).expect("DSL renderer");
+        let image = renderer.render_frame(0, 0.0).expect("DSL image");
+        let unique_colors = unique_rgb_colors(image.pixels());
+        assert!(
+            unique_colors >= 32,
+            "generated DSL shader produced only {unique_colors} RGB colors"
+        );
     }
 
     fn unique_rgb_colors(pixels: &[u8]) -> usize {

@@ -1,0 +1,76 @@
+version: 1
+name: twisted-mandelbox-dsl
+precision: f32
+seed: 20260811
+
+camera:
+  position: [8.0, 5.0, 4.0]
+  target: [0.0, 0.0, 0.0]
+  up: [0.0, 0.0, 1.0]
+  vertical_fov_degrees: 34.0
+  aperture_radius: 0.05
+  focus_distance: 7.5
+
+# This section is parsed into a typed AST. It accepts no WGSL text, function
+# names, identifiers, or unbounded loops.
+fractal:
+  kind: dsl
+  parameters:
+    iterations: 18
+    normal_epsilon: 5.0e-5
+    orbit:
+      - op: rotate
+        axis: [0.3, 0.8, 1.0]
+        degrees: 7.5
+      - op: box-fold
+        limit: 1.14
+      - op: sphere-fold
+        min_radius_squared: 0.60
+        fixed_radius_squared: 2.65
+      - op: scale-add-point
+        scale: -2.18
+    material:
+      base_color: [0.035, 0.16, 0.48]
+      accent_color: [1.25, 0.28, 0.035]
+      specular_color: [1.0, 0.78, 0.48]
+      background_bottom: [0.004, 0.007, 0.018]
+      background_top: [0.055, 0.10, 0.20]
+      color_frequency: 2.4
+      ambient_strength: 0.20
+      diffuse_strength: 1.05
+      specular_strength: 0.42
+      shininess: 56.0
+      rim_strength: 0.22
+      fog_density: 0.002
+
+light:
+  direction: [-0.6, 0.9, 0.7]
+
+render:
+  width: 640
+  height: 360
+  max_steps: 320
+  max_distance: 50.0
+  epsilon: 1.0e-5
+  step_safety: 0.88
+  pixel_epsilon_multiplier: 1.0
+
+quality:
+  samples_per_pixel: 16
+  ambient_occlusion:
+    max_steps: 48
+    radius: 1.0
+    strength: 0.65
+  soft_shadow:
+    max_steps: 72
+    angular_radius_degrees: 1.5
+    max_distance: 14.0
+  reflection:
+    max_steps: 64
+    max_distance: 12.0
+    strength: 0.12
+    roughness: 0.08
+  tone_mapping:
+    enabled: true
+    exposure_stops: -0.2
+    white_point: 3.0
