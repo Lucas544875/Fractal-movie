@@ -1,11 +1,13 @@
 # Fractal Movie
 
-Rust、wgpu、WGSL で3次元フラクタルを描画する、ウィンドウ不要のオフスクリーンレンダラーです。現在は Phase 1 として、fullscreen triangle の fragment shader から Mandelbulb の Distance Estimator を ray marching し、法線・ディレクショナルライトを計算して PNG 1枚へ保存できます。
+Rust、wgpu、WGSL で3次元フラクタルを描画する、ウィンドウ不要のオフスクリーンレンダラーです。fullscreen triangle の fragment shader から Mandelbulb または Mandelbox の Distance Estimator を ray marching し、PNG へ保存できます。
 
 ## 現在の実装範囲
 
 - wgpu による headless adapter/device 初期化（画面・surface 不要）
-- WGSL による Mandelbulb、sphere tracing、法線、基本ライティング
+- WGSL による Mandelbulb / Mandelbox、sphere tracing、法線、フラクタル別ライティング
+- CPU Distance Estimator による再利用可能なカメラターゲット探索
+- overview から深部へ進む指数ズーム経路モデル
 - `Rgba8UnormSrgb` オフスクリーン texture から row alignment を考慮した readback
 - PNG 出力を GPU renderer から分離
 - 解像度、ray steps、fractal iterations、NaN/Inf などの事前 validation
@@ -77,6 +79,25 @@ cargo run --release -p fractal-renderer-cli -- render \
   --height 1080
 ```
 
+## Portfolio Mandelbox を1フレーム出力
+
+`../portfolio/site/works/mandelbox/` と同じ box fold / sphere fold パラメーター、茶色の材質、6方向の橙色発光を使います。CPU側では参照JSの `pickOriginGapDir()` と同じ方針で、+X側から実際に到達できる表面を探索してカメラを配置します。
+
+```bash
+cargo run --release -p fractal-renderer-cli -- render --fractal mandelbox
+```
+
+出力先は既定で `output/phase1/mandelbox.png` です。ターゲット探索はseedに対して決定的なので、同じseedなら同じ構図になります。
+
+```bash
+cargo run --release -p fractal-renderer-cli -- render \
+  --fractal mandelbox \
+  --seed 20260811 \
+  --output output/phase1/mandelbox-alt.png
+```
+
+経路関連のコードはGPUレンダラーから独立しています。`DistanceEstimator` を実装したフラクタルは `TargetPicker` による表面ターゲット探索を再利用でき、`ExponentialDivePath::distance_at()` は参照JSの overview→dive の距離曲線を提供します。将来の連番アニメーションでは、この結果を各フレームのcamera設定へ渡せます。
+
 ## Scene file（Phase 2）
 
 renderer はすでに `RenderConfig` と GPU 実装を分離しています。Phase 2 では versioned YAML schema から camera、fractal、light、render、seed を deserialize・validate し、次の形で起動できるようにします。
@@ -85,7 +106,7 @@ renderer はすでに `RenderConfig` と GPU 実装を分離しています。Ph
 fractal-render render scene/examples/mandelbulb.yaml
 ```
 
-予定する主要フィールドは `fractal.power/iterations/bailout`、`camera.position/target/fov`、`render.width/height/max_steps/max_distance/epsilon`、`seed` です。自由な WGSL 全体を scene に埋め込まず、将来も `fn map(p: vec3<f32>) -> f32` の限定された生成境界を使います。
+予定する主要フィールドは `fractal.kind/parameters`、`camera.position/target/up/fov`、`render.width/height/max_steps/max_distance/epsilon`、`seed` です。自由な WGSL 全体を scene に埋め込まず、将来も `fn map(p: vec3<f32>) -> f32` の限定された生成境界を使います。
 
 ## Animation と任意フレーム（Phase 3）
 
@@ -116,8 +137,13 @@ Phase 4 ではこの subprocess 呼び出しと codec options を scene/CLI 設�
 │   ├── raymarch.wgsl            # fullscreen triangle と sphere tracing
 │   ├── shading.wgsl             # normal と lighting
 │   ├── fractal/
-│   │   └── mandelbulb.wgsl      # 差し替え可能な map(p) 実装
-│   └── src/                      # config、wgpu、readback
+│   │   ├── mandelbulb.wgsl      # Mandelbulb map / material
+│   │   └── mandelbox.wgsl       # Portfolio Mandelbox map / material
+│   └── src/
+│       ├── fractal.rs           # CPU DistanceEstimator
+│       ├── path.rs              # target search / dive path
+│       ├── scene.rs             # scene presets
+│       └── ...                  # config、wgpu、readback
 ├── renderer-cli/
 │   └── src/                      # CLI と PNG encoder
 └── output/                       # 生成物（Git 管理外）

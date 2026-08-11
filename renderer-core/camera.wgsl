@@ -4,11 +4,14 @@ struct RenderUniforms {
     // xyz: position, w: vertical FOV in radians
     camera_position_fov: vec4<f32>,
     camera_target: vec4<f32>,
-    // x: power, y: bailout, z: epsilon, w: max distance
-    fractal: vec4<f32>,
+    // Fractal-specific parameters; interpreted by the selected map() module.
+    fractal_primary: vec4<f32>,
+    // x: epsilon, y: max distance, z: step safety, w: pixel epsilon multiplier
+    render_params: vec4<f32>,
     // x: fractal iterations, y: ray steps, z: seed
     limits: vec4<u32>,
     light_direction: vec4<f32>,
+    camera_up: vec4<f32>,
 }
 
 @group(0) @binding(0)
@@ -29,13 +32,16 @@ fn camera_ray(pixel: vec2<f32>) -> vec3<f32> {
 
     let origin = uniforms.camera_position_fov.xyz;
     let forward = safe_normalize(uniforms.camera_target.xyz - origin, vec3<f32>(0.0, 0.0, -1.0));
-    var world_up = vec3<f32>(0.0, 1.0, 0.0);
+    var world_up = safe_normalize(uniforms.camera_up.xyz, vec3<f32>(0.0, 1.0, 0.0));
     if abs(dot(forward, world_up)) > 0.999 {
-        world_up = vec3<f32>(0.0, 0.0, 1.0);
+        world_up = select(
+            vec3<f32>(0.0, 1.0, 0.0),
+            vec3<f32>(1.0, 0.0, 0.0),
+            abs(forward.y) > 0.999,
+        );
     }
     let right = safe_normalize(cross(forward, world_up), vec3<f32>(1.0, 0.0, 0.0));
     let up = cross(right, forward);
     let focal_scale = tan(0.5 * uniforms.camera_position_fov.w);
     return safe_normalize(forward + focal_scale * (screen.x * right + screen.y * up), forward);
 }
-

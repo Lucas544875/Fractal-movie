@@ -3,8 +3,14 @@ mod output;
 use std::{path::Path, path::PathBuf, process::ExitCode, time::Instant};
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use fractal_renderer_core::{RenderConfig, Renderer, RendererOptions, adapter_is_software};
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum FractalName {
+    Mandelbulb,
+    Mandelbox,
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -19,11 +25,19 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Render the built-in Phase 1 Mandelbulb scene to one PNG file.
+    /// Render a built-in fractal scene to one PNG file.
     Render {
         /// Output PNG path.
-        #[arg(long, default_value = "output/phase1/mandelbulb.png")]
-        output: PathBuf,
+        #[arg(long)]
+        output: Option<PathBuf>,
+
+        /// Fractal scene to render.
+        #[arg(long, value_enum, default_value_t = FractalName::Mandelbulb)]
+        fractal: FractalName,
+
+        /// Deterministic seed used by scene and camera-path generation.
+        #[arg(long, default_value_t = 12_345)]
+        seed: u32,
 
         /// Image width in pixels.
         #[arg(long, default_value_t = 640)]
@@ -61,25 +75,45 @@ fn run() -> Result<()> {
     match cli.command {
         Command::Render {
             output,
+            fractal,
+            seed,
             width,
             height,
             allow_software,
             adapter,
-        } => render(output, width, height, allow_software, adapter),
+        } => render(
+            output,
+            fractal,
+            seed,
+            width,
+            height,
+            allow_software,
+            adapter,
+        ),
         Command::GpuInfo => gpu_info(),
     }
 }
 
 fn render(
-    output_path: PathBuf,
+    output_path: Option<PathBuf>,
+    fractal: FractalName,
+    seed: u32,
     width: u32,
     height: u32,
     allow_software: bool,
     adapter_name: Option<String>,
 ) -> Result<()> {
-    let mut config = RenderConfig::default();
+    let mut config = match fractal {
+        FractalName::Mandelbulb => RenderConfig::default(),
+        FractalName::Mandelbox => RenderConfig::mandelbox(seed),
+    };
+    config.seed = seed;
     config.render.width = width;
     config.render.height = height;
+    let output_path = output_path.unwrap_or_else(|| match fractal {
+        FractalName::Mandelbulb => PathBuf::from("output/phase1/mandelbulb.png"),
+        FractalName::Mandelbox => PathBuf::from("output/phase1/mandelbox.png"),
+    });
 
     let renderer = pollster::block_on(Renderer::new_with_options(
         config,
@@ -102,6 +136,7 @@ fn render(
             "software (CPU)"
         }
     );
+    println!("Fractal: {fractal:?}");
     println!("Resolution: {width}x{height}");
     println!("Frames: 1");
     println!("Rendering frame 1/1");
@@ -110,7 +145,7 @@ fn render(
     let frame_start = Instant::now();
     let image = renderer
         .render_frame(0, 0.0)
-        .context("failed to render Mandelbulb frame 0")?;
+        .with_context(|| format!("failed to render {fractal:?} frame 0"))?;
     let frame_time = frame_start.elapsed();
     println!("Frame render time: {:.3}s", frame_time.as_secs_f64());
 

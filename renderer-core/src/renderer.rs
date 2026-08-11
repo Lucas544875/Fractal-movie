@@ -51,9 +51,11 @@ struct RenderUniforms {
     resolution_time_frame: [f32; 4],
     camera_position_fov: [f32; 4],
     camera_target: [f32; 4],
-    fractal: [f32; 4],
+    fractal_primary: [f32; 4],
+    render_params: [f32; 4],
     limits: [u32; 4],
     light_direction: [f32; 4],
+    camera_up: [f32; 4],
 }
 
 impl RenderUniforms {
@@ -77,14 +79,15 @@ impl RenderUniforms {
                 config.camera.target[2],
                 0.0,
             ],
-            fractal: [
-                config.fractal.power,
-                config.fractal.bailout,
+            fractal_primary: config.fractal.shader_parameters(),
+            render_params: [
                 config.render.epsilon,
                 config.render.max_distance,
+                config.render.step_safety,
+                config.render.pixel_epsilon_multiplier,
             ],
             limits: [
-                config.fractal.iterations,
+                config.fractal.iterations(),
                 config.render.max_steps,
                 config.seed,
                 0,
@@ -93,6 +96,12 @@ impl RenderUniforms {
                 config.light.direction[0],
                 config.light.direction[1],
                 config.light.direction[2],
+                0.0,
+            ],
+            camera_up: [
+                config.camera.up[0],
+                config.camera.up[1],
+                config.camera.up[2],
                 0.0,
             ],
         }
@@ -226,8 +235,10 @@ impl Renderer {
 
         let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("mandelbulb-shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Owned(shader::mandelbulb_source())),
+            label: Some("fractal-shader"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(shader::fractal_source(
+                config.fractal.kind(),
+            ))),
         });
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("raymarch-render-pipeline"),

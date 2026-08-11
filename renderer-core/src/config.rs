@@ -10,14 +10,99 @@ pub const MAX_FRACTAL_ITERATIONS: u32 = 64;
 pub struct CameraConfig {
     pub position: [f32; 3],
     pub target: [f32; 3],
+    /// Preferred world-up direction. Mandelbulb uses Y-up; the portfolio
+    /// Mandelbox uses the original WebGL scene's Z-up convention.
+    pub up: [f32; 3],
     pub vertical_fov_degrees: f32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FractalKind {
+    Mandelbulb,
+    Mandelbox,
+}
+
 #[derive(Clone, Debug)]
-pub struct FractalConfig {
+pub struct MandelbulbConfig {
     pub power: f32,
     pub iterations: u32,
     pub bailout: f32,
+}
+
+impl Default for MandelbulbConfig {
+    fn default() -> Self {
+        Self {
+            power: 8.0,
+            iterations: 16,
+            bailout: 4.0,
+        }
+    }
+}
+
+/// Parameters from `portfolio/site/src/pages/mandelbox.js`.
+#[derive(Clone, Debug)]
+pub struct MandelboxConfig {
+    pub scale: f32,
+    pub min_radius_squared: f32,
+    pub fixed_radius_squared: f32,
+    pub fold_limit: f32,
+    pub iterations: u32,
+    /// Conservative sphere containing the fractal, used by CPU path search.
+    pub bound_radius: f64,
+}
+
+impl Default for MandelboxConfig {
+    fn default() -> Self {
+        Self {
+            scale: -2.18,
+            min_radius_squared: 0.60,
+            fixed_radius_squared: 2.65,
+            fold_limit: 1.14,
+            iterations: 16,
+            bound_radius: 4.2,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum FractalConfig {
+    Mandelbulb(MandelbulbConfig),
+    Mandelbox(MandelboxConfig),
+}
+
+impl FractalConfig {
+    #[must_use]
+    pub const fn kind(&self) -> FractalKind {
+        match self {
+            Self::Mandelbulb(_) => FractalKind::Mandelbulb,
+            Self::Mandelbox(_) => FractalKind::Mandelbox,
+        }
+    }
+
+    pub(crate) const fn iterations(&self) -> u32 {
+        match self {
+            Self::Mandelbulb(config) => config.iterations,
+            Self::Mandelbox(config) => config.iterations,
+        }
+    }
+
+    pub(crate) const fn shader_parameters(&self) -> [f32; 4] {
+        match self {
+            Self::Mandelbulb(config) => [config.power, config.bailout, 0.0, 0.0],
+            Self::Mandelbox(config) => [
+                config.scale,
+                config.min_radius_squared,
+                config.fixed_radius_squared,
+                config.fold_limit,
+            ],
+        }
+    }
+}
+
+impl Default for FractalConfig {
+    fn default() -> Self {
+        Self::Mandelbulb(MandelbulbConfig::default())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -33,12 +118,14 @@ pub struct RenderSettings {
     pub max_steps: u32,
     pub max_distance: f32,
     pub epsilon: f32,
+    /// Multiplier applied to every distance-estimator step.
+    pub step_safety: f32,
+    /// Multiplier for distance- and pixel-projected hit precision. Zero keeps
+    /// a fixed epsilon.
+    pub pixel_epsilon_multiplier: f32,
 }
 
-/// Complete in-memory render description used by the Phase 1 renderer.
-///
-/// Phase 2 will deserialize this model from a versioned scene file rather than
-/// changing the GPU renderer API.
+/// Complete in-memory render description.
 #[derive(Clone, Debug)]
 pub struct RenderConfig {
     pub camera: CameraConfig,
@@ -54,13 +141,10 @@ impl Default for RenderConfig {
             camera: CameraConfig {
                 position: [2.5, 1.7, 2.5],
                 target: [0.0, 0.0, 0.0],
+                up: [0.0, 1.0, 0.0],
                 vertical_fov_degrees: 38.0,
             },
-            fractal: FractalConfig {
-                power: 8.0,
-                iterations: 16,
-                bailout: 4.0,
-            },
+            fractal: FractalConfig::default(),
             light: LightConfig {
                 direction: [-0.45, 0.75, 0.55],
             },
@@ -70,6 +154,8 @@ impl Default for RenderConfig {
                 max_steps: 256,
                 max_distance: 100.0,
                 epsilon: 0.0001,
+                step_safety: 1.0,
+                pixel_epsilon_multiplier: 0.0,
             },
             seed: 12_345,
         }
@@ -93,18 +179,57 @@ impl RenderConfig {
         if render.max_steps == 0 || render.max_steps > MAX_RAY_STEPS {
             bail!("max_steps must be in 1..={MAX_RAY_STEPS}");
         }
-        if self.fractal.iterations == 0 || self.fractal.iterations > MAX_FRACTAL_ITERATIONS {
+        let iterations = self.fractal.iterations();
+        if iterations == 0 || iterations > MAX_FRACTAL_ITERATIONS {
             bail!("fractal iterations must be in 1..={MAX_FRACTAL_ITERATIONS}");
         }
-        finite_positive("fractal power", self.fractal.power)?;
-        if self.fractal.power < 2.0 || self.fractal.power > 32.0 {
-            bail!("fractal power must be in 2.0..=32.0");
+        match &self.fractal {
+            FractalConfig::Mandelbulb(config) => {
+                finite_positive("fractal power", config.power)?;
+                if !(2.0..=32.0).contains(&config.power) {
+                    bail!("fractal power must be in 2.0..=32.0");
+                }
+                finite_positive("fractal bailout", config.bailout)?;
+            }
+            FractalConfig::Mandelbox(config) => {
+                if !config.scale.is_finite()
+                    || config.scale.abs() <= 1.0
+                    || config.scale.abs() > 4.0
+                {
+                    bail!("Mandelbox scale magnitude must be in (1.0, 4.0]");
+                }
+                finite_positive(
+                    "Mandelbox minimum radius squared",
+                    config.min_radius_squared,
+                )?;
+                finite_positive(
+                    "Mandelbox fixed radius squared",
+                    config.fixed_radius_squared,
+                )?;
+                if config.fixed_radius_squared <= config.min_radius_squared {
+                    bail!("Mandelbox fixed radius squared must exceed its minimum radius squared");
+                }
+                finite_positive("Mandelbox fold limit", config.fold_limit)?;
+                if !config.bound_radius.is_finite() || config.bound_radius <= 0.0 {
+                    bail!("Mandelbox bound radius must be finite and greater than zero");
+                }
+            }
         }
-        finite_positive("fractal bailout", self.fractal.bailout)?;
         finite_positive("max_distance", render.max_distance)?;
         finite_positive("epsilon", render.epsilon)?;
         if render.epsilon >= 0.1 {
             bail!("epsilon must be less than 0.1");
+        }
+        if !render.step_safety.is_finite() || !(0.0..=1.0).contains(&render.step_safety) {
+            bail!("step_safety must be finite and in (0.0, 1.0]");
+        }
+        if render.step_safety == 0.0 {
+            bail!("step_safety must be greater than zero");
+        }
+        if !render.pixel_epsilon_multiplier.is_finite()
+            || !(0.0..=10.0).contains(&render.pixel_epsilon_multiplier)
+        {
+            bail!("pixel_epsilon_multiplier must be finite and in 0.0..=10.0");
         }
         let fov = self.camera.vertical_fov_degrees;
         if !fov.is_finite() || !(1.0..179.0).contains(&fov) {
@@ -112,9 +237,17 @@ impl RenderConfig {
         }
         finite_vector("camera position", self.camera.position)?;
         finite_vector("camera target", self.camera.target)?;
+        finite_vector("camera up", self.camera.up)?;
         finite_vector("light direction", self.light.direction)?;
         if squared_distance(self.camera.position, self.camera.target) < 1.0e-8 {
             bail!("camera position and target must not be equal");
+        }
+        if squared_length(self.camera.up) < 1.0e-8 {
+            bail!("camera up must not be zero");
+        }
+        let forward = subtract(self.camera.target, self.camera.position);
+        if squared_length(cross(forward, self.camera.up)) < 1.0e-8 {
+            bail!("camera up must not be parallel to the viewing direction");
         }
         if squared_length(self.light.direction) < 1.0e-8 {
             bail!("light direction must not be zero");
@@ -137,12 +270,24 @@ fn finite_vector(name: &str, value: [f32; 3]) -> Result<()> {
     Ok(())
 }
 
+fn subtract(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
 fn squared_length(value: [f32; 3]) -> f32 {
     value.iter().map(|component| component * component).sum()
 }
 
 fn squared_distance(a: [f32; 3], b: [f32; 3]) -> f32 {
-    squared_length([a[0] - b[0], a[1] - b[1], a[2] - b[2]])
+    squared_length(subtract(a, b))
 }
 
 #[cfg(test)]
@@ -153,7 +298,7 @@ mod tests {
     fn default_config_is_valid() {
         RenderConfig::default()
             .validate()
-            .expect("the built-in Phase 1 scene must remain valid");
+            .expect("the built-in Mandelbulb scene must remain valid");
     }
 
     #[test]
@@ -163,14 +308,20 @@ mod tests {
         assert!(config.validate().is_err());
 
         config = RenderConfig::default();
-        config.fractal.iterations = MAX_FRACTAL_ITERATIONS + 1;
+        let FractalConfig::Mandelbulb(fractal) = &mut config.fractal else {
+            panic!("default fractal changed unexpectedly");
+        };
+        fractal.iterations = MAX_FRACTAL_ITERATIONS + 1;
         assert!(config.validate().is_err());
     }
 
     #[test]
     fn rejects_non_finite_values() {
         let mut config = RenderConfig::default();
-        config.fractal.power = f32::NAN;
+        let FractalConfig::Mandelbulb(fractal) = &mut config.fractal else {
+            panic!("default fractal changed unexpectedly");
+        };
+        fractal.power = f32::NAN;
         assert!(config.validate().is_err());
     }
 

@@ -20,8 +20,10 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 fn fs_main(@builtin(position) fragment_position: vec4<f32>) -> @location(0) vec4<f32> {
     let ray_origin = uniforms.camera_position_fov.xyz;
     let ray_direction = camera_ray(fragment_position.xy);
-    let max_distance = uniforms.fractal.w;
-    let epsilon = uniforms.fractal.z;
+    let max_distance = uniforms.render_params.y;
+    let epsilon = uniforms.render_params.x;
+    let step_safety = uniforms.render_params.z;
+    let pixel_epsilon_multiplier = uniforms.render_params.w;
     var travel = 0.0;
     var steps = 0u;
     var hit = false;
@@ -37,25 +39,38 @@ fn fs_main(@builtin(position) fragment_position: vec4<f32>) -> @location(0) vec4
         if distance != distance {
             break;
         }
-        let hit_epsilon = epsilon * max(1.0, travel * 0.1);
+        let pixel_angle = uniforms.camera_position_fov.w
+            / min(uniforms.resolution_time_frame.x, uniforms.resolution_time_frame.y);
+        let hit_epsilon = clamp(
+            max(epsilon, travel * pixel_angle * pixel_epsilon_multiplier),
+            epsilon,
+            0.1,
+        );
         if distance < hit_epsilon {
             hit = true;
             break;
         }
-        travel += max(distance, epsilon * 0.25);
+        travel += max(distance * step_safety, epsilon * 0.25);
         if travel > max_distance {
             break;
         }
     }
 
-    let sky = background(ray_direction);
+    let sky = fractal_background(ray_direction);
     if !hit {
         return vec4<f32>(sky, 1.0);
     }
 
     let hit_position = ray_origin + ray_direction * travel;
     let step_ratio = f32(steps) / max(f32(uniforms.limits.y), 1.0);
-    let surface = shade_surface(hit_position, ray_direction, step_ratio);
-    let fog = 1.0 - exp(-0.012 * travel * travel);
-    return vec4<f32>(clamp(mix(surface, sky, fog), vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+    let pixel_angle = uniforms.camera_position_fov.w
+        / min(uniforms.resolution_time_frame.x, uniforms.resolution_time_frame.y);
+    let surface_epsilon = clamp(
+        max(epsilon, travel * pixel_angle * pixel_epsilon_multiplier),
+        epsilon,
+        0.1,
+    );
+    let surface = shade_surface(hit_position, ray_direction, step_ratio, surface_epsilon);
+    let final_color = apply_fractal_atmosphere(surface, sky, travel);
+    return vec4<f32>(clamp(final_color, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }
