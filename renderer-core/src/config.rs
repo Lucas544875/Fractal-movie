@@ -1,15 +1,21 @@
 use anyhow::{Result, bail};
 
+use crate::QfVec3;
+
 /// Hard safety ceilings shared by validation and the bounded WGSL loops.
 pub const MAX_IMAGE_DIMENSION: u32 = 8_192;
 pub const MAX_PIXEL_COUNT: u64 = 33_554_432;
 pub const MAX_RAY_STEPS: u32 = 1_024;
-pub const MAX_FRACTAL_ITERATIONS: u32 = 64;
+pub const MAX_FRACTAL_ITERATIONS: u32 = 96;
+/// Deepest camera-to-target separation validated for the built-in quad-float
+/// Mandelbox path. One decade deeper reaches the representation's guard-bit
+/// boundary on the current GL backend.
+pub const MIN_QUAD_CAMERA_DISTANCE: f64 = 1.0e-26;
 
 #[derive(Clone, Debug)]
 pub struct CameraConfig {
-    pub position: [f32; 3],
-    pub target: [f32; 3],
+    pub position: QfVec3,
+    pub target: QfVec3,
     /// Preferred world-up direction. Mandelbulb uses Y-up; the portfolio
     /// Mandelbox uses the original WebGL scene's Z-up convention.
     pub up: [f32; 3],
@@ -20,6 +26,14 @@ pub struct CameraConfig {
 pub enum FractalKind {
     Mandelbulb,
     Mandelbox,
+}
+
+/// Coordinate precision used by the camera, ray marcher, and fractal DE.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Precision {
+    #[default]
+    F32,
+    QuadFloat,
 }
 
 #[derive(Clone, Debug)]
@@ -128,6 +142,7 @@ pub struct RenderSettings {
 /// Complete in-memory render description.
 #[derive(Clone, Debug)]
 pub struct RenderConfig {
+    pub precision: Precision,
     pub camera: CameraConfig,
     pub fractal: FractalConfig,
     pub light: LightConfig,
@@ -138,9 +153,10 @@ pub struct RenderConfig {
 impl Default for RenderConfig {
     fn default() -> Self {
         Self {
+            precision: Precision::F32,
             camera: CameraConfig {
-                position: [2.5, 1.7, 2.5],
-                target: [0.0, 0.0, 0.0],
+                position: QfVec3::from_f32([2.5, 1.7, 2.5]),
+                target: QfVec3::ZERO,
                 up: [0.0, 1.0, 0.0],
                 vertical_fov_degrees: 38.0,
             },
@@ -215,6 +231,9 @@ impl RenderConfig {
                 }
             }
         }
+        if self.precision == Precision::QuadFloat && self.fractal.kind() != FractalKind::Mandelbox {
+            bail!("quad-float precision is currently supported only for Mandelbox scenes");
+        }
         finite_positive("max_distance", render.max_distance)?;
         finite_positive("epsilon", render.epsilon)?;
         if render.epsilon >= 0.1 {
@@ -235,17 +254,20 @@ impl RenderConfig {
         if !fov.is_finite() || !(1.0..179.0).contains(&fov) {
             bail!("vertical camera FOV must be finite and in 1.0..179.0 degrees");
         }
-        finite_vector("camera position", self.camera.position)?;
-        finite_vector("camera target", self.camera.target)?;
+        finite_coordinate("camera position", self.camera.position)?;
+        finite_coordinate("camera target", self.camera.target)?;
         finite_vector("camera up", self.camera.up)?;
         finite_vector("light direction", self.light.direction)?;
-        if squared_distance(self.camera.position, self.camera.target) < 1.0e-8 {
+        let forward_qf = self.camera.target - self.camera.position;
+        if forward_qf == QfVec3::ZERO {
             bail!("camera position and target must not be equal");
         }
         if squared_length(self.camera.up) < 1.0e-8 {
             bail!("camera up must not be zero");
         }
-        let forward = subtract(self.camera.target, self.camera.position);
+        let forward = forward_qf
+            .normalized_to_f32()
+            .ok_or_else(|| anyhow::anyhow!("camera viewing direction could not be normalized"))?;
         if squared_length(cross(forward, self.camera.up)) < 1.0e-8 {
             bail!("camera up must not be parallel to the viewing direction");
         }
@@ -270,8 +292,11 @@ fn finite_vector(name: &str, value: [f32; 3]) -> Result<()> {
     Ok(())
 }
 
-fn subtract(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+fn finite_coordinate(name: &str, value: QfVec3) -> Result<()> {
+    if !value.is_finite() {
+        bail!("{name} must contain only finite values");
+    }
+    Ok(())
 }
 
 fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
@@ -284,10 +309,6 @@ fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
 
 fn squared_length(value: [f32; 3]) -> f32 {
     value.iter().map(|component| component * component).sum()
-}
-
-fn squared_distance(a: [f32; 3], b: [f32; 3]) -> f32 {
-    squared_length(subtract(a, b))
 }
 
 #[cfg(test)]

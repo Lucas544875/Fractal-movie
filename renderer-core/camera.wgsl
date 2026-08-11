@@ -12,6 +12,12 @@ struct RenderUniforms {
     limits: vec4<u32>,
     light_direction: vec4<f32>,
     camera_up: vec4<f32>,
+    camera_position_qf_x: vec4<f32>,
+    camera_position_qf_y: vec4<f32>,
+    camera_position_qf_z: vec4<f32>,
+    camera_target_qf_x: vec4<f32>,
+    camera_target_qf_y: vec4<f32>,
+    camera_target_qf_z: vec4<f32>,
 }
 
 @group(0) @binding(0)

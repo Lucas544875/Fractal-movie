@@ -1,8 +1,8 @@
-use crate::DistanceEstimator;
+use crate::{DistanceEstimator, HighPrecisionDistanceEstimator, Qf32, QfVec3};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PathTarget {
-    pub point: [f64; 3],
+    pub point: QfVec3,
     pub view_direction: [f64; 3],
 }
 
@@ -62,7 +62,7 @@ impl<'a, D: DistanceEstimator> TargetPicker<'a, D> {
             {
                 best = Some((
                     PathTarget {
-                        point,
+                        point: QfVec3::from_f64(point),
                         view_direction: aim,
                     },
                     distance_from_origin,
@@ -96,7 +96,7 @@ impl<'a, D: DistanceEstimator> TargetPicker<'a, D> {
                 && distance_from_origin <= self.config.bound_radius * 1.4
             {
                 return Some(PathTarget {
-                    point,
+                    point: QfVec3::from_f64(point),
                     view_direction: aim,
                 });
             }
@@ -129,6 +129,41 @@ impl<'a, D: DistanceEstimator> TargetPicker<'a, D> {
     }
 }
 
+impl<D: DistanceEstimator + HighPrecisionDistanceEstimator> TargetPicker<'_, D> {
+    /// Continues sphere tracing from an already located exterior target using
+    /// quad-float coordinates. The direction remains normalized `f64`; its
+    /// product with each quad-float step is accumulated without rounding the
+    /// absolute point back to `f64` or `f32`.
+    #[must_use]
+    pub fn refine(
+        &self,
+        target: PathTarget,
+        hit_epsilon: Qf32,
+        max_steps: u32,
+    ) -> Option<PathTarget> {
+        if hit_epsilon <= Qf32::ZERO || !hit_epsilon.is_finite() {
+            return None;
+        }
+        let direction = QfVec3::from_f64(target.view_direction);
+        // The coarse f64 march stops within its epsilon and can be just inside
+        // the unsigned Mandelbox DE. Step back along the incoming ray before
+        // continuing so refinement always approaches from the exterior.
+        let retreat = Qf32::from_f64((self.config.hit_epsilon * 32.0).max(1.0e-5));
+        let mut point = target.point - direction * retreat;
+        for _ in 0..max_steps {
+            let distance = self.estimator.distance_estimate_qf(point);
+            if !distance.is_finite() || distance < Qf32::ZERO {
+                return None;
+            }
+            if distance < hit_epsilon {
+                return Some(PathTarget { point, ..target });
+            }
+            point = point + direction * (distance * Qf32::from_f32(0.9));
+        }
+        None
+    }
+}
+
 /// Reusable overview-then-exponential-dive timing curve from the portfolio.
 #[derive(Clone, Copy, Debug)]
 pub struct ExponentialDivePath {
@@ -147,6 +182,12 @@ impl ExponentialDivePath {
         let progress =
             ((time_seconds - self.overview_duration) / self.dive_duration).clamp(0.0, 1.0);
         self.overview_distance * (self.minimum_distance / self.overview_distance).powf(progress)
+    }
+
+    /// High-precision coordinate distance for camera/path composition.
+    #[must_use]
+    pub fn distance_qf_at(&self, time_seconds: f64) -> Qf32 {
+        Qf32::from_f64(self.distance_at(time_seconds))
     }
 }
 
@@ -235,7 +276,7 @@ mod tests {
             .pick_origin_gap(12_345, [1.0, 0.0, 0.0])
             .expect("the same seed must remain reachable");
         assert_eq!(first, second);
-        assert!(fractal.distance_estimate(first.point) < 1.0e-6);
+        assert!(fractal.distance_estimate(first.point.to_f64()) < 1.0e-6);
         assert!((length(first.view_direction) - 1.0).abs() < 1.0e-12);
     }
 
@@ -250,5 +291,30 @@ mod tests {
         assert_eq!(path.distance_at(1.0), 10.0);
         assert!((path.distance_at(4.0) - 1.0).abs() < 1.0e-12);
         assert!((path.distance_at(10.0) - 0.1).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn quad_refinement_reaches_below_f64_target_epsilon() {
+        let fractal = MandelboxConfig::default();
+        let picker = TargetPicker::new(
+            &fractal,
+            TargetSearchConfig {
+                bound_radius: fractal.bound_radius,
+                hit_epsilon: 1.0e-8,
+                max_steps: 1_200,
+                attempts: 96,
+                aim_jitter: 0.35,
+            },
+            [2.0, 1.0, 1.0],
+        );
+        let target = PathTarget {
+            point: QfVec3::from_f64([10.0, 0.0, 0.0]),
+            view_direction: [-1.0, 0.0, 0.0],
+        };
+        let epsilon = Qf32::from_f64(1.0e-20);
+        let refined = picker
+            .refine(target, epsilon, 512)
+            .expect("quad target must converge");
+        assert!(fractal.distance_estimate_qf(refined.point) < epsilon);
     }
 }

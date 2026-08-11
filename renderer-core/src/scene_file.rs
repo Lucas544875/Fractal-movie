@@ -1,11 +1,11 @@
-use std::{fs, path::Path};
+use std::{fs, path::Path, str::FromStr};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CameraConfig, FractalConfig, LightConfig, MandelboxConfig, MandelbulbConfig, RenderConfig,
-    RenderSettings,
+    CameraConfig, FractalConfig, LightConfig, MandelboxConfig, MandelbulbConfig, Precision, Qf32,
+    QfVec3, RenderConfig, RenderSettings,
 };
 
 pub const CURRENT_SCENE_VERSION: u32 = 1;
@@ -65,10 +65,20 @@ enum ScenePrecision {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SceneCamera {
-    position: [f32; 3],
-    target: [f32; 3],
+    position: [SceneScalar; 3],
+    target: [SceneScalar; 3],
     up: [f32; 3],
     vertical_fov_degrees: f32,
+}
+
+/// Coordinate scalars accept convenient YAML numbers, exact decimal strings,
+/// or an exact four-limb expansion emitted by `LoadedScene::to_yaml`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+enum SceneScalar {
+    Number(f64),
+    Decimal(String),
+    Expansion([f32; 4]),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -127,11 +137,10 @@ impl TryFrom<SceneDocument> for LoadedScene {
             );
         }
         validate_scene_name(&document.name)?;
-        if matches!(document.precision, ScenePrecision::QuadFloat) {
-            bail!(
-                "scene requests precision 'quad-float', which is reserved for Phase 2.5 and is not implemented yet"
-            );
-        }
+        let precision = match document.precision {
+            ScenePrecision::F32 => Precision::F32,
+            ScenePrecision::QuadFloat => Precision::QuadFloat,
+        };
 
         let fractal = match document.fractal {
             SceneFractal::Mandelbulb(config) => FractalConfig::Mandelbulb(MandelbulbConfig {
@@ -149,9 +158,12 @@ impl TryFrom<SceneDocument> for LoadedScene {
             }),
         };
         let config = RenderConfig {
+            precision,
             camera: CameraConfig {
-                position: document.camera.position,
-                target: document.camera.target,
+                position: parse_coordinate(document.camera.position, precision)
+                    .context("invalid camera position")?,
+                target: parse_coordinate(document.camera.target, precision)
+                    .context("invalid camera target")?,
                 up: document.camera.up,
                 vertical_fov_degrees: document.camera.vertical_fov_degrees,
             },
@@ -201,11 +213,17 @@ impl From<&LoadedScene> for SceneDocument {
         Self {
             version: CURRENT_SCENE_VERSION,
             name: scene.name.clone(),
-            precision: ScenePrecision::F32,
+            precision: match scene.config.precision {
+                Precision::F32 => ScenePrecision::F32,
+                Precision::QuadFloat => ScenePrecision::QuadFloat,
+            },
             seed: scene.config.seed,
             camera: SceneCamera {
-                position: scene.config.camera.position,
-                target: scene.config.camera.target,
+                position: serialize_coordinate(
+                    scene.config.camera.position,
+                    scene.config.precision,
+                ),
+                target: serialize_coordinate(scene.config.camera.target, scene.config.precision),
                 up: scene.config.camera.up,
                 vertical_fov_degrees: scene.config.camera.vertical_fov_degrees,
             },
@@ -224,6 +242,37 @@ impl From<&LoadedScene> for SceneDocument {
             },
         }
     }
+}
+
+fn parse_coordinate(values: [SceneScalar; 3], precision: Precision) -> Result<QfVec3> {
+    let [x, y, z] = values.map(parse_scalar);
+    let coordinate = QfVec3::new(x?, y?, z?);
+    if precision == Precision::F32 {
+        Ok(QfVec3::from_f32(coordinate.to_f32()))
+    } else {
+        Ok(coordinate)
+    }
+}
+
+fn parse_scalar(value: SceneScalar) -> Result<Qf32> {
+    match value {
+        SceneScalar::Number(value) => Ok(Qf32::from_f64(value)),
+        SceneScalar::Decimal(value) => Qf32::from_str(&value)
+            .with_context(|| format!("invalid high-precision decimal '{value}'")),
+        SceneScalar::Expansion(limbs) => {
+            if limbs.iter().any(|limb| !limb.is_finite()) {
+                bail!("quad-float expansion must contain only finite limbs");
+            }
+            Ok(Qf32::from_limbs(limbs))
+        }
+    }
+}
+
+fn serialize_coordinate(value: QfVec3, precision: Precision) -> [SceneScalar; 3] {
+    value.components().map(|component| match precision {
+        Precision::F32 => SceneScalar::Number(f64::from(component.to_f32())),
+        Precision::QuadFloat => SceneScalar::Expansion(component.limbs()),
+    })
 }
 
 fn validate_scene_name(name: &str) -> Result<()> {
@@ -248,6 +297,8 @@ mod tests {
 
     const MANDELBULB: &str = include_str!("../../scenes/examples/mandelbulb.yaml");
     const MANDELBOX: &str = include_str!("../../scenes/examples/mandelbox.yaml");
+    const MANDELBOX_QUAD_DEEP: &str =
+        include_str!("../../scenes/examples/mandelbox-quad-deep.yaml");
 
     #[test]
     fn parses_both_example_scenes() {
@@ -290,10 +341,48 @@ mod tests {
     }
 
     #[test]
-    fn reserves_quad_float_until_phase_2_5() {
+    fn rejects_quad_float_for_unsupported_fractals() {
         let yaml = MANDELBULB.replacen("precision: f32", "precision: quad-float", 1);
-        let error = parse_scene(&yaml).expect_err("quad-float must not silently use f32");
-        assert!(error.to_string().contains("Phase 2.5"));
+        let error = parse_scene(&yaml).expect_err("Mandelbulb has no quad-float shader");
+        assert!(error.to_string().contains("scene configuration is invalid"));
+    }
+
+    #[test]
+    fn parses_exact_quad_float_coordinates_for_mandelbox() {
+        let yaml = MANDELBOX
+            .replacen("precision: f32", "precision: quad-float", 1)
+            .replacen(
+                "position: [11.417633, -1.764267, 5.605854]",
+                "position: [\"11.4176330000000000000000000001\", -1.764267, 5.605854]",
+                1,
+            );
+        let scene = parse_scene(&yaml).expect("quad-float Mandelbox must parse");
+        assert_eq!(scene.config.precision, Precision::QuadFloat);
+        let residual = scene.config.camera.position.x
+            - Qf32::from_str("11.417633").expect("baseline must parse");
+        assert!(residual > Qf32::ZERO);
+    }
+
+    #[test]
+    fn deep_scene_requires_quad_float_to_preserve_its_camera() {
+        let scene = parse_scene(MANDELBOX_QUAD_DEEP).expect("deep scene must parse");
+        assert_ne!(scene.config.camera.position, scene.config.camera.target);
+        assert_eq!(
+            scene.config.camera.position.to_f32(),
+            scene.config.camera.target.to_f32()
+        );
+        let serialized = scene.to_yaml().expect("quad scene must serialize");
+        let reparsed = parse_scene(&serialized).expect("quad scene must round trip");
+        assert_eq!(reparsed.config.precision, Precision::QuadFloat);
+        assert_eq!(
+            reparsed.config.camera.position,
+            scene.config.camera.position
+        );
+        assert_eq!(reparsed.config.camera.target, scene.config.camera.target);
+
+        let f32_yaml = MANDELBOX_QUAD_DEEP.replacen("quad-float", "f32", 1);
+        let error = parse_scene(&f32_yaml).expect_err("f32 must collapse the deep camera");
+        assert!(error.to_string().contains("scene configuration is invalid"));
     }
 
     #[test]

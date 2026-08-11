@@ -11,3 +11,7 @@ bytemuck.workspace = true
 serde.workspace = true
 serde_yaml_ng.workspace = true
 wgpu.workspace = true
+
+[dev-dependencies]
+pollster.workspace = true
+rug = "1.30.0"

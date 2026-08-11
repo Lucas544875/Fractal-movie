@@ -7,6 +7,8 @@ Rust、wgpu、WGSL で3次元フラクタルを描画する、ウィンドウ不
 - wgpu による headless adapter/device 初期化（画面・surface 不要）
 - WGSL による Mandelbulb / Mandelbox、sphere tracing、法線、フラクタル別ライティング
 - CPU Distance Estimator による再利用可能なカメラターゲット探索
+- CPU/WGSL共通の4×`f32` quad-float座標と高精度Mandelbox DE
+- 十進文字列または4 limb展開を保持できる高精度scene camera
 - overview から深部へ進む指数ズーム経路モデル
 - `Rgba8UnormSrgb` オフスクリーン texture から row alignment を考慮した readback
 - PNG 出力を GPU renderer から分離
@@ -14,7 +16,7 @@ Rust、wgpu、WGSL で3次元フラクタルを描画する、ウィンドウ不
 - WGSL validation error を文脈付きエラーとして報告
 - GPU 名、解像度、フレーム時間、合計時間のログ
 
-quad-float高精度座標、animation、resume、FFmpeg 自動実行は Phase 2.5〜4 の対象で、まだ CLI からは利用できません。
+animation、resume、FFmpeg 自動実行は Phase 3〜4 の対象で、まだ CLI からは利用できません。
 
 ## 必要環境
 
@@ -118,30 +120,54 @@ cargo run --release -p fractal-renderer-cli -- \
   --output output/mandelbox-1080p.png
 ```
 
-`--output` を省略した scene file の出力先は `output/<scene名>/<scene名>.png` です。`precision: quad-float` はスキーマ上で予約済みですが、`f32` へ黙ってフォールバックせず、Phase 2.5 が実装されるまでは明示的なエラーになります。
+`--output` を省略した scene file の出力先は `output/<scene名>/<scene名>.png` です。`precision: quad-float` はMandelboxで利用できます。現在Mandelbulbをquad-floatへ変更すると、未対応であることを明示したエラーになります。
 
-## Quad-float 高精度座標（Phase 2.5）
+## Quad-float 高精度座標（Phase 2.5・実装済み）
 
-Phase 3の経路アニメーションより先に、4個の`f32`を非重複な展開として保持するquad-float座標基盤を実装します。汎用IEEE 754任意精度floatではなく、Mandelboxの超高倍率ズームに必要な演算へ対象を限定します。
+4個の`f32`を大きい順の非重複な展開として保持する`Qf32`と`QfVec3`をCPU/WGSLへ実装しています。汎用IEEE 754任意精度floatではなく、Mandelboxの超高倍率ズームに必要な演算へ対象を限定した約90 bitの仮数精度です。演算は[Hida–Li–Baileyのquad-doubleアルゴリズム](https://escholarship.org/uc/item/69q5t2mj)と[Shewchukの浮動小数点展開](https://people.eecs.berkeley.edu/~jrs/papers/robustr.pdf)を基礎にしています。
 
-### 実装範囲
+サンプルの1e-14 camera distanceは、絶対座標を`f32`へ変換するとcameraとtargetが同一値へ丸められますが、quad-float経路では分離したまま描画できます。
 
-1. `precision`モジュールに`Qf32`と`QfVec3`を定義し、正規化、比較、加減算、乗算、除算、内積をCPUとWGSLへ実装する
-2. cameraの基準点、相対オフセット、ray上の位置、Mandelbox反復座標をquad-float化する
-3. 色、時間、ライト、正規化後の法線など、精度へ影響しない値は`f32`のまま維持する
-4. `PathTarget`の`[f64; 3]`固定を高精度座標型へ置き換え、ターゲット探索と`ExponentialDivePath`から`f32`への早期丸めをなくす
-5. 予約済みのscene schemaの`precision`を実行時の座標型へ接続し、高精度用Mandelbox sceneはquad-floatを選択する
-6. CPU側の高精度参照値とWGSL結果を比較する演算テスト、ズーム深度別のDEテスト、golden imageテスト、GPU性能測定を追加する
+```bash
+cargo run --release -p fractal-renderer-cli -- \
+  render scenes/examples/mandelbox-quad-deep.yaml
+```
 
-### 完了条件
+組み込みpresetから任意の単一ズーム画像を生成する場合は、camera distanceを十進文字列として直接指定できます。軸上の解析的な外側境界を基準点とし、shader内ではその境界からの相対座標でrayとDEを評価します。
 
-- cameraからshaderまでの座標経路に意図しない`f64 → f32`変換がない
-- quad-floatの各演算がCPU高精度oracleに対する誤差基準を満たす
-- 複数のズーム深度で表面の連続性、法線、同一seedの再現性を確認できる
-- 実測で保証できる最大ズーム倍率とGPUコストが文書化されている
-- Phase 3はこの条件を満たした高精度camera/path APIだけを利用する
+```bash
+cargo run --release -p fractal-renderer-cli -- render \
+  --fractal mandelbox \
+  --precision quad-float \
+  --camera-distance 1e-14 \
+  --width 640 --height 360
+```
 
-想定する配置は次のとおりです。
+sceneのcamera座標は通常の数値に加え、`"2.2800000000000000000000000001"`のような仮数部最大35桁の十進文字列と、`[high, low1, low2, low3]`形式を受け付けます。十進文字列は`f64`を経由せず`Qf32`へ変換され、`LoadedScene::to_yaml()`は4 limbを損失なく出力します。
+
+### 精度境界
+
+- quad-float対象: camera position/target、境界相対のray位置、Mandelbox反復座標、sphere foldの半径と係数
+- 深部DEは`x = 2 × fold_limit`を原点とする相対座標を使い、`O(1)`の絶対値へ`1e-N`のray offsetを再加算しない
+- DE反復数はcamera distanceから`ceil(log(1/distance) / log(abs(scale))) + 5`で算出し、16〜96回へ制限
+- 組み込みquad-float Mandelboxは128 ray stepで全画素の収束を確認。sceneで指定できる安全上限は1024回
+- `f32`維持: rayの正規化済み方向、travel、色、時間、ライト、法線の最終ベクトル
+- `PathTarget.point`は`QfVec3`になり、一般経路は`TargetPicker::refine()`で高精度化、組み込みpresetは解析的境界を使用
+- CPU演算は160 bit MPFR oracleに対して加算`1e-24`、乗算`1e-23`、除算`1e-22`の相対誤差基準でテスト
+- exponent範囲は`f32`と同じで、任意精度型ではない
+
+### GPU実測
+
+RTX 3070をMesa D3D12/OpenGL経路で使用した320x180、同一overview sceneの単一フレーム結果です。
+
+| precision | frame time | f32比 |
+|---|---:|---:|
+| `f32` | 0.261秒 | 1.00× |
+| `quad-float` | 0.470秒 | 1.80× |
+
+overview画像同士のnormalized RMSEは`2.11e-5`でした。深部は同じ環境の320x180でcamera distance `1e-14`と`1e-26`を描画し、全画素の表面ヒットと空間的な色変化を確認しています。`1e-27`では有効な表面画素を得られなかったため、組み込みpresetの保証下限は安全側の`1e-26`とし、それ未満はエラーにします。この境界はGPU・backend・compilerで変化します。
+
+実装配置は次のとおりです。
 
 ```text
 renderer-core/
@@ -184,10 +210,13 @@ Phase 4 ではこの subprocess 呼び出しと codec options を scene/CLI 設�
 │   ├── shading.wgsl             # normal と lighting
 │   ├── fractal/
 │   │   ├── mandelbulb.wgsl      # Mandelbulb map / material
-│   │   └── mandelbox.wgsl       # Portfolio Mandelbox map / material
+│   │   ├── mandelbox.wgsl       # Portfolio Mandelbox f32 map / material
+│   │   └── mandelbox_quad.wgsl  # quad-float Mandelbox map / material
+│   ├── precision/                # WGSL Qf32 / QfVec3
 │   └── src/
 │       ├── fractal.rs           # CPU DistanceEstimator
 │       ├── path.rs              # target search / dive path
+│       ├── precision/            # CPU Qf32 / QfVec3
 │       ├── scene.rs             # scene presets
 │       ├── scene_file.rs        # versioned YAML schema / validation
 │       └── ...                  # config、wgpu、readback
@@ -200,7 +229,7 @@ Phase 4 ではこの subprocess 呼び出しと codec options を scene/CLI 設�
 ## 後続フェーズ
 
 1. Phase 2（完了）: YAML scene schema、読み込み、validation
-2. Phase 2.5: 4×`f32` quad-float、`QfVec3`、高精度camera/DE/path、精度・性能検証
+2. Phase 2.5（完了）: 4×`f32` quad-float、`QfVec3`、高精度camera/DE/path、精度・性能検証
 3. Phase 3: quad-float対応animation、指数ズーム、連番、resume、`--frame`、`--overwrite`
 4. Phase 4: configurable FFmpeg integration
 5. Phase 5: accumulation、AO、soft shadow、reflection、HDR/tone mapping

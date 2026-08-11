@@ -1,0 +1,39 @@
+version: 1
+name: mandelbox-quad
+precision: quad-float
+seed: 12345
+
+camera:
+  # Strings are parsed directly into four f32 limbs without an f64 round-trip.
+  position:
+    - "11.4176330000000000000000000001"
+    - "-1.7642670000000000000000000001"
+    - "5.6058540000000000000000000001"
+  target:
+    - "2.2129210000000000000000000001"
+    - "1.0990110000000000000000000001"
+    - "0.3072750000000000000000000001"
+  up: [0.0, 0.0, 1.0]
+  vertical_fov_degrees: 30.0
+
+fractal:
+  kind: mandelbox
+  parameters:
+    scale: -2.18
+    min_radius_squared: 0.60
+    fixed_radius_squared: 2.65
+    fold_limit: 1.14
+    iterations: 16
+    bound_radius: 4.2
+
+light:
+  direction: [2.0, 1.0, 1.0]
+
+render:
+  width: 640
+  height: 360
+  max_steps: 280
+  max_distance: 100.0
+  epsilon: 5.0e-8
+  step_safety: 0.93
+  pixel_epsilon_multiplier: 1.5

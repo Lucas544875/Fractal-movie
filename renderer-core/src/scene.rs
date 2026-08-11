@@ -1,11 +1,16 @@
 use crate::{
-    CameraConfig, ExponentialDivePath, FractalConfig, LightConfig, MandelboxConfig, PathTarget,
-    RenderConfig, RenderSettings, TargetPicker, TargetSearchConfig,
+    CameraConfig, ExponentialDivePath, FractalConfig, LightConfig, MIN_QUAD_CAMERA_DISTANCE,
+    MandelboxConfig, PathTarget, Precision, Qf32, QfVec3, RenderConfig, RenderSettings,
+    TargetPicker, TargetSearchConfig,
 };
 
 const MANDELBOX_LIGHT: [f32; 3] = [2.0, 1.0, 1.0];
 const FALLBACK_TARGET: PathTarget = PathTarget {
-    point: [2.212_921, 1.099_011, 0.307_275],
+    point: QfVec3::new(
+        Qf32::from_f32(2.212_921),
+        Qf32::from_f32(1.099_011),
+        Qf32::from_f32(0.307_275),
+    ),
     view_direction: [-0.836_792, 0.260_298, -0.481_689],
 };
 
@@ -35,17 +40,14 @@ impl RenderConfig {
             overview_duration: 4.0,
             dive_duration: 23.0,
         };
-        let distance = dive.distance_at(0.0);
-        let camera_position = [
-            target.point[0] - target.view_direction[0] * distance,
-            target.point[1] - target.view_direction[1] * distance,
-            target.point[2] - target.view_direction[2] * distance,
-        ];
+        let distance = dive.distance_qf_at(0.0);
+        let camera_position = target.point - QfVec3::from_f64(target.view_direction) * distance;
 
         Self {
+            precision: Precision::F32,
             camera: CameraConfig {
-                position: camera_position.map(|value| value as f32),
-                target: target.point.map(|value| value as f32),
+                position: QfVec3::from_f32(camera_position.to_f32()),
+                target: QfVec3::from_f32(target.point.to_f32()),
                 up: [0.0, 0.0, 1.0],
                 vertical_fov_degrees: 30.0,
             },
@@ -65,11 +67,75 @@ impl RenderConfig {
             seed,
         }
     }
+
+    /// Portfolio Mandelbox preset with an analytic boundary target and a
+    /// quad-float camera separation. Intended as the precision-safe input to
+    /// Phase 3 paths.
+    #[must_use]
+    pub fn mandelbox_quad(seed: u32, camera_distance: Qf32) -> Option<Self> {
+        if camera_distance <= Qf32::ZERO
+            || !camera_distance.is_finite()
+            || camera_distance.to_f64() < MIN_QUAD_CAMERA_DISTANCE
+        {
+            return None;
+        }
+        let mut fractal = MandelboxConfig::default();
+        fractal.iterations = quad_iterations_for_distance(camera_distance, fractal.scale);
+        // The positive axial boundary is exactly twice the box-fold limit.
+        // Keeping this analytic point avoids a tiny sphere-tracing overshoot
+        // becoming larger than the entire camera offset at extreme zoom.
+        let target = PathTarget {
+            point: QfVec3::new(
+                Qf32::from_f32(2.0 * fractal.fold_limit),
+                Qf32::ZERO,
+                Qf32::ZERO,
+            ),
+            view_direction: [-1.0, 0.0, 0.0],
+        };
+        let camera_position =
+            target.point - QfVec3::from_f64(target.view_direction) * camera_distance;
+        let distance_f32 = camera_distance.to_f32();
+
+        Some(Self {
+            precision: Precision::QuadFloat,
+            camera: CameraConfig {
+                position: camera_position,
+                target: target.point,
+                up: [0.0, 0.0, 1.0],
+                vertical_fov_degrees: 30.0,
+            },
+            fractal: FractalConfig::Mandelbox(fractal),
+            light: LightConfig {
+                direction: MANDELBOX_LIGHT,
+            },
+            render: RenderSettings {
+                width: 640,
+                height: 360,
+                max_steps: 128,
+                max_distance: distance_f32 * 4.0,
+                epsilon: (distance_f32 * 1.0e-7).max(1.0e-30),
+                step_safety: 0.9,
+                pixel_epsilon_multiplier: 1.5,
+            },
+            seed,
+        })
+    }
+}
+
+fn quad_iterations_for_distance(camera_distance: Qf32, scale: f32) -> u32 {
+    let distance = camera_distance.to_f64();
+    let detail_iterations = if distance >= 1.0 {
+        0
+    } else {
+        ((1.0 / distance).ln() / f64::from(scale.abs()).ln()).ceil() as u32
+    };
+    detail_iterations.saturating_add(5).clamp(16, 96)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::HighPrecisionDistanceEstimator;
 
     #[test]
     fn portfolio_mandelbox_scene_is_valid_and_reproducible() {
@@ -79,5 +145,56 @@ mod tests {
         assert_eq!(first.camera.position, second.camera.position);
         assert_eq!(first.camera.target, second.camera.target);
         assert_eq!(first.fractal.kind(), crate::FractalKind::Mandelbox);
+    }
+
+    #[test]
+    fn quad_scene_retains_camera_separation_below_f32_ulp() {
+        let distance = Qf32::from_f64(1.0e-12);
+        let scene = RenderConfig::mandelbox_quad(12_345, distance)
+            .expect("reference scene must be generated");
+        let repeated =
+            RenderConfig::mandelbox_quad(12_345, distance).expect("scene must be reproducible");
+        scene.validate().expect("quad preset must be valid");
+        assert_eq!(scene.camera.position, repeated.camera.position);
+        assert_eq!(scene.camera.target, repeated.camera.target);
+        assert_ne!(scene.camera.position, scene.camera.target);
+        assert_eq!(
+            scene.camera.position.to_f32(),
+            scene.camera.target.to_f32(),
+            "the test zoom must actually exceed absolute f32 coordinate precision"
+        );
+        let separation = (scene.camera.target - scene.camera.position)
+            .length_squared()
+            .sqrt();
+        assert!((separation - distance).abs() < Qf32::from_f64(1.0e-18));
+    }
+
+    #[test]
+    fn quad_scene_scales_iterations_with_zoom_depth() {
+        let near = RenderConfig::mandelbox_quad(12_345, Qf32::from_f64(1.0e-12)).unwrap();
+        let deep = RenderConfig::mandelbox_quad(12_345, Qf32::from_f64(1.0e-24)).unwrap();
+        assert_eq!(near.fractal.iterations(), 41);
+        assert_eq!(deep.fractal.iterations(), 76);
+        assert_eq!(deep.render.max_steps, 128);
+    }
+
+    #[test]
+    fn quad_scene_uses_exact_boundary_and_enforces_measured_depth() {
+        let distance = Qf32::from_f64(MIN_QUAD_CAMERA_DISTANCE);
+        let scene = RenderConfig::mandelbox_quad(12_345, distance).unwrap();
+        let boundary = Qf32::from_f32(2.0 * MandelboxConfig::default().fold_limit);
+        assert_eq!(scene.camera.target.x, boundary);
+        assert_eq!(scene.camera.position.x - scene.camera.target.x, distance);
+        assert_eq!(scene.fractal.iterations(), 82);
+        let FractalConfig::Mandelbox(fractal) = &scene.fractal else {
+            unreachable!();
+        };
+        let distance_ratio =
+            (fractal.distance_estimate_qf(scene.camera.position) / distance).to_f64();
+        assert!(
+            (0.5..=2.0).contains(&distance_ratio),
+            "deep DE/camera ratio {distance_ratio} is not conservative enough"
+        );
+        assert!(RenderConfig::mandelbox_quad(12_345, Qf32::from_f64(1.0e-27)).is_none());
     }
 }

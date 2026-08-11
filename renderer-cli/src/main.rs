@@ -2,17 +2,23 @@ mod output;
 
 use std::{path::Path, path::PathBuf, process::ExitCode, time::Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use fractal_renderer_core::{
-    FractalConfig, FractalKind, MandelboxConfig, MandelbulbConfig, RenderConfig, Renderer,
-    RendererOptions, adapter_is_software, load_scene,
+    FractalConfig, FractalKind, MIN_QUAD_CAMERA_DISTANCE, MandelboxConfig, MandelbulbConfig,
+    Precision, Qf32, RenderConfig, Renderer, RendererOptions, adapter_is_software, load_scene,
 };
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum FractalName {
     Mandelbulb,
     Mandelbox,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum PrecisionName {
+    F32,
+    QuadFloat,
 }
 
 #[derive(Debug, Parser)]
@@ -41,6 +47,14 @@ enum Command {
         /// Override the scene's fractal using its default parameters.
         #[arg(long, value_enum)]
         fractal: Option<FractalName>,
+
+        /// Override coordinate precision.
+        #[arg(long, value_enum)]
+        precision: Option<PrecisionName>,
+
+        /// Quad-float preset camera distance, parsed as an exact decimal.
+        #[arg(long, value_name = "DECIMAL")]
+        camera_distance: Option<Qf32>,
 
         /// Override the deterministic scene seed.
         #[arg(long)]
@@ -84,6 +98,8 @@ fn run() -> Result<()> {
             scene,
             output,
             fractal,
+            precision,
+            camera_distance,
             seed,
             width,
             height,
@@ -93,6 +109,8 @@ fn run() -> Result<()> {
             scene,
             output,
             fractal,
+            precision,
+            camera_distance,
             seed,
             width,
             height,
@@ -107,6 +125,8 @@ struct RenderRequest {
     scene: Option<PathBuf>,
     output: Option<PathBuf>,
     fractal: Option<FractalName>,
+    precision: Option<PrecisionName>,
+    camera_distance: Option<Qf32>,
     seed: Option<u32>,
     width: Option<u32>,
     height: Option<u32>,
@@ -124,6 +144,8 @@ fn render(request: RenderRequest) -> Result<()> {
     let prepared = prepare_scene(
         request.scene.as_deref(),
         request.fractal,
+        request.precision,
+        request.camera_distance,
         request.seed,
         request.width,
         request.height,
@@ -132,6 +154,7 @@ fn render(request: RenderRequest) -> Result<()> {
     let config = prepared.config;
     let output_path = request.output.unwrap_or(prepared.default_output);
     let fractal_kind = config.fractal.kind();
+    let precision = config.precision;
     let width = config.render.width;
     let height = config.render.height;
 
@@ -158,6 +181,7 @@ fn render(request: RenderRequest) -> Result<()> {
     );
     println!("Scene: {scene_name}");
     println!("Fractal: {}", fractal_label(fractal_kind));
+    println!("Precision: {}", precision_label(precision));
     println!("Resolution: {width}x{height}");
     println!("Frames: 1");
     println!("Rendering frame 1/1");
@@ -182,18 +206,46 @@ fn render(request: RenderRequest) -> Result<()> {
 fn prepare_scene(
     scene_path: Option<&Path>,
     fractal_override: Option<FractalName>,
+    precision_override: Option<PrecisionName>,
+    camera_distance: Option<Qf32>,
     seed_override: Option<u32>,
     width_override: Option<u32>,
     height_override: Option<u32>,
 ) -> Result<PreparedScene> {
     let has_scene_file = scene_path.is_some();
     let (name, mut config) = if let Some(path) = scene_path {
+        if camera_distance.is_some() {
+            bail!(
+                "--camera-distance is available only with the built-in quad-float Mandelbox preset"
+            );
+        }
         let scene = load_scene(path)?;
         (scene.name, scene.config)
     } else {
         let seed = seed_override.unwrap_or(12_345);
         let fractal = fractal_override.unwrap_or(FractalName::Mandelbulb);
-        (fractal.label().to_owned(), fractal.built_in_config(seed))
+        let precision = precision_override.unwrap_or(PrecisionName::F32);
+        match (fractal, precision) {
+            (FractalName::Mandelbox, PrecisionName::QuadFloat) => {
+                let distance = camera_distance.unwrap_or_else(|| Qf32::from_f64(1.0e-12));
+                let config = RenderConfig::mandelbox_quad(seed, distance)
+                    .with_context(|| {
+                        format!(
+                            "built-in quad-float Mandelbox camera distance must be finite and at least {MIN_QUAD_CAMERA_DISTANCE:e}"
+                        )
+                    })?;
+                ("mandelbox-quad".to_owned(), config)
+            }
+            (FractalName::Mandelbulb, PrecisionName::QuadFloat) => {
+                bail!("quad-float precision is currently supported only for Mandelbox scenes");
+            }
+            (_, PrecisionName::F32) => {
+                if camera_distance.is_some() {
+                    bail!("--camera-distance requires --precision quad-float");
+                }
+                (fractal.label().to_owned(), fractal.built_in_config(seed))
+            }
+        }
     };
 
     if has_scene_file {
@@ -202,6 +254,9 @@ fn prepare_scene(
         }
         if let Some(seed) = seed_override {
             config.seed = seed;
+        }
+        if let Some(precision) = precision_override {
+            config.precision = precision.into();
         }
     }
     if let Some(width) = width_override {
@@ -254,10 +309,26 @@ impl FractalName {
     }
 }
 
+impl From<PrecisionName> for Precision {
+    fn from(value: PrecisionName) -> Self {
+        match value {
+            PrecisionName::F32 => Self::F32,
+            PrecisionName::QuadFloat => Self::QuadFloat,
+        }
+    }
+}
+
 const fn fractal_label(kind: FractalKind) -> &'static str {
     match kind {
         FractalKind::Mandelbulb => "mandelbulb",
         FractalKind::Mandelbox => "mandelbox",
+    }
+}
+
+const fn precision_label(precision: Precision) -> &'static str {
+    match precision {
+        Precision::F32 => "f32",
+        Precision::QuadFloat => "quad-float (4xf32)",
     }
 }
 
@@ -312,7 +383,8 @@ mod tests {
 
     #[test]
     fn built_in_defaults_remain_backwards_compatible() {
-        let scene = prepare_scene(None, None, None, None, None).expect("preset must be valid");
+        let scene =
+            prepare_scene(None, None, None, None, None, None, None).expect("preset must be valid");
         assert_eq!(scene.name, "mandelbulb");
         assert_eq!(scene.config.seed, 12_345);
         assert_eq!(scene.config.render.width, 640);
@@ -325,7 +397,7 @@ mod tests {
     #[test]
     fn scene_values_are_preserved_unless_explicitly_overridden() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scenes/examples/mandelbox.yaml");
-        let scene = prepare_scene(Some(&path), None, None, Some(800), None)
+        let scene = prepare_scene(Some(&path), None, None, None, None, Some(800), None)
             .expect("example scene must be valid");
         assert_eq!(scene.name, "mandelbox");
         assert_eq!(scene.config.seed, 12_345);
@@ -344,6 +416,8 @@ mod tests {
         let scene = prepare_scene(
             Some(&path),
             Some(FractalName::Mandelbulb),
+            None,
+            None,
             Some(99),
             None,
             None,
@@ -351,5 +425,41 @@ mod tests {
         .expect("overridden scene must be valid");
         assert_eq!(scene.config.seed, 99);
         assert_eq!(scene.config.fractal.kind(), FractalKind::Mandelbulb);
+    }
+
+    #[test]
+    fn built_in_quad_preset_accepts_exact_camera_distance() {
+        let distance: Qf32 = "1e-12".parse().unwrap();
+        let scene = prepare_scene(
+            None,
+            Some(FractalName::Mandelbox),
+            Some(PrecisionName::QuadFloat),
+            Some(distance),
+            Some(7),
+            Some(80),
+            Some(45),
+        )
+        .expect("quad preset must be generated");
+        assert_eq!(scene.config.precision, Precision::QuadFloat);
+        assert_eq!(scene.config.seed, 7);
+        assert_eq!(scene.config.render.width, 80);
+        assert_ne!(scene.config.camera.position, scene.config.camera.target);
+    }
+
+    #[test]
+    fn built_in_quad_preset_rejects_unverified_camera_depth() {
+        let result = prepare_scene(
+            None,
+            Some(FractalName::Mandelbox),
+            Some(PrecisionName::QuadFloat),
+            Some("1e-27".parse().unwrap()),
+            None,
+            None,
+            None,
+        );
+        let Err(error) = result else {
+            panic!("depth beyond the measured limit must fail");
+        };
+        assert!(error.to_string().contains("at least 1e-26"));
     }
 }

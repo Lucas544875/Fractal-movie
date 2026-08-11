@@ -56,10 +56,18 @@ struct RenderUniforms {
     limits: [u32; 4],
     light_direction: [f32; 4],
     camera_up: [f32; 4],
+    camera_position_qf_x: [f32; 4],
+    camera_position_qf_y: [f32; 4],
+    camera_position_qf_z: [f32; 4],
+    camera_target_qf_x: [f32; 4],
+    camera_target_qf_y: [f32; 4],
+    camera_target_qf_z: [f32; 4],
 }
 
 impl RenderUniforms {
     fn new(config: &RenderConfig, frame_index: u32, time_seconds: f32) -> Self {
+        let camera_position = config.camera.position.to_f32();
+        let camera_target = config.camera.target.to_f32();
         Self {
             resolution_time_frame: [
                 config.render.width as f32,
@@ -68,17 +76,12 @@ impl RenderUniforms {
                 frame_index as f32,
             ],
             camera_position_fov: [
-                config.camera.position[0],
-                config.camera.position[1],
-                config.camera.position[2],
+                camera_position[0],
+                camera_position[1],
+                camera_position[2],
                 config.camera.vertical_fov_degrees.to_radians(),
             ],
-            camera_target: [
-                config.camera.target[0],
-                config.camera.target[1],
-                config.camera.target[2],
-                0.0,
-            ],
+            camera_target: [camera_target[0], camera_target[1], camera_target[2], 0.0],
             fractal_primary: config.fractal.shader_parameters(),
             render_params: [
                 config.render.epsilon,
@@ -104,6 +107,12 @@ impl RenderUniforms {
                 config.camera.up[2],
                 0.0,
             ],
+            camera_position_qf_x: config.camera.position.x.limbs(),
+            camera_position_qf_y: config.camera.position.y.limbs(),
+            camera_position_qf_z: config.camera.position.z.limbs(),
+            camera_target_qf_x: config.camera.target.x.limbs(),
+            camera_target_qf_y: config.camera.target.y.limbs(),
+            camera_target_qf_z: config.camera.target.z.limbs(),
         }
     }
 }
@@ -238,6 +247,7 @@ impl Renderer {
             label: Some("fractal-shader"),
             source: wgpu::ShaderSource::Wgsl(Cow::Owned(shader::fractal_source(
                 config.fractal.kind(),
+                config.precision,
             ))),
         });
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -509,7 +519,10 @@ fn padded_bytes_per_row(width: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
+    use crate::{Precision, Qf32};
 
     #[test]
     fn row_pitch_is_aligned_without_truncating_pixels() {
@@ -541,5 +554,75 @@ mod tests {
 
         assert!(adapter_rank(&discrete) > adapter_rank(&integrated));
         assert!(adapter_rank(&integrated) > adapter_rank(&cpu));
+    }
+
+    #[test]
+    #[ignore = "requires a hardware GPU"]
+    fn quad_float_overview_matches_f32_golden() {
+        let mut ordinary = RenderConfig::mandelbox(12_345);
+        ordinary.render.width = 96;
+        ordinary.render.height = 54;
+        let mut precise = ordinary.clone();
+        precise.precision = Precision::QuadFloat;
+
+        let ordinary_renderer = pollster::block_on(Renderer::new(ordinary)).expect("f32 renderer");
+        let precise_renderer = pollster::block_on(Renderer::new(precise)).expect("quad renderer");
+        let ordinary_image = ordinary_renderer.render_frame(0, 0.0).expect("f32 image");
+        let precise_image = precise_renderer.render_frame(0, 0.0).expect("quad image");
+        let normalized_rmse = normalized_rmse(ordinary_image.pixels(), precise_image.pixels());
+        assert!(
+            normalized_rmse < 1.0e-3,
+            "overview regression RMSE {normalized_rmse} exceeds tolerance"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a hardware GPU"]
+    fn quad_float_reaches_measured_depth_at_regression_resolution() {
+        let mut config =
+            RenderConfig::mandelbox_quad(12_345, Qf32::from_f64(1.0e-26)).expect("limit scene");
+        assert_eq!(
+            config.camera.position.to_f32(),
+            config.camera.target.to_f32()
+        );
+        config.render.width = 320;
+        config.render.height = 180;
+        let renderer = pollster::block_on(Renderer::new(config)).expect("quad renderer");
+        let image = renderer.render_frame(0, 0.0).expect("deep image");
+        let non_black = image
+            .pixels()
+            .chunks_exact(4)
+            .filter(|pixel| pixel[..3].iter().any(|channel| *channel != 0))
+            .count();
+        let unique_colors = unique_rgb_colors(image.pixels());
+        assert!(
+            non_black > 50_000,
+            "deep quad scene rendered only {non_black} surface pixels"
+        );
+        assert!(
+            unique_colors >= 16,
+            "deep quad scene produced only {unique_colors} RGB colors"
+        );
+    }
+
+    fn unique_rgb_colors(pixels: &[u8]) -> usize {
+        pixels
+            .chunks_exact(4)
+            .map(|pixel| [pixel[0], pixel[1], pixel[2]])
+            .collect::<BTreeSet<_>>()
+            .len()
+    }
+
+    fn normalized_rmse(left: &[u8], right: &[u8]) -> f64 {
+        assert_eq!(left.len(), right.len());
+        let squared_error = left
+            .iter()
+            .zip(right)
+            .map(|(left, right)| {
+                let difference = f64::from(*left) - f64::from(*right);
+                difference * difference
+            })
+            .sum::<f64>();
+        (squared_error / left.len() as f64).sqrt() / 255.0
     }
 }
