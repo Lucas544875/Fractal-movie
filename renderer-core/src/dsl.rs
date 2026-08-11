@@ -48,6 +48,12 @@ pub struct DslMaterial {
     pub background_bottom: [f32; 3],
     pub background_top: [f32; 3],
     pub color_frequency: f32,
+    /// Blend weight from world coordinates to camera-relative coordinates.
+    /// The latter keeps palette detail at a stable apparent scale while zooming.
+    pub camera_palette_weight: f32,
+    /// Blend weight from position-based palette coordinates to normal-based
+    /// coordinates. Higher values retain color variation during deep zooms.
+    pub normal_palette_weight: f32,
     pub ambient_strength: f32,
     pub diffuse_strength: f32,
     pub specular_strength: f32,
@@ -65,6 +71,8 @@ impl Default for DslMaterial {
             background_bottom: [0.008, 0.012, 0.025],
             background_top: [0.08, 0.13, 0.22],
             color_frequency: 1.8,
+            camera_palette_weight: 0.0,
+            normal_palette_weight: 0.55,
             ambient_strength: 0.18,
             diffuse_strength: 0.95,
             specular_strength: 0.35,
@@ -287,8 +295,11 @@ impl DslFractalConfig {
         )?;
         writeln!(
             source,
-            "fn shade_fractal(\n    p: vec3<f32>,\n    ray_direction: vec3<f32>,\n    normal: vec3<f32>,\n    step_ratio: f32,\n    light: vec3<f32>,\n    direct_visibility: f32,\n    ambient_visibility: f32,\n) -> vec3<f32> {{\n    let palette = 0.5 + 0.5 * sin(p.z * {});\n    let base = mix({}, {}, palette);\n    let diffuse = max(dot(normal, light), 0.0);\n    let half_vector = safe_normalize(light - ray_direction, light);\n    let specular = pow(max(dot(normal, half_vector), 0.0), {});\n    let rim = pow(1.0 - max(dot(normal, -ray_direction), 0.0), 2.5);\n    let march_occlusion = mix(1.0, 0.76, clamp(step_ratio, 0.0, 1.0));\n    return max(\n        base * ({} * ambient_visibility + {} * diffuse * direct_visibility) * march_occlusion\n            + {} * specular * {} * direct_visibility\n            + base * rim * {} * ambient_visibility,\n        vec3<f32>(0.0),\n    );\n}}\n",
+            "fn shade_fractal(\n    p: vec3<f32>,\n    ray_direction: vec3<f32>,\n    normal: vec3<f32>,\n    step_ratio: f32,\n    light: vec3<f32>,\n    direct_visibility: f32,\n    ambient_visibility: f32,\n) -> vec3<f32> {{\n    let world_palette = 0.5 + 0.5 * sin(p.z * {});\n    let basis = camera_basis();\n    let camera_relative_position = (p - uniforms.camera_target.xyz)\n        / max(uniforms.camera_lens.y, 1.0e-12);\n    let camera_palette_coordinate = dot(\n        camera_relative_position,\n        0.7 * basis.right + basis.up,\n    );\n    let camera_palette = 0.5 + 0.5 * sin(camera_palette_coordinate * {});\n    let position_palette = mix(world_palette, camera_palette, {});\n    let normal_palette = 0.5 + 0.5 * normal.z;\n    let palette = mix(position_palette, normal_palette, {});\n    let base = mix({}, {}, palette);\n    let diffuse = max(dot(normal, light), 0.0);\n    let half_vector = safe_normalize(light - ray_direction, light);\n    let specular = pow(max(dot(normal, half_vector), 0.0), {});\n    let rim = pow(1.0 - max(dot(normal, -ray_direction), 0.0), 2.5);\n    let march_occlusion = mix(1.0, 0.76, clamp(step_ratio, 0.0, 1.0));\n    return max(\n        base * ({} * ambient_visibility + {} * diffuse * direct_visibility) * march_occlusion\n            + {} * specular * {} * direct_visibility\n            + base * rim * {} * ambient_visibility,\n        vec3<f32>(0.0),\n    );\n}}\n",
             wgsl_float(material.color_frequency),
+            wgsl_float(material.color_frequency),
+            wgsl_float(material.camera_palette_weight),
+            wgsl_float(material.normal_palette_weight),
             wgsl_vec3(material.base_color),
             wgsl_vec3(material.accent_color),
             wgsl_float(material.shininess),
@@ -325,6 +336,18 @@ impl DslMaterial {
             self.color_frequency,
             0.0,
             1_000.0,
+        )?;
+        finite_range(
+            "DSL material camera_palette_weight",
+            self.camera_palette_weight,
+            0.0,
+            1.0,
+        )?;
+        finite_range(
+            "DSL material normal_palette_weight",
+            self.normal_palette_weight,
+            0.0,
+            1.0,
         )?;
         finite_range(
             "DSL material ambient_strength",

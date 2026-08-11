@@ -105,6 +105,10 @@ impl AnimationConfig {
             config
                 .tune_mandelbox_quad_zoom(camera_distance)
                 .context("could not tune quad-float Mandelbox for animation frame")?;
+        } else {
+            config
+                .tune_camera_relative_effects(camera_distance.to_f32())
+                .context("could not tune camera-relative effects for animation frame")?;
         }
         config
             .validate()
@@ -166,5 +170,31 @@ mod tests {
         let AnimationPath::ExponentialDive(path) = &mut animation.path;
         path.minimum_distance = Qf32::from_str("1e-27").unwrap();
         assert!(animation.validate(&base).is_err());
+    }
+
+    #[test]
+    fn f32_animation_scales_lens_and_secondary_effect_ranges() {
+        let mut base = RenderConfig::default();
+        base.camera.focus_distance = 1.0;
+        base.camera.aperture_radius = 0.1;
+        base.quality.ambient_occlusion.radius = 0.5;
+        base.quality.soft_shadow.max_distance = 2.0;
+        base.quality.reflection.max_distance = 3.0;
+        let animation = AnimationConfig {
+            fps: 1,
+            frame_count: 2,
+            path: AnimationPath::ExponentialDive(ExponentialDivePath {
+                overview_distance: Qf32::ONE,
+                minimum_distance: Qf32::from_f32(0.1),
+                overview_duration: 0.0,
+                dive_duration: 1.0,
+            }),
+        };
+        let last = animation.sample(&base, 1).unwrap();
+        assert!((last.config.camera.focus_distance - 0.1).abs() < 1.0e-7);
+        assert!((last.config.camera.aperture_radius - 0.01).abs() < 1.0e-7);
+        assert!((last.config.quality.ambient_occlusion.radius - 0.05).abs() < 1.0e-7);
+        assert!((last.config.quality.soft_shadow.max_distance - 0.2).abs() < 1.0e-7);
+        assert!((last.config.quality.reflection.max_distance - 0.3).abs() < 1.0e-7);
     }
 }

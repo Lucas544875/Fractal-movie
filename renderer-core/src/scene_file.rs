@@ -165,6 +165,8 @@ struct SceneDslMaterial {
     background_bottom: [f32; 3],
     background_top: [f32; 3],
     color_frequency: f32,
+    camera_palette_weight: f32,
+    normal_palette_weight: f32,
     ambient_strength: f32,
     diffuse_strength: f32,
     specular_strength: f32,
@@ -529,6 +531,8 @@ impl From<SceneDslMaterial> for DslMaterial {
             background_bottom: material.background_bottom,
             background_top: material.background_top,
             color_frequency: material.color_frequency,
+            camera_palette_weight: material.camera_palette_weight,
+            normal_palette_weight: material.normal_palette_weight,
             ambient_strength: material.ambient_strength,
             diffuse_strength: material.diffuse_strength,
             specular_strength: material.specular_strength,
@@ -548,6 +552,8 @@ impl From<&DslMaterial> for SceneDslMaterial {
             background_bottom: material.background_bottom,
             background_top: material.background_top,
             color_frequency: material.color_frequency,
+            camera_palette_weight: material.camera_palette_weight,
+            normal_palette_weight: material.normal_palette_weight,
             ambient_strength: material.ambient_strength,
             diffuse_strength: material.diffuse_strength,
             specular_strength: material.specular_strength,
@@ -767,6 +773,8 @@ mod tests {
         include_str!("../../scenes/examples/mandelbox-quad-zoom.yaml");
     const TWISTED_MANDELBOX_DSL: &str =
         include_str!("../../scenes/examples/twisted-mandelbox-dsl.yaml");
+    const MANDELBOX_FIRST_DESCENT_YOUTUBE: &str =
+        include_str!("../../scenes/examples/mandelbox-first-descent-youtube.yaml");
 
     #[test]
     fn parses_both_example_scenes() {
@@ -847,6 +855,40 @@ mod tests {
         );
         let error = parse_scene(&injected).expect_err("raw WGSL fields must be rejected");
         assert!(error.to_string().contains("scene schema"));
+    }
+
+    #[test]
+    fn publication_scene_preserves_deep_zoom_effect_scale() {
+        let scene = parse_scene(MANDELBOX_FIRST_DESCENT_YOUTUBE)
+            .expect("YouTube publication scene must parse");
+        let animation = scene.animation.as_ref().expect("animation must be present");
+        let video = scene.video.as_ref().expect("video must be configured");
+
+        assert_eq!(scene.name, "mandelbox-first-descent-youtube");
+        assert_eq!(scene.config.fractal.kind(), FractalKind::Dsl);
+        assert_eq!(
+            (scene.config.render.width, scene.config.render.height),
+            (2560, 1440)
+        );
+        assert_eq!(scene.config.quality.samples_per_pixel, 32);
+        assert_eq!((animation.fps, animation.frame_count), (60, 1_441));
+        assert_eq!(video.crf, 14);
+
+        let final_frame = animation
+            .sample(&scene.config, animation.frame_count - 1)
+            .expect("final publication frame must be representable");
+        let deep_distance = final_frame.camera_distance.to_f32();
+        assert!((deep_distance - 2.0e-5).abs() < 1.0e-11);
+        assert!((final_frame.config.camera.focus_distance - deep_distance).abs() < 1.0e-11);
+        assert!(
+            (final_frame.config.camera.aperture_radius / deep_distance - 0.035 / 11.0).abs()
+                < 1.0e-6
+        );
+        assert!(
+            (final_frame.config.quality.ambient_occlusion.radius / deep_distance - 1.10 / 11.0)
+                .abs()
+                < 1.0e-6
+        );
     }
 
     #[test]

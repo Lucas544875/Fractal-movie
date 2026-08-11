@@ -342,6 +342,9 @@ fractal:
     material:
       base_color: [0.035, 0.16, 0.48]
       accent_color: [1.25, 0.28, 0.035]
+      color_frequency: 8.0
+      camera_palette_weight: 1.0
+      normal_palette_weight: 0.15
       shininess: 56.0
 ```
 
@@ -365,6 +368,32 @@ WGPU_BACKEND=gl cargo run --release -p fractal-renderer-cli -- render \
 ```
 
 Rust側の再利用可能なAST・generatorは`renderer-core/src/dsl.rs`、同じASTを解釈するCPU `DistanceEstimator`は`renderer-core/src/fractal.rs`、YAMLとの変換は`renderer-core/src/scene_file.rs`、shader moduleへの合成は`renderer-core/src/shader.rs`に分離しています。DSL programは既存の`TargetPicker`へそのまま渡せます。新しい安全な命令を追加するときは、AST variant、domain validation、CPU解釈、固定templateによるWGSL生成、scene変換を同時に追加します。
+
+## 最初のYouTube作品用scene
+
+`scenes/examples/mandelbox-first-descent-youtube.yaml`は、投稿前の微調整を始めるための公開品質masterです。16:9の1440p60、24秒、32 sppとし、最初の3秒で全体像を見せた後、解析的な+X境界へ指数的に潜ります。正面対称の構図により、中盤の格子、円環、深部の自己相似模様が画面中央で連続して現れます。
+
+色は暗いsapphireと暖色のcopperを対置しました。深部でworld座標の差が小さくなっても単色化しないよう、DSL materialの`camera_palette_weight`で合焦距離により正規化したcamera相対paletteを合成し、`normal_palette_weight`で法線による変化も加えます。またf32 animationでも、focus distance、aperture、AO、soft shadow、reflectionの距離をcamera distanceに比例させるため、被写界深度と二次効果の見かけの大きさがズーム中に維持されます。
+
+まず始点・中間・後半・終点を低解像度で確認します。`--frame`ではsceneの動画encodeが自動的にskipされます。
+
+```bash
+for frame in 0 720 1200 1440; do
+  WGPU_BACKEND=gl cargo run --release -p fractal-renderer-cli -- render \
+    scenes/examples/mandelbox-first-descent-youtube.yaml \
+    --frame "$frame" --width 640 --height 360 \
+    --output output/mandelbox-first-descent-proof --overwrite
+done
+```
+
+構図を確定したら、次のコマンドでPNG連番とMP4を生成します。PNG連番を編集・再encode用のmasterとして保持し、MP4はYouTubeへ直接uploadできるH.264 / `yuv420p` / CRF 14 / fast-start設定です。
+
+```bash
+WGPU_BACKEND=gl cargo run --release -p fractal-renderer-cli -- render \
+  scenes/examples/mandelbox-first-descent-youtube.yaml
+```
+
+途中から再開する場合は`--resume`、PNGを再利用してMP4だけ作り直す場合は`--resume --video-overwrite`を使います。[YouTubeの解像度とaspect ratioの案内](https://support.google.com/youtube/answer/6375112?co=GENIE.Platform%3DDesktop&hl=ja)にある標準16:9の2560x1440を採用し、[推奨upload encode設定](https://support.google.com/youtube/answer/1722171?hl=ja)に合わせて撮影時と同じ60 fps、MP4、H.264、4:2:0、fast-start構成にしています。YouTube側で再圧縮されるため、sceneのCRFは配信用bitrateではなく入力masterの品質を優先しています。
 
 ## ディレクトリ構成
 

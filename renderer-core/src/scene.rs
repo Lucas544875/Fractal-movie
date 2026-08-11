@@ -151,13 +151,25 @@ impl RenderConfig {
         fractal.iterations = quad_iterations_for_distance(camera_distance, fractal.scale);
         self.render.max_distance = distance_f32 * 4.0;
         self.render.epsilon = (distance_f32 * 1.0e-7).max(1.0e-30);
+        self.tune_camera_relative_effects(distance_f32)?;
+        Ok(())
+    }
+
+    /// Keeps lens and secondary-ray effect sizes proportional to the sampled
+    /// camera distance. This applies to ordinary f32 DSL animation as well as
+    /// the quad-float zoom path.
+    pub fn tune_camera_relative_effects(&mut self, camera_distance: f32) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            camera_distance.is_finite() && camera_distance > 0.0,
+            "camera effect tuning distance must be finite and greater than zero"
+        );
         let old_focus_distance = self.camera.focus_distance;
         let zoom_scale = if old_focus_distance.is_finite() && old_focus_distance > 0.0 {
-            distance_f32 / old_focus_distance
+            camera_distance / old_focus_distance
         } else {
             1.0
         };
-        self.camera.focus_distance = distance_f32;
+        self.camera.focus_distance = camera_distance;
         self.camera.aperture_radius *= zoom_scale;
         self.quality.ambient_occlusion.radius *= zoom_scale;
         self.quality.soft_shadow.max_distance *= zoom_scale;

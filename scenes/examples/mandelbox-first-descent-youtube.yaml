@@ -1,0 +1,104 @@
+version: 1
+name: mandelbox-first-descent-youtube
+precision: f32
+seed: 20260811
+
+# The analytic +X boundary keeps the complete dive on a self-similar axial
+# structure instead of converging on an uninteresting locally planar patch.
+camera:
+  position: [13.28, 0.0, 0.0]
+  target: [2.28, 0.0, 0.0]
+  up: [0.0, 0.0, 1.0]
+  vertical_fov_degrees: 30.0
+  # Subtle cinematic DOF. Animation scales both values with camera distance.
+  aperture_radius: 0.035
+  focus_distance: 11.0
+
+# The classic Mandelbox orbit is expressed through the Phase 6 DSL so its
+# material can be art-directed without accepting arbitrary WGSL.
+fractal:
+  kind: dsl
+  parameters:
+    iterations: 24
+    normal_epsilon: 2.0e-9
+    orbit:
+      - op: box-fold
+        limit: 1.14
+      - op: sphere-fold
+        min_radius_squared: 0.60
+        fixed_radius_squared: 2.65
+      - op: scale-add-point
+        scale: -2.18
+    material:
+      # Sapphire shadows and warm copper ridges remain distinct after YouTube
+      # compression; normal weighting keeps variation at the deepest frames.
+      base_color: [0.008, 0.07, 0.52]
+      accent_color: [1.15, 0.35, 0.015]
+      specular_color: [0.72, 1.05, 1.35]
+      background_bottom: [0.0015, 0.003, 0.010]
+      background_top: [0.022, 0.050, 0.115]
+      color_frequency: 8.0
+      camera_palette_weight: 1.0
+      normal_palette_weight: 0.15
+      ambient_strength: 0.22
+      diffuse_strength: 1.10
+      specular_strength: 0.30
+      shininess: 72.0
+      rim_strength: 0.16
+      fog_density: 0.0006
+
+light:
+  direction: [1.2, 0.7, 1.0]
+
+render:
+  # 1440p60 is the publication master. Override to 640x360 for proof renders.
+  width: 2560
+  height: 1440
+  max_steps: 512
+  max_distance: 60.0
+  epsilon: 2.0e-10
+  step_safety: 0.90
+  pixel_epsilon_multiplier: 1.20
+
+quality:
+  # Distributed effects converge cleanly enough for temporal compression.
+  samples_per_pixel: 32
+  ambient_occlusion:
+    max_steps: 72
+    radius: 1.10
+    strength: 0.58
+  soft_shadow:
+    max_steps: 96
+    angular_radius_degrees: 1.0
+    max_distance: 18.0
+  reflection:
+    max_steps: 72
+    max_distance: 14.0
+    strength: 0.08
+    roughness: 0.04
+  tone_mapping:
+    enabled: true
+    exposure_stops: -0.45
+    white_point: 3.8
+
+# 3 seconds establish the full form, followed by a smooth logarithmic dive.
+# The final f32 distance remains comfortably above absolute-coordinate ULP.
+animation:
+  fps: 60
+  frame_count: 1441
+  path:
+    kind: exponential-dive
+    parameters:
+      overview_distance: "11"
+      minimum_distance: "2e-5"
+      overview_duration: 3.0
+      dive_duration: 21.0
+
+# MP4/H.264/4:2:0/fast-start matches YouTube's SDR upload recommendations.
+# CRF 14 intentionally keeps a high-quality mezzanine before YouTube transcode.
+video:
+  codec: libx264
+  pixel_format: yuv420p
+  crf: 14
+  preset: slow
+  faststart: true
