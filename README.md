@@ -14,7 +14,7 @@ Rust、wgpu、WGSL で3次元フラクタルを描画する、ウィンドウ不
 - WGSL validation error を文脈付きエラーとして報告
 - GPU 名、解像度、フレーム時間、合計時間のログ
 
-外部 scene file、animation、resume、FFmpeg 自動実行は Phase 2〜4 の対象で、まだ CLI からは利用できません。
+外部 scene file、quad-float高精度座標、animation、resume、FFmpeg 自動実行は Phase 2〜4 の対象で、まだ CLI からは利用できません。
 
 ## 必要環境
 
@@ -108,9 +108,43 @@ fractal-render render scene/examples/mandelbulb.yaml
 
 予定する主要フィールドは `fractal.kind/parameters`、`camera.position/target/up/fov`、`render.width/height/max_steps/max_distance/epsilon`、`seed` です。自由な WGSL 全体を scene に埋め込まず、将来も `fn map(p: vec3<f32>) -> f32` の限定された生成境界を使います。
 
+## Quad-float 高精度座標（Phase 2.5）
+
+Phase 3の経路アニメーションより先に、4個の`f32`を非重複な展開として保持するquad-float座標基盤を実装します。汎用IEEE 754任意精度floatではなく、Mandelboxの超高倍率ズームに必要な演算へ対象を限定します。
+
+### 実装範囲
+
+1. `precision`モジュールに`Qf32`と`QfVec3`を定義し、正規化、比較、加減算、乗算、除算、内積をCPUとWGSLへ実装する
+2. cameraの基準点、相対オフセット、ray上の位置、Mandelbox反復座標をquad-float化する
+3. 色、時間、ライト、正規化後の法線など、精度へ影響しない値は`f32`のまま維持する
+4. `PathTarget`の`[f64; 3]`固定を高精度座標型へ置き換え、ターゲット探索と`ExponentialDivePath`から`f32`への早期丸めをなくす
+5. scene schemaにprecision方式をversioned fieldとして追加し、Mandelbox presetはquad-floatを選択する
+6. CPU側の高精度参照値とWGSL結果を比較する演算テスト、ズーム深度別のDEテスト、golden imageテスト、GPU性能測定を追加する
+
+### 完了条件
+
+- cameraからshaderまでの座標経路に意図しない`f64 → f32`変換がない
+- quad-floatの各演算がCPU高精度oracleに対する誤差基準を満たす
+- 複数のズーム深度で表面の連続性、法線、同一seedの再現性を確認できる
+- 実測で保証できる最大ズーム倍率とGPUコストが文書化されている
+- Phase 3はこの条件を満たした高精度camera/path APIだけを利用する
+
+想定する配置は次のとおりです。
+
+```text
+renderer-core/
+├── precision/
+│   ├── quad_float.wgsl
+│   └── quad_float_vec3.wgsl
+└── src/precision/
+    ├── mod.rs
+    ├── quad_float.rs
+    └── coordinate.rs
+```
+
 ## Animation と任意フレーム（Phase 3）
 
-uniform layout にはすでに frame index と time があり、`Renderer::render_frame(frame, time)` へ渡せます。Phase 3 では scene の FPS と frame 数から `time = frame / fps` を求め、連番 PNG、`--frame 120`、既存フレームの skip、明示的な `--overwrite` を CLI に追加します。
+uniform layout にはすでに frame index と time があり、`Renderer::render_frame(frame, time)` へ渡せます。Phase 3 ではPhase 2.5の`QfVec3`対応camera/path APIを前提として、scene の FPS と frame 数から `time = frame / fps` を求め、`ExponentialDivePath`による超高倍率ズーム、連番 PNG、`--frame 120`、既存フレームの skip、明示的な `--overwrite` を CLI に追加します。
 
 ## FFmpeg による動画生成（Phase 4）
 
@@ -152,7 +186,8 @@ Phase 4 ではこの subprocess 呼び出しと codec options を scene/CLI 設�
 ## 後続フェーズ
 
 1. Phase 2: YAML scene schema、読み込み、validation
-2. Phase 3: animation、連番、resume、`--frame`、`--overwrite`
-3. Phase 4: configurable FFmpeg integration
-4. Phase 5: accumulation、AO、soft shadow、reflection、HDR/tone mapping
-5. Phase 6: fractal DSL/AST、限定的な WGSL 生成と validation
+2. Phase 2.5: 4×`f32` quad-float、`QfVec3`、高精度camera/DE/path、精度・性能検証
+3. Phase 3: quad-float対応animation、指数ズーム、連番、resume、`--frame`、`--overwrite`
+4. Phase 4: configurable FFmpeg integration
+5. Phase 5: accumulation、AO、soft shadow、reflection、HDR/tone mapping
+6. Phase 6: fractal DSL/AST、限定的な WGSL 生成と validation
