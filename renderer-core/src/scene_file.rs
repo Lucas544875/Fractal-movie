@@ -4,8 +4,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CameraConfig, FractalConfig, LightConfig, MandelboxConfig, MandelbulbConfig, Precision, Qf32,
-    QfVec3, RenderConfig, RenderSettings,
+    AnimationConfig, AnimationPath, CameraConfig, ExponentialDivePath, FractalConfig, LightConfig,
+    MandelboxConfig, MandelbulbConfig, Precision, Qf32, QfVec3, RenderConfig, RenderSettings,
 };
 
 pub const CURRENT_SCENE_VERSION: u32 = 1;
@@ -15,6 +15,7 @@ pub const CURRENT_SCENE_VERSION: u32 = 1;
 pub struct LoadedScene {
     pub name: String,
     pub config: RenderConfig,
+    pub animation: Option<AnimationConfig>,
 }
 
 impl LoadedScene {
@@ -52,6 +53,8 @@ struct SceneDocument {
     fractal: SceneFractal,
     light: SceneLight,
     render: SceneRender,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    animation: Option<SceneAnimation>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
@@ -125,6 +128,29 @@ struct SceneRender {
     pixel_epsilon_multiplier: f32,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SceneAnimation {
+    fps: u32,
+    frame_count: u32,
+    path: SceneAnimationPath,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", content = "parameters", rename_all = "kebab-case")]
+enum SceneAnimationPath {
+    ExponentialDive(SceneExponentialDive),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SceneExponentialDive {
+    overview_distance: SceneScalar,
+    minimum_distance: SceneScalar,
+    overview_duration: f64,
+    dive_duration: f64,
+}
+
 impl TryFrom<SceneDocument> for LoadedScene {
     type Error = anyhow::Error;
 
@@ -186,9 +212,21 @@ impl TryFrom<SceneDocument> for LoadedScene {
             .validate()
             .context("scene configuration is invalid")?;
 
+        let animation = document
+            .animation
+            .map(AnimationConfig::try_from)
+            .transpose()
+            .context("invalid animation configuration")?;
+        if let Some(animation) = &animation {
+            animation
+                .validate(&config)
+                .context("animation configuration is invalid")?;
+        }
+
         Ok(Self {
             name: document.name,
             config,
+            animation,
         })
     }
 }
@@ -240,6 +278,51 @@ impl From<&LoadedScene> for SceneDocument {
                 step_safety: scene.config.render.step_safety,
                 pixel_epsilon_multiplier: scene.config.render.pixel_epsilon_multiplier,
             },
+            animation: scene.animation.as_ref().map(SceneAnimation::from),
+        }
+    }
+}
+
+impl TryFrom<SceneAnimation> for AnimationConfig {
+    type Error = anyhow::Error;
+
+    fn try_from(animation: SceneAnimation) -> Result<Self> {
+        let path = match animation.path {
+            SceneAnimationPath::ExponentialDive(path) => {
+                AnimationPath::ExponentialDive(ExponentialDivePath {
+                    overview_distance: parse_scalar(path.overview_distance)
+                        .context("invalid overview_distance")?,
+                    minimum_distance: parse_scalar(path.minimum_distance)
+                        .context("invalid minimum_distance")?,
+                    overview_duration: path.overview_duration,
+                    dive_duration: path.dive_duration,
+                })
+            }
+        };
+        Ok(Self {
+            fps: animation.fps,
+            frame_count: animation.frame_count,
+            path,
+        })
+    }
+}
+
+impl From<&AnimationConfig> for SceneAnimation {
+    fn from(animation: &AnimationConfig) -> Self {
+        let path = match &animation.path {
+            AnimationPath::ExponentialDive(path) => {
+                SceneAnimationPath::ExponentialDive(SceneExponentialDive {
+                    overview_distance: SceneScalar::Expansion(path.overview_distance.limbs()),
+                    minimum_distance: SceneScalar::Expansion(path.minimum_distance.limbs()),
+                    overview_duration: path.overview_duration,
+                    dive_duration: path.dive_duration,
+                })
+            }
+        };
+        Self {
+            fps: animation.fps,
+            frame_count: animation.frame_count,
+            path,
         }
     }
 }
@@ -299,6 +382,8 @@ mod tests {
     const MANDELBOX: &str = include_str!("../../scenes/examples/mandelbox.yaml");
     const MANDELBOX_QUAD_DEEP: &str =
         include_str!("../../scenes/examples/mandelbox-quad-deep.yaml");
+    const MANDELBOX_QUAD_ZOOM: &str =
+        include_str!("../../scenes/examples/mandelbox-quad-zoom.yaml");
 
     #[test]
     fn parses_both_example_scenes() {
@@ -383,6 +468,50 @@ mod tests {
         let f32_yaml = MANDELBOX_QUAD_DEEP.replacen("quad-float", "f32", 1);
         let error = parse_scene(&f32_yaml).expect_err("f32 must collapse the deep camera");
         assert!(error.to_string().contains("scene configuration is invalid"));
+    }
+
+    #[test]
+    fn parses_and_round_trips_quad_float_animation() {
+        let scene = parse_scene(MANDELBOX_QUAD_ZOOM).expect("zoom scene must parse");
+        let animation = scene.animation.as_ref().expect("animation must be present");
+        assert_eq!(animation.fps, 60);
+        assert_eq!(animation.frame_count, 1_621);
+        let FractalConfig::Mandelbox(fractal) = &scene.config.fractal else {
+            unreachable!();
+        };
+        assert_eq!(
+            scene.config.camera.target.x,
+            Qf32::from_f32(2.0 * fractal.fold_limit)
+        );
+        let final_frame = animation
+            .sample(&scene.config, animation.frame_count - 1)
+            .expect("final animation frame must be representable");
+        assert_eq!(final_frame.time_seconds, 27.0);
+        assert_eq!(
+            final_frame.camera_distance,
+            Qf32::from_str("1e-26").unwrap()
+        );
+
+        let yaml = scene.to_yaml().expect("animation scene must serialize");
+        let reparsed = parse_scene(&yaml).expect("serialized animation must parse");
+        let reparsed_animation = reparsed
+            .animation
+            .expect("animation must survive round trip");
+        let reparsed_final = reparsed_animation
+            .sample(&reparsed.config, reparsed_animation.frame_count - 1)
+            .unwrap();
+        assert_eq!(reparsed_final.camera_distance, final_frame.camera_distance);
+    }
+
+    #[test]
+    fn rejects_animation_beyond_the_measured_quad_depth() {
+        let yaml = MANDELBOX_QUAD_ZOOM.replacen("1e-26", "1e-27", 1);
+        let error = parse_scene(&yaml).expect_err("unverified depth must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("animation configuration is invalid")
+        );
     }
 
     #[test]

@@ -1,3 +1,5 @@
+use anyhow::{Result, bail};
+
 use crate::{DistanceEstimator, HighPrecisionDistanceEstimator, Qf32, QfVec3};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -167,27 +169,53 @@ impl<D: DistanceEstimator + HighPrecisionDistanceEstimator> TargetPicker<'_, D> 
 /// Reusable overview-then-exponential-dive timing curve from the portfolio.
 #[derive(Clone, Copy, Debug)]
 pub struct ExponentialDivePath {
-    pub overview_distance: f64,
-    pub minimum_distance: f64,
+    pub overview_distance: Qf32,
+    pub minimum_distance: Qf32,
     pub overview_duration: f64,
     pub dive_duration: f64,
 }
 
 impl ExponentialDivePath {
+    pub fn validate(&self) -> Result<()> {
+        if !self.overview_distance.is_finite() || self.overview_distance <= Qf32::ZERO {
+            bail!("overview_distance must be finite and greater than zero");
+        }
+        if !self.minimum_distance.is_finite() || self.minimum_distance <= Qf32::ZERO {
+            bail!("minimum_distance must be finite and greater than zero");
+        }
+        if self.minimum_distance > self.overview_distance {
+            bail!("minimum_distance must not exceed overview_distance");
+        }
+        if !self.overview_duration.is_finite() || self.overview_duration < 0.0 {
+            bail!("overview_duration must be finite and non-negative");
+        }
+        if !self.dive_duration.is_finite() || self.dive_duration <= 0.0 {
+            bail!("dive_duration must be finite and greater than zero");
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn distance_at(&self, time_seconds: f64) -> f64 {
+        self.distance_qf_at(time_seconds).to_f64()
+    }
+
+    /// High-precision coordinate distance for camera/path composition.
+    /// Exact path endpoints retain every quad-float limb; only the smooth
+    /// transcendental interpolation factor is evaluated as `f64`.
+    #[must_use]
+    pub fn distance_qf_at(&self, time_seconds: f64) -> Qf32 {
         if time_seconds <= self.overview_duration {
             return self.overview_distance;
         }
         let progress =
             ((time_seconds - self.overview_duration) / self.dive_duration).clamp(0.0, 1.0);
-        self.overview_distance * (self.minimum_distance / self.overview_distance).powf(progress)
-    }
-
-    /// High-precision coordinate distance for camera/path composition.
-    #[must_use]
-    pub fn distance_qf_at(&self, time_seconds: f64) -> Qf32 {
-        Qf32::from_f64(self.distance_at(time_seconds))
+        if progress >= 1.0 {
+            return self.minimum_distance;
+        }
+        let overview = self.overview_distance.to_f64();
+        let minimum = self.minimum_distance.to_f64();
+        Qf32::from_f64(overview * (minimum / overview).powf(progress))
     }
 }
 
@@ -283,14 +311,15 @@ mod tests {
     #[test]
     fn dive_distance_uses_exponential_interpolation() {
         let path = ExponentialDivePath {
-            overview_distance: 10.0,
-            minimum_distance: 0.1,
+            overview_distance: Qf32::from_f32(10.0),
+            minimum_distance: Qf32::from_f32(0.1),
             overview_duration: 2.0,
             dive_duration: 4.0,
         };
+        path.validate().unwrap();
         assert_eq!(path.distance_at(1.0), 10.0);
-        assert!((path.distance_at(4.0) - 1.0).abs() < 1.0e-12);
-        assert!((path.distance_at(10.0) - 0.1).abs() < 1.0e-12);
+        assert!((path.distance_at(4.0) - 1.0).abs() < 1.0e-7);
+        assert!((path.distance_at(10.0) - 0.1).abs() < 1.0e-7);
     }
 
     #[test]

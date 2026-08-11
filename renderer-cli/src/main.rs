@@ -5,8 +5,9 @@ use std::{path::Path, path::PathBuf, process::ExitCode, time::Instant};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use fractal_renderer_core::{
-    FractalConfig, FractalKind, MIN_QUAD_CAMERA_DISTANCE, MandelboxConfig, MandelbulbConfig,
-    Precision, Qf32, RenderConfig, Renderer, RendererOptions, adapter_is_software, load_scene,
+    AnimationConfig, FractalConfig, FractalKind, MIN_QUAD_CAMERA_DISTANCE, MandelboxConfig,
+    MandelbulbConfig, Precision, Qf32, RenderConfig, Renderer, RendererOptions,
+    adapter_is_software, load_scene,
 };
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -34,15 +35,27 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Render a YAML scene or built-in preset to one PNG file.
+    /// Render a static PNG or a scene-defined PNG sequence.
     Render {
         /// Versioned YAML scene file. Omit to use a built-in preset.
         #[arg(value_name = "SCENE")]
         scene: Option<PathBuf>,
 
-        /// Output PNG path.
+        /// Static PNG path, or output directory for an animated scene.
         #[arg(long)]
         output: Option<PathBuf>,
+
+        /// Render only this zero-based frame from an animated scene.
+        #[arg(long, value_name = "INDEX")]
+        frame: Option<u32>,
+
+        /// Skip valid existing PNG frames and continue an animated sequence.
+        #[arg(long, conflicts_with = "overwrite")]
+        resume: bool,
+
+        /// Replace existing output PNG files.
+        #[arg(long, conflicts_with = "resume")]
+        overwrite: bool,
 
         /// Override the scene's fractal using its default parameters.
         #[arg(long, value_enum)]
@@ -97,6 +110,9 @@ fn run() -> Result<()> {
         Command::Render {
             scene,
             output,
+            frame,
+            resume,
+            overwrite,
             fractal,
             precision,
             camera_distance,
@@ -108,6 +124,9 @@ fn run() -> Result<()> {
         } => render(RenderRequest {
             scene,
             output,
+            frame,
+            resume,
+            overwrite,
             fractal,
             precision,
             camera_distance,
@@ -124,6 +143,9 @@ fn run() -> Result<()> {
 struct RenderRequest {
     scene: Option<PathBuf>,
     output: Option<PathBuf>,
+    frame: Option<u32>,
+    resume: bool,
+    overwrite: bool,
     fractal: Option<FractalName>,
     precision: Option<PrecisionName>,
     camera_distance: Option<Qf32>,
@@ -137,6 +159,7 @@ struct RenderRequest {
 struct PreparedScene {
     name: String,
     config: RenderConfig,
+    animation: Option<AnimationConfig>,
     default_output: PathBuf,
 }
 
@@ -150,22 +173,158 @@ fn render(request: RenderRequest) -> Result<()> {
         request.width,
         request.height,
     )?;
+    let output_path = request
+        .output
+        .clone()
+        .unwrap_or_else(|| prepared.default_output.clone());
+    if prepared.animation.is_some() {
+        render_animation(prepared, &request, &output_path)
+    } else {
+        render_static(prepared, &request, &output_path)
+    }
+}
+
+fn render_static(
+    prepared: PreparedScene,
+    request: &RenderRequest,
+    output_path: &Path,
+) -> Result<()> {
+    if request.frame.is_some() {
+        bail!("--frame requires a scene with an animation section");
+    }
+    if request.resume {
+        bail!("--resume requires a scene with an animation section");
+    }
+    ensure_output_is_available(output_path, request.overwrite)?;
+
     let scene_name = prepared.name;
     let config = prepared.config;
-    let output_path = request.output.unwrap_or(prepared.default_output);
-    let fractal_kind = config.fractal.kind();
-    let precision = config.precision;
-    let width = config.render.width;
-    let height = config.render.height;
+    let renderer = create_renderer(config.clone(), request)?;
+    println!("Scene: {scene_name}");
+    print_renderer_summary(&renderer, &config);
+    println!("Frames: 1");
+    println!("Rendering frame 1/1");
 
-    let renderer = pollster::block_on(Renderer::new_with_options(
+    let total_start = Instant::now();
+    let frame_start = Instant::now();
+    let image = renderer
+        .render_frame(0, 0.0)
+        .with_context(|| format!("failed to render {scene_name} frame 0"))?;
+    let frame_time = frame_start.elapsed();
+    println!("Frame render time: {:.3}s", frame_time.as_secs_f64());
+
+    output::save_png(output_path, &image, request.overwrite)
+        .with_context(|| format!("failed to write {}", output_path.display()))?;
+    let total_time = total_start.elapsed();
+    println!("Saved: {}", output_path.display());
+    println!("Total render time: {:.3}s", total_time.as_secs_f64());
+    println!("Average frame time: {:.3}s", frame_time.as_secs_f64());
+    Ok(())
+}
+
+fn render_animation(
+    prepared: PreparedScene,
+    request: &RenderRequest,
+    output_directory: &Path,
+) -> Result<()> {
+    let animation = prepared
+        .animation
+        .as_ref()
+        .context("animated render was selected without an animation configuration")?;
+    if output_directory.exists() && !output_directory.is_dir() {
+        bail!(
+            "animated output must be a directory, but {} is not",
+            output_directory.display()
+        );
+    }
+
+    let requested_frames = if let Some(frame) = request.frame {
+        if frame >= animation.frame_count {
+            bail!(
+                "--frame {frame} is outside this animation's frame range 0..{}",
+                animation.frame_count
+            );
+        }
+        vec![frame]
+    } else {
+        (0..animation.frame_count).collect()
+    };
+    let (pending_frames, skipped_frames) = plan_animation_outputs(
+        &requested_frames,
+        output_directory,
+        prepared.config.render.width,
+        prepared.config.render.height,
+        request.resume,
+        request.overwrite,
+    )?;
+
+    println!("Scene: {}", prepared.name);
+    println!(
+        "Animation: {} fps, {} frames",
+        animation.fps, animation.frame_count
+    );
+    println!("Output: {}", output_directory.display());
+    if skipped_frames > 0 {
+        println!("Resume: skipped {skipped_frames} valid existing frame(s)");
+    }
+    if pending_frames.is_empty() {
+        println!("Nothing to render; every requested frame is already complete.");
+        return Ok(());
+    }
+
+    let initial_frame = animation.sample(&prepared.config, pending_frames[0])?;
+    let renderer = create_renderer(initial_frame.config.clone(), request)?;
+    print_renderer_summary(&renderer, &initial_frame.config);
+    println!("Frames to render: {}", pending_frames.len());
+
+    let total_start = Instant::now();
+    let mut accumulated_frame_seconds = 0.0;
+    for frame_index in pending_frames.iter().copied() {
+        let sample = animation
+            .sample(&prepared.config, frame_index)
+            .with_context(|| format!("could not sample animation frame {frame_index}"))?;
+        println!(
+            "Rendering frame {}/{} (t={:.6}s, distance={:.6e})",
+            frame_index + 1,
+            animation.frame_count,
+            sample.time_seconds,
+            sample.camera_distance.to_f64()
+        );
+        let frame_start = Instant::now();
+        let image = renderer
+            .render_frame_with_config(&sample.config, sample.index, sample.time_seconds as f32)
+            .with_context(|| format!("failed to render {} frame {frame_index}", prepared.name))?;
+        let frame_seconds = frame_start.elapsed().as_secs_f64();
+        accumulated_frame_seconds += frame_seconds;
+        println!("Frame render time: {frame_seconds:.3}s");
+
+        let frame_path = animation_frame_path(output_directory, frame_index);
+        output::save_png(&frame_path, &image, request.overwrite)
+            .with_context(|| format!("failed to write {}", frame_path.display()))?;
+        println!("Saved: {}", frame_path.display());
+    }
+
+    let total_seconds = total_start.elapsed().as_secs_f64();
+    println!("Total render time: {total_seconds:.3}s");
+    println!(
+        "Average frame time: {:.3}s",
+        accumulated_frame_seconds / pending_frames.len() as f64
+    );
+    Ok(())
+}
+
+fn create_renderer(config: RenderConfig, request: &RenderRequest) -> Result<Renderer> {
+    pollster::block_on(Renderer::new_with_options(
         config,
         RendererOptions {
             allow_software_adapter: request.allow_software,
-            adapter_name: request.adapter,
+            adapter_name: request.adapter.clone(),
         },
     ))
-    .context("could not initialize the offscreen renderer")?;
+    .context("could not initialize the offscreen renderer")
+}
+
+fn print_renderer_summary(renderer: &Renderer, config: &RenderConfig) {
     let adapter = renderer.adapter_info();
     println!(
         "Adapter: {} ({:?}, {:?})",
@@ -179,28 +338,69 @@ fn render(request: RenderRequest) -> Result<()> {
             "software (CPU)"
         }
     );
-    println!("Scene: {scene_name}");
-    println!("Fractal: {}", fractal_label(fractal_kind));
-    println!("Precision: {}", precision_label(precision));
-    println!("Resolution: {width}x{height}");
-    println!("Frames: 1");
-    println!("Rendering frame 1/1");
+    println!("Fractal: {}", fractal_label(config.fractal.kind()));
+    println!("Precision: {}", precision_label(config.precision));
+    println!(
+        "Resolution: {}x{}",
+        config.render.width, config.render.height
+    );
+}
 
-    let total_start = Instant::now();
-    let frame_start = Instant::now();
-    let image = renderer
-        .render_frame(0, 0.0)
-        .with_context(|| format!("failed to render {scene_name} frame 0"))?;
-    let frame_time = frame_start.elapsed();
-    println!("Frame render time: {:.3}s", frame_time.as_secs_f64());
+fn animation_frame_path(directory: &Path, frame_index: u32) -> PathBuf {
+    directory.join(format!("frame_{frame_index:06}.png"))
+}
 
-    output::save_png(&output_path, &image)
-        .with_context(|| format!("failed to write {}", output_path.display()))?;
-    let total_time = total_start.elapsed();
-    println!("Saved: {}", output_path.display());
-    println!("Total render time: {:.3}s", total_time.as_secs_f64());
-    println!("Average frame time: {:.3}s", frame_time.as_secs_f64());
-    Ok(())
+fn ensure_output_is_available(path: &Path, overwrite: bool) -> Result<()> {
+    if !path.exists() || overwrite {
+        return Ok(());
+    }
+    bail!(
+        "output {} already exists; pass --overwrite to replace it",
+        path.display()
+    )
+}
+
+fn plan_animation_outputs(
+    requested_frames: &[u32],
+    directory: &Path,
+    width: u32,
+    height: u32,
+    resume: bool,
+    overwrite: bool,
+) -> Result<(Vec<u32>, usize)> {
+    let mut pending = Vec::with_capacity(requested_frames.len());
+    let mut skipped = 0;
+    for &frame_index in requested_frames {
+        let path = animation_frame_path(directory, frame_index);
+        if !path.exists() || overwrite {
+            pending.push(frame_index);
+            continue;
+        }
+        if !resume {
+            bail!(
+                "output frame {} already exists; pass --resume to skip completed frames or --overwrite to replace them",
+                path.display()
+            );
+        }
+        let dimensions = output::png_dimensions(&path).with_context(|| {
+            format!(
+                "existing frame {} is not a valid resumable PNG; use --overwrite to replace it",
+                path.display()
+            )
+        })?;
+        if dimensions != (width, height) {
+            bail!(
+                "existing frame {} is {}x{}, expected {}x{}; use --overwrite to replace it",
+                path.display(),
+                dimensions.0,
+                dimensions.1,
+                width,
+                height
+            );
+        }
+        skipped += 1;
+    }
+    Ok((pending, skipped))
 }
 
 fn prepare_scene(
@@ -213,14 +413,14 @@ fn prepare_scene(
     height_override: Option<u32>,
 ) -> Result<PreparedScene> {
     let has_scene_file = scene_path.is_some();
-    let (name, mut config) = if let Some(path) = scene_path {
+    let (name, mut config, animation) = if let Some(path) = scene_path {
         if camera_distance.is_some() {
             bail!(
                 "--camera-distance is available only with the built-in quad-float Mandelbox preset"
             );
         }
         let scene = load_scene(path)?;
-        (scene.name, scene.config)
+        (scene.name, scene.config, scene.animation)
     } else {
         let seed = seed_override.unwrap_or(12_345);
         let fractal = fractal_override.unwrap_or(FractalName::Mandelbulb);
@@ -234,7 +434,7 @@ fn prepare_scene(
                             "built-in quad-float Mandelbox camera distance must be finite and at least {MIN_QUAD_CAMERA_DISTANCE:e}"
                         )
                     })?;
-                ("mandelbox-quad".to_owned(), config)
+                ("mandelbox-quad".to_owned(), config, None)
             }
             (FractalName::Mandelbulb, PrecisionName::QuadFloat) => {
                 bail!("quad-float precision is currently supported only for Mandelbox scenes");
@@ -243,7 +443,11 @@ fn prepare_scene(
                 if camera_distance.is_some() {
                     bail!("--camera-distance requires --precision quad-float");
                 }
-                (fractal.label().to_owned(), fractal.built_in_config(seed))
+                (
+                    fractal.label().to_owned(),
+                    fractal.built_in_config(seed),
+                    None,
+                )
             }
         }
     };
@@ -268,8 +472,15 @@ fn prepare_scene(
     config
         .validate()
         .context("render configuration is invalid after applying CLI overrides")?;
+    if let Some(animation) = &animation {
+        animation
+            .validate(&config)
+            .context("animation is invalid after applying CLI overrides")?;
+    }
 
-    let default_output = if has_scene_file {
+    let default_output = if animation.is_some() {
+        PathBuf::from("output").join(&name)
+    } else if has_scene_file {
         PathBuf::from("output")
             .join(&name)
             .join(format!("{name}.png"))
@@ -279,6 +490,7 @@ fn prepare_scene(
     Ok(PreparedScene {
         name,
         config,
+        animation,
         default_output,
     })
 }
@@ -379,6 +591,8 @@ fn gpu_info() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
 
     #[test]
@@ -461,5 +675,80 @@ mod tests {
             panic!("depth beyond the measured limit must fail");
         };
         assert!(error.to_string().contains("at least 1e-26"));
+    }
+
+    #[test]
+    fn animated_scene_uses_a_sequence_directory_and_supports_frame_sampling() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../scenes/examples/mandelbox-quad-zoom.yaml");
+        let scene = prepare_scene(Some(&path), None, None, None, None, Some(80), Some(45))
+            .expect("animation example must be valid");
+        let animation = scene.animation.as_ref().expect("animation must be loaded");
+        assert_eq!(animation.fps, 60);
+        assert_eq!(animation.frame_count, 1_621);
+        assert_eq!(
+            scene.default_output,
+            PathBuf::from("output/mandelbox-quad-zoom")
+        );
+        let final_frame = animation.sample(&scene.config, 1_620).unwrap();
+        assert_eq!(final_frame.config.render.width, 80);
+        assert_eq!(final_frame.config.render.height, 45);
+        assert_ne!(
+            final_frame.config.camera.position,
+            final_frame.config.camera.target
+        );
+    }
+
+    #[test]
+    fn sequence_frame_names_are_ffmpeg_compatible() {
+        assert_eq!(
+            animation_frame_path(Path::new("frames"), 120),
+            PathBuf::from("frames/frame_000120.png")
+        );
+    }
+
+    #[test]
+    fn resume_skips_only_complete_frames_at_the_expected_resolution() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "fractal-renderer-resume-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let existing = animation_frame_path(&directory, 0);
+        image::save_buffer_with_format(
+            &existing,
+            &[0_u8; 4 * 4 * 3],
+            4,
+            3,
+            image::ColorType::Rgba8,
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+
+        let (pending, skipped) =
+            plan_animation_outputs(&[0, 1], &directory, 4, 3, true, false).unwrap();
+        assert_eq!(pending, vec![1]);
+        assert_eq!(skipped, 1);
+        assert!(plan_animation_outputs(&[0], &directory, 8, 3, true, false).is_err());
+        assert!(plan_animation_outputs(&[0], &directory, 4, 3, false, false).is_err());
+
+        let encoded = std::fs::read(&existing).unwrap();
+        std::fs::write(&existing, &encoded[..encoded.len() / 2]).unwrap();
+        assert!(
+            plan_animation_outputs(&[0], &directory, 4, 3, true, false).is_err(),
+            "resume must reject a truncated PNG even if its header is present"
+        );
+        assert_eq!(
+            plan_animation_outputs(&[0], &directory, 4, 3, false, true)
+                .unwrap()
+                .0,
+            vec![0]
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

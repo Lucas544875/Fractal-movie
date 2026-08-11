@@ -10,13 +10,15 @@ Rust、wgpu、WGSL で3次元フラクタルを描画する、ウィンドウ不
 - CPU/WGSL共通の4×`f32` quad-float座標と高精度Mandelbox DE
 - 十進文字列または4 limb展開を保持できる高精度scene camera
 - overview から深部へ進む指数ズーム経路モデル
+- scene定義のFPS/frame countによるquad-float animationとフレーム単位の動的DE調整
+- `frame_%06d.png`連番、検証付きresume、任意フレーム出力、明示的overwrite
 - `Rgba8UnormSrgb` オフスクリーン texture から row alignment を考慮した readback
 - PNG 出力を GPU renderer から分離
 - 解像度、ray steps、fractal iterations、NaN/Inf などの事前 validation
 - WGSL validation error を文脈付きエラーとして報告
 - GPU 名、解像度、フレーム時間、合計時間のログ
 
-animation、resume、FFmpeg 自動実行は Phase 3〜4 の対象で、まだ CLI からは利用できません。
+FFmpeg 自動実行は Phase 4 の対象です。Phase 3 のPNG連番はCLIから利用できます。
 
 ## 必要環境
 
@@ -120,7 +122,7 @@ cargo run --release -p fractal-renderer-cli -- \
   --output output/mandelbox-1080p.png
 ```
 
-`--output` を省略した scene file の出力先は `output/<scene名>/<scene名>.png` です。`precision: quad-float` はMandelboxで利用できます。現在Mandelbulbをquad-floatへ変更すると、未対応であることを明示したエラーになります。
+`--output` を省略した静止画sceneの出力先は `output/<scene名>/<scene名>.png` です。既存ファイルを置換するときは`--overwrite`を明示します。`precision: quad-float` はMandelboxで利用できます。現在Mandelbulbをquad-floatへ変更すると、未対応であることを明示したエラーになります。
 
 ## Quad-float 高精度座標（Phase 2.5・実装済み）
 
@@ -180,13 +182,43 @@ renderer-core/
     └── coordinate.rs
 ```
 
-## Animation と任意フレーム（Phase 3）
+## Animation と任意フレーム（Phase 3・実装済み）
 
-uniform layout にはすでに frame index と time があり、`Renderer::render_frame(frame, time)` へ渡せます。Phase 3 ではPhase 2.5の`QfVec3`対応camera/path APIを前提として、scene の FPS と frame 数から `time = frame / fps` を求め、`ExponentialDivePath`による超高倍率ズーム、連番 PNG、`--frame 120`、既存フレームの skip、明示的な `--overwrite` を CLI に追加します。
+`animation.fps`と`animation.frame_count`から`time = frame / fps`を決定し、`ExponentialDivePath`でoverview保持後に指数ズームします。サンプルは60 fps・1621フレームで、0〜4秒を距離11に保持し、4〜27秒で距離1e-26へ移動します。最初と最後のフレームを含むため、最終indexは1620です。
+
+```bash
+cargo run --release -p fractal-renderer-cli -- render \
+  scenes/examples/mandelbox-quad-zoom.yaml
+```
+
+出力先は既定で`output/mandelbox-quad-zoom/`、ファイル名は`frame_000000.png`〜`frame_001620.png`です。別のディレクトリへ出す場合、animation sceneの`--output`はPNGファイルではなくディレクトリを指定します。
+
+深いフレームだけを確認・再生成できます。
+
+```bash
+cargo run --release -p fractal-renderer-cli -- render \
+  scenes/examples/mandelbox-quad-zoom.yaml \
+  --frame 1620 \
+  --output output/phase3-check
+```
+
+中断した連番は`--resume`で再開します。既存PNGは全体をdecodeし、sceneと同じ解像度で正常な場合だけskipします。破損・解像度不一致は黙って飛ばさずエラーになるため、そのフレームを置換する場合は`--overwrite`を使います。`--resume`と`--overwrite`は同時指定できません。
+
+```bash
+cargo run --release -p fractal-renderer-cli -- render \
+  scenes/examples/mandelbox-quad-zoom.yaml --resume
+
+cargo run --release -p fractal-renderer-cli -- render \
+  scenes/examples/mandelbox-quad-zoom.yaml --frame 1620 --overwrite
+```
+
+各PNGは一時ファイルへのencode完了後にrenameされるため、中断時に未完成のフレームを完成済みとして扱いません。quad-float Mandelboxでは各フレームのcamera distanceに合わせてDE反復数、`max_distance`、`epsilon`を再計算し、GPU pipeline・texture・readback bufferは連番全体で再利用します。経路は`renderer-core/src/path.rs`、timelineとcamera合成は`renderer-core/src/animation.rs`に分離してあり、予定している経路選択アルゴリズムからも再利用できます。
+
+RTX 3070 / GL backendの320x180回帰テストでは、同一rendererで始点・中間・終点を連続描画し、距離1e-26の終点まで有効な色分布を確認しています。実測した単一フレーム時間は0.42〜0.45秒でした。
 
 ## FFmpeg による動画生成（Phase 4）
 
-Phase 3 の連番画像が `frame_%06d.png` として生成された後は、renderer と codec を分離したまま次のように MP4 化します。
+Phase 3 の連番画像が `frame_%06d.png` として生成された後は、renderer と codec を分離したまま次のように MP4 化できます。
 
 ```bash
 ffmpeg \
@@ -216,6 +248,7 @@ Phase 4 ではこの subprocess 呼び出しと codec options を scene/CLI 設�
 │   └── src/
 │       ├── fractal.rs           # CPU DistanceEstimator
 │       ├── path.rs              # target search / dive path
+│       ├── animation.rs         # timeline / quad-float camera合成
 │       ├── precision/            # CPU Qf32 / QfVec3
 │       ├── scene.rs             # scene presets
 │       ├── scene_file.rs        # versioned YAML schema / validation
@@ -230,7 +263,7 @@ Phase 4 ではこの subprocess 呼び出しと codec options を scene/CLI 設�
 
 1. Phase 2（完了）: YAML scene schema、読み込み、validation
 2. Phase 2.5（完了）: 4×`f32` quad-float、`QfVec3`、高精度camera/DE/path、精度・性能検証
-3. Phase 3: quad-float対応animation、指数ズーム、連番、resume、`--frame`、`--overwrite`
+3. Phase 3（完了）: quad-float対応animation、指数ズーム、連番、resume、`--frame`、`--overwrite`
 4. Phase 4: configurable FFmpeg integration
 5. Phase 5: accumulation、AO、soft shadow、reflection、HDR/tone mapping
 6. Phase 6: fractal DSL/AST、限定的な WGSL 生成と validation

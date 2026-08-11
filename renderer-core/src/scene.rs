@@ -35,8 +35,8 @@ impl RenderConfig {
             .pick_origin_gap(seed, [1.0, 0.0, 0.0])
             .unwrap_or(FALLBACK_TARGET);
         let dive = ExponentialDivePath {
-            overview_distance: 11.0,
-            minimum_distance: 5.0e-5,
+            overview_distance: Qf32::from_f32(11.0),
+            minimum_distance: Qf32::from_f32(5.0e-5),
             overview_duration: 4.0,
             dive_duration: 23.0,
         };
@@ -79,8 +79,7 @@ impl RenderConfig {
         {
             return None;
         }
-        let mut fractal = MandelboxConfig::default();
-        fractal.iterations = quad_iterations_for_distance(camera_distance, fractal.scale);
+        let fractal = MandelboxConfig::default();
         // The positive axial boundary is exactly twice the box-fold limit.
         // Keeping this analytic point avoids a tiny sphere-tracing overshoot
         // becoming larger than the entire camera offset at extreme zoom.
@@ -94,9 +93,7 @@ impl RenderConfig {
         };
         let camera_position =
             target.point - QfVec3::from_f64(target.view_direction) * camera_distance;
-        let distance_f32 = camera_distance.to_f32();
-
-        Some(Self {
+        let mut config = Self {
             precision: Precision::QuadFloat,
             camera: CameraConfig {
                 position: camera_position,
@@ -112,13 +109,43 @@ impl RenderConfig {
                 width: 640,
                 height: 360,
                 max_steps: 128,
-                max_distance: distance_f32 * 4.0,
-                epsilon: (distance_f32 * 1.0e-7).max(1.0e-30),
+                max_distance: 1.0,
+                epsilon: 1.0e-7,
                 step_safety: 0.9,
                 pixel_epsilon_multiplier: 1.5,
             },
             seed,
-        })
+        };
+        config.tune_mandelbox_quad_zoom(camera_distance).ok()?;
+        Some(config)
+    }
+
+    /// Retunes the cancellation-sensitive values that vary over a deep zoom.
+    /// Geometry, lighting, resolution, and the ray-step budget remain owned by
+    /// the caller, making this suitable for both presets and animation paths.
+    pub fn tune_mandelbox_quad_zoom(&mut self, camera_distance: Qf32) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.precision == Precision::QuadFloat,
+            "quad zoom tuning requires quad-float precision"
+        );
+        anyhow::ensure!(
+            camera_distance > Qf32::ZERO
+                && camera_distance.is_finite()
+                && camera_distance.to_f64() >= MIN_QUAD_CAMERA_DISTANCE,
+            "quad-float Mandelbox camera distance must be finite and at least {MIN_QUAD_CAMERA_DISTANCE:e}"
+        );
+        let FractalConfig::Mandelbox(fractal) = &mut self.fractal else {
+            anyhow::bail!("quad zoom tuning is currently supported only for Mandelbox");
+        };
+        let distance_f32 = camera_distance.to_f32();
+        anyhow::ensure!(
+            distance_f32.is_finite() && distance_f32 > 0.0 && (distance_f32 * 4.0).is_finite(),
+            "quad-float camera distance is outside the supported f32 exponent range"
+        );
+        fractal.iterations = quad_iterations_for_distance(camera_distance, fractal.scale);
+        self.render.max_distance = distance_f32 * 4.0;
+        self.render.epsilon = (distance_f32 * 1.0e-7).max(1.0e-30);
+        Ok(())
     }
 }
 

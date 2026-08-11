@@ -1,5 +1,6 @@
 //! Headless GPU renderer for distance-estimated 3D fractals.
 
+mod animation;
 mod config;
 mod fractal;
 mod path;
@@ -9,6 +10,9 @@ mod scene;
 mod scene_file;
 mod shader;
 
+pub use animation::{
+    AnimationConfig, AnimationFrame, AnimationPath, MAX_ANIMATION_FPS, MAX_ANIMATION_FRAMES,
+};
 pub use config::{
     CameraConfig, FractalConfig, FractalKind, LightConfig, MIN_QUAD_CAMERA_DISTANCE,
     MandelboxConfig, MandelbulbConfig, Precision, RenderConfig, RenderSettings,

@@ -330,10 +330,46 @@ impl Renderer {
 
     /// Renders one deterministic frame and reads it back from GPU memory.
     pub fn render_frame(&self, frame_index: u32, time_seconds: f32) -> Result<RenderedImage> {
+        self.render_frame_with_config(&self.config, frame_index, time_seconds)
+    }
+
+    /// Renders a frame with updated uniforms while reusing the pipeline,
+    /// texture, and readback allocation created from the initial config.
+    ///
+    /// Animation may change camera, DE parameters, lighting, and march limits;
+    /// shader selection and resolution must remain compatible.
+    pub fn render_frame_with_config(
+        &self,
+        config: &RenderConfig,
+        frame_index: u32,
+        time_seconds: f32,
+    ) -> Result<RenderedImage> {
         if !time_seconds.is_finite() || time_seconds < 0.0 {
             return Err(anyhow!("frame time must be finite and non-negative"));
         }
-        let uniforms = RenderUniforms::new(&self.config, frame_index, time_seconds);
+        config
+            .validate()
+            .context("invalid per-frame render configuration")?;
+        if config.render.width != self.config.render.width
+            || config.render.height != self.config.render.height
+        {
+            return Err(anyhow!(
+                "per-frame resolution {}x{} does not match renderer resolution {}x{}",
+                config.render.width,
+                config.render.height,
+                self.config.render.width,
+                self.config.render.height
+            ));
+        }
+        if config.fractal.kind() != self.config.fractal.kind()
+            || config.precision != self.config.precision
+        {
+            return Err(anyhow!(
+                "per-frame fractal kind and precision must match the renderer pipeline"
+            ));
+        }
+
+        let uniforms = RenderUniforms::new(config, frame_index, time_seconds);
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 
@@ -522,7 +558,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
-    use crate::{Precision, Qf32};
+    use crate::{AnimationConfig, AnimationPath, ExponentialDivePath, Precision, Qf32};
 
     #[test]
     fn row_pitch_is_aligned_without_truncating_pixels() {
@@ -603,6 +639,40 @@ mod tests {
             unique_colors >= 16,
             "deep quad scene produced only {unique_colors} RGB colors"
         );
+    }
+
+    #[test]
+    #[ignore = "requires a hardware GPU"]
+    fn quad_float_animation_reuses_renderer_across_zoom_depths() {
+        let mut base =
+            RenderConfig::mandelbox_quad(12_345, Qf32::from_f32(11.0)).expect("overview scene");
+        base.render.width = 320;
+        base.render.height = 180;
+        let animation = AnimationConfig {
+            fps: 1,
+            frame_count: 3,
+            path: AnimationPath::ExponentialDive(ExponentialDivePath {
+                overview_distance: Qf32::from_f32(11.0),
+                minimum_distance: Qf32::from_f64(1.0e-26),
+                overview_duration: 0.0,
+                dive_duration: 2.0,
+            }),
+        };
+        animation.validate(&base).expect("animation must be valid");
+        let initial = animation.sample(&base, 0).unwrap();
+        let renderer = pollster::block_on(Renderer::new(initial.config)).expect("quad renderer");
+
+        for frame_index in 0..animation.frame_count {
+            let sample = animation.sample(&base, frame_index).unwrap();
+            let image = renderer
+                .render_frame_with_config(&sample.config, frame_index, sample.time_seconds as f32)
+                .expect("animated frame");
+            let unique_colors = unique_rgb_colors(image.pixels());
+            assert!(
+                unique_colors >= 16,
+                "animation frame {frame_index} produced only {unique_colors} RGB colors"
+            );
+        }
     }
 
     fn unique_rgb_colors(pixels: &[u8]) -> usize {
