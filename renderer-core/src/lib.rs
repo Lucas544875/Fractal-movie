@@ -27,8 +27,8 @@ pub use dsl::{
 };
 pub use fractal::{DistanceEstimator, HighPrecisionDistanceEstimator};
 pub use path::{
-    ExponentialDivePath, MultiTargetDivePath, PathTarget, SurfaceFlyoverPath, TargetPicker,
-    TargetSearchConfig,
+    ExponentialDivePath, MultiTargetDivePath, PathTarget, SurfaceFlyoverPath, TargetOrbitPath,
+    TargetPicker, TargetSearchConfig,
 };
 pub use precision::{Qf32, QfParseError, QfVec3};
 pub use renderer::{RenderedImage, Renderer, RendererOptions, adapter_is_software};

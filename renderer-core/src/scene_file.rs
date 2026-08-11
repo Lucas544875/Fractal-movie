@@ -8,7 +8,8 @@ use crate::{
     DslMaterial, DslPaletteStop, ExponentialDivePath, FractalConfig, LightConfig, MandelboxConfig,
     MandelbulbConfig, MultiTargetDivePath, OrbitTransform, PostProcessConfig, Precision, Qf32,
     QfVec3, QualityConfig, ReflectionConfig, RenderConfig, RenderSettings, SoftShadowConfig,
-    SurfaceFlyoverPath, TargetSearchConfig, ToneMappingConfig, ToneMappingOperator, VideoConfig,
+    SurfaceFlyoverPath, TargetOrbitPath, TargetSearchConfig, ToneMappingConfig,
+    ToneMappingOperator, VideoConfig,
 };
 
 pub const CURRENT_SCENE_VERSION: u32 = 1;
@@ -354,6 +355,7 @@ struct SceneAnimation {
 #[serde(tag = "kind", content = "parameters", rename_all = "kebab-case")]
 enum SceneAnimationPath {
     ExponentialDive(SceneExponentialDive),
+    TargetOrbit(SceneTargetOrbit),
     MultiTargetDive(SceneMultiTargetDive),
     SurfaceFlyover(SceneSurfaceFlyover),
 }
@@ -365,6 +367,18 @@ struct SceneExponentialDive {
     minimum_distance: SceneScalar,
     overview_duration: f64,
     dive_duration: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SceneTargetOrbit {
+    radius: SceneScalar,
+    duration: f64,
+    revolutions: f64,
+    axis: [f64; 3],
+    cone_angle_degrees: f64,
+    #[serde(default)]
+    start_angle_degrees: f64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -951,6 +965,14 @@ impl TryFrom<SceneAnimation> for AnimationConfig {
                     dive_duration: path.dive_duration,
                 })
             }
+            SceneAnimationPath::TargetOrbit(path) => AnimationPath::TargetOrbit(TargetOrbitPath {
+                radius: parse_scalar(path.radius).context("invalid radius")?,
+                duration: path.duration,
+                revolutions: path.revolutions,
+                axis: path.axis,
+                cone_angle_degrees: path.cone_angle_degrees,
+                start_angle_degrees: path.start_angle_degrees,
+            }),
             SceneAnimationPath::MultiTargetDive(path) => {
                 AnimationPath::MultiTargetDive(MultiTargetDivePath::new(
                     parse_scalar(path.overview_distance).context("invalid overview_distance")?,
@@ -992,6 +1014,14 @@ impl From<&AnimationConfig> for SceneAnimation {
                     dive_duration: path.dive_duration,
                 })
             }
+            AnimationPath::TargetOrbit(path) => SceneAnimationPath::TargetOrbit(SceneTargetOrbit {
+                radius: SceneScalar::Expansion(path.radius.limbs()),
+                duration: path.duration,
+                revolutions: path.revolutions,
+                axis: path.axis,
+                cone_angle_degrees: path.cone_angle_degrees,
+                start_angle_degrees: path.start_angle_degrees,
+            }),
             AnimationPath::MultiTargetDive(path) => {
                 SceneAnimationPath::MultiTargetDive(SceneMultiTargetDive {
                     overview_distance: SceneScalar::Expansion(path.overview_distance.limbs()),
@@ -1098,6 +1128,8 @@ mod tests {
     use crate::{DistanceEstimator, FractalKind};
 
     const MANDELBULB: &str = include_str!("../../scenes/examples/mandelbulb.yaml");
+    const MANDELBULB_TARGET_ORBIT: &str =
+        include_str!("../../scenes/examples/mandelbulb-target-orbit.yaml");
     const MANDELBOX: &str = include_str!("../../scenes/examples/mandelbox.yaml");
     const MANDELBOX_QUAD_DEEP: &str =
         include_str!("../../scenes/examples/mandelbox-quad-deep.yaml");
@@ -1109,6 +1141,8 @@ mod tests {
         include_str!("../../scenes/examples/mandelbox-first-descent-youtube.yaml");
     const ALCHEMY_PSEUDO_KLEINIAN: &str =
         include_str!("../../scenes/examples/alchemy-pseudo-kleinian.yaml");
+    const ALCHEMY_PSEUDO_KLEINIAN_TARGET_ORBIT: &str =
+        include_str!("../../scenes/examples/alchemy-pseudo-kleinian-target-orbit.yaml");
     const MANDELBOX_MULTI_TARGET_DIVE: &str =
         include_str!("../../scenes/examples/mandelbox-multi-target-dive.yaml");
     const MANDELBOX_SURFACE_FLYOVER: &str =
@@ -1280,6 +1314,65 @@ mod tests {
     }
 
     #[test]
+    fn alchemy_target_orbit_preserves_the_static_scene_look() {
+        let static_scene = parse_scene(ALCHEMY_PSEUDO_KLEINIAN)
+            .expect("static Alchemy scene must parse and validate");
+        let orbit_scene = parse_scene(ALCHEMY_PSEUDO_KLEINIAN_TARGET_ORBIT)
+            .expect("Alchemy target-orbit scene must parse and validate");
+
+        let (FractalConfig::Dsl(static_fractal), FractalConfig::Dsl(orbit_fractal)) =
+            (&static_scene.config.fractal, &orbit_scene.config.fractal)
+        else {
+            panic!("both Alchemy scenes must use the typed DSL");
+        };
+        assert_eq!(orbit_fractal, static_fractal);
+        assert_eq!(
+            orbit_scene.config.light.direction,
+            static_scene.config.light.direction
+        );
+        assert_eq!(
+            orbit_scene.config.camera.target,
+            static_scene.config.camera.target
+        );
+        assert_eq!(
+            orbit_scene.config.camera.vertical_fov_degrees,
+            static_scene.config.camera.vertical_fov_degrees
+        );
+        assert_eq!(
+            orbit_scene.config.quality.samples_per_pixel,
+            static_scene.config.quality.samples_per_pixel
+        );
+        assert_eq!(
+            orbit_scene.config.quality.tone_mapping.operator,
+            ToneMappingOperator::Mandelbulber
+        );
+
+        let animation = orbit_scene
+            .animation
+            .as_ref()
+            .expect("orbit example must be animated");
+        let AnimationPath::TargetOrbit(path) = &animation.path else {
+            panic!("Alchemy animation must use target-orbit");
+        };
+        assert_eq!((animation.fps, animation.frame_count), (30, 721));
+        assert_eq!(path.cone_angle_degrees, 18.0);
+        let first = animation.sample(&orbit_scene.config, 0).unwrap();
+        let last = animation.sample(&orbit_scene.config, 720).unwrap();
+        assert_eq!(first.config.camera.target, orbit_scene.config.camera.target);
+        assert_eq!(first.config.camera.position, last.config.camera.position);
+        for (sampled, original) in first
+            .config
+            .camera
+            .position
+            .to_f32()
+            .into_iter()
+            .zip(static_scene.config.camera.position.to_f32())
+        {
+            assert!((sampled - original).abs() < 1.0e-6);
+        }
+    }
+
+    #[test]
     fn rejects_quad_float_for_unsupported_fractals() {
         let yaml = MANDELBULB.replacen("precision: f32", "precision: quad-float", 1);
         let error = parse_scene(&yaml).expect_err("Mandelbulb has no quad-float shader");
@@ -1428,6 +1521,39 @@ mod tests {
         assert!(normal_motion.abs() < 1.0e-6);
         assert!((start.camera_distance.to_f64() - end.camera_distance.to_f64()).abs() < 1.0e-9);
         assert_ne!(start.config.camera.position, end.config.camera.position);
+    }
+
+    #[test]
+    fn target_orbit_scene_round_trips_and_preserves_its_cone() {
+        let scene = parse_scene(MANDELBULB_TARGET_ORBIT)
+            .expect("target-orbit example must parse and validate");
+        let animation = scene.animation.as_ref().expect("animation must exist");
+        let AnimationPath::TargetOrbit(path) = &animation.path else {
+            panic!("scene must retain the target-orbit path kind");
+        };
+        assert!((path.radius.to_f64() - 4.2).abs() < 1.0e-12);
+        assert_eq!(path.cone_angle_degrees, 35.0);
+
+        let start = animation.sample(&scene.config, 0).unwrap();
+        let quarter = animation.sample(&scene.config, 90).unwrap();
+        let end = animation.sample(&scene.config, 360).unwrap();
+        assert_eq!(start.config.camera.target, quarter.config.camera.target);
+        assert_ne!(start.config.camera.position, quarter.config.camera.position);
+        assert_eq!(start.config.camera.position, end.config.camera.position);
+
+        let yaml = scene.to_yaml().expect("target orbit must serialize");
+        let reparsed = parse_scene(&yaml).expect("serialized target orbit must parse");
+        let reparsed_quarter = reparsed
+            .animation
+            .as_ref()
+            .unwrap()
+            .sample(&reparsed.config, 90)
+            .unwrap();
+        assert_eq!(
+            reparsed_quarter.config.camera.position,
+            quarter.config.camera.position
+        );
+        assert_eq!(reparsed_quarter.config.camera.up, quarter.config.camera.up);
     }
 
     #[test]

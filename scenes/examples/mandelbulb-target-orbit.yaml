@@ -1,0 +1,47 @@
+version: 1
+name: mandelbulb-target-orbit
+precision: f32
+seed: 12345
+
+# The target is also the center of the target-orbit animation. The initial
+# position defines azimuth zero after projection onto the plane normal to axis.
+camera:
+  position: [2.409, 0.0, 3.440]
+  target: [0.0, 0.0, 0.0]
+  up: [0.0, 0.0, 1.0]
+  vertical_fov_degrees: 38.0
+  focus_distance: 4.2
+
+fractal:
+  kind: mandelbulb
+  parameters:
+    power: 8.0
+    iterations: 16
+    bailout: 4.0
+
+light:
+  direction: [-0.45, 0.75, 0.55]
+
+render:
+  width: 640
+  height: 360
+  max_steps: 256
+  max_distance: 100.0
+  epsilon: 0.0001
+  step_safety: 1.0
+  pixel_epsilon_multiplier: 0.0
+
+animation:
+  fps: 30
+  frame_count: 361
+  path:
+    kind: target-orbit
+    parameters:
+      radius: 4.2
+      duration: 12.0
+      revolutions: 1.0
+      axis: [0.0, 0.0, 1.0]
+      # 90 degrees is a great circle. At 35 degrees the camera stays above the
+      # target and its sight lines sweep a cone around the downward axis.
+      cone_angle_degrees: 35.0
+      start_angle_degrees: 0.0

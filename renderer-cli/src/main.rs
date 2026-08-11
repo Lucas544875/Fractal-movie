@@ -443,6 +443,9 @@ fn render_animation(
     );
     match &animation.path {
         AnimationPath::ExponentialDive(_) => println!("Path: exponential-dive"),
+        AnimationPath::TargetOrbit(_) => {
+            println!("Path: target-orbit (fixed-target conical orbit)")
+        }
         AnimationPath::MultiTargetDive(path) => println!(
             "Path: multi-target-dive ({} preplanned targets)",
             path.target_count()

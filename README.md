@@ -220,6 +220,27 @@ cargo run --release -p fractal-renderer-cli -- render \
 
 RTX 3070 / GL backendの320x180回帰テストでは、同一rendererで始点・中間・終点を連続描画し、距離1e-26の終点まで有効な色分布を確認しています。Phase 3時点の1 spp・追加効果offでは、実測した単一フレーム時間は0.42〜0.45秒でした。
 
+## ターゲット周回経路
+
+`target-orbit`はsceneの`camera.target`を常に注視し、一定距離の球面上でその周囲を周回します。`axis`と、軸からtarget→camera方向までの`cone_angle_degrees`で軌道面を指定します。90度なら大円、90度未満ならcameraが軸側に留まる小円となり、camera→targetの視線は`-axis`を中心とする円錐に沿います。たとえば`axis: [0, 0, 1]`と35度の組み合わせでは、cameraはtargetより上に留まって見下ろし続けます。
+
+```yaml
+animation:
+  fps: 30
+  frame_count: 361
+  path:
+    kind: target-orbit
+    parameters:
+      radius: 4.2
+      duration: 12.0
+      revolutions: 1.0
+      axis: [0.0, 0.0, 1.0]
+      cone_angle_degrees: 35.0
+      start_angle_degrees: 0.0
+```
+
+`radius`は正のcamera距離、`duration`は軌道を進み終える秒数です。`axis`は方向だけが使われ、自動的に正規化されます。`revolutions`は周回数で、負値にすると逆回転し、小数なら部分周回になります。`start_angle_degrees`の0度方向は、初期`camera.position - camera.target`を`axis`に垂直な平面へ射影して決まります。このため初期cameraを基準に開始位相を直感的に調整できます。cameraの`up`は軸を画面へ射影した方向へ毎frame更新され、周回中の不要なrollを抑えます。実行可能な例は`scenes/examples/mandelbulb-target-orbit.yaml`です。
+
 ## 自動経路探索
 
 portfolio由来の`pickOriginGapDir()`は以前から、+X付近へ96本のCPUレイを投げ、原点へ最も深く到達した命中点を組み込みMandelboxの初期構図に使用していました。ただし静止画preset専用で、sceneのanimationからは選べませんでした。現在は全候補を評価する`TargetPicker::pick_best()`を追加し、Mandelbulb、Mandelbox、typed DSLのCPU DEから次の2経路を事前計画できます。同じscene seedなら探索結果も同一です。
@@ -497,6 +518,15 @@ WGPU_BACKEND=gl cargo run --release -p fractal-renderer-cli -- render \
   scenes/examples/alchemy-pseudo-kleinian.yaml \
   --width 405 --height 270 \
   --output output/alchemy-pseudo-kleinian-preview.png --overwrite
+```
+
+`scenes/examples/alchemy-pseudo-kleinian-target-orbit.yaml`は、視線中央の装飾表面を`camera.target`に固定した24秒・30 fpsの周回作例です。元のcamera位置と画面上方向から18度の円錐軸を逆算しているため、frame 0は静止画の構図をほぼそのまま再現します。fractal geometry、orbit palette、material、world-space light、FOV、tone mapping、post process、128 spp設定は静止画sceneと同一です。円錐が狭いため視点は元方向から最大36度の範囲に留まり、中央の被写体を見失わずに立体感を見せます。
+
+```bash
+WGPU_BACKEND=gl cargo run --release -p fractal-renderer-cli -- render \
+  scenes/examples/alchemy-pseudo-kleinian-target-orbit.yaml \
+  --frame 180 --width 405 --height 270 \
+  --output output/alchemy-target-orbit-preview --overwrite --no-video
 ```
 
 ## ディレクトリ構成

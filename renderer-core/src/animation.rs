@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::{
     ExponentialDivePath, FractalConfig, MIN_QUAD_CAMERA_DISTANCE, MultiTargetDivePath, Precision,
-    Qf32, QfVec3, RenderConfig, SurfaceFlyoverPath,
+    Qf32, QfVec3, RenderConfig, SurfaceFlyoverPath, TargetOrbitPath,
 };
 
 /// Safety ceilings for scene-driven image sequences.
@@ -20,6 +20,7 @@ pub struct AnimationConfig {
 #[derive(Clone, Debug)]
 pub enum AnimationPath {
     ExponentialDive(ExponentialDivePath),
+    TargetOrbit(TargetOrbitPath),
     MultiTargetDive(MultiTargetDivePath),
     SurfaceFlyover(SurfaceFlyoverPath),
 }
@@ -46,7 +47,7 @@ impl AnimationConfig {
         }
         let light_direction = base.light.direction.map(f64::from);
         match &mut self.path {
-            AnimationPath::ExponentialDive(_) => {}
+            AnimationPath::ExponentialDive(_) | AnimationPath::TargetOrbit(_) => {}
             AnimationPath::MultiTargetDive(path) => {
                 if base.precision != Precision::F32 {
                     bail!("multi-target-dive currently requires f32 precision");
@@ -122,6 +123,9 @@ impl AnimationConfig {
                     }
                 }
             }
+            AnimationPath::TargetOrbit(path) => {
+                path.validate().context("invalid target-orbit path")?;
+            }
             AnimationPath::MultiTargetDive(path) => {
                 if base.precision != Precision::F32 {
                     bail!("multi-target-dive currently requires f32 precision");
@@ -150,9 +154,9 @@ impl AnimationConfig {
         f64::from(frame_index) / f64::from(self.fps)
     }
 
-    /// Composes a camera sample in quad-float coordinates. The base camera
-    /// supplies the target and viewing direction; the path supplies only its
-    /// distance, so future path-selection algorithms can be reused unchanged.
+    /// Composes a camera sample in quad-float coordinates. Each path updates
+    /// only the camera fields it owns and leaves the rest of the base render
+    /// configuration unchanged.
     pub fn sample(&self, base: &RenderConfig, frame_index: u32) -> Result<AnimationFrame> {
         if self.fps == 0 {
             bail!("animation fps must be greater than zero");
@@ -174,6 +178,12 @@ impl AnimationConfig {
                     .context("base camera position and target do not define a view direction")?;
                 config.camera.position = config.camera.target - view_direction * camera_distance;
                 (camera_distance, 0.0)
+            }
+            AnimationPath::TargetOrbit(path) => {
+                let sample = path.sample(base.camera.target, base.camera.position, time_seconds)?;
+                config.camera.position = sample.position;
+                config.camera.up = sample.up;
+                (sample.camera_distance, 0.0)
             }
             AnimationPath::MultiTargetDive(path) => {
                 let sample = path.sample(time_seconds)?;
@@ -270,6 +280,39 @@ mod tests {
         };
         path.minimum_distance = Qf32::from_str("1e-27").unwrap();
         assert!(animation.validate(&base).is_err());
+    }
+
+    #[test]
+    fn target_orbit_keeps_the_target_fixed_and_camera_on_its_cone() {
+        let base = RenderConfig::default();
+        let animation = AnimationConfig {
+            fps: 4,
+            frame_count: 17,
+            path: AnimationPath::TargetOrbit(TargetOrbitPath {
+                radius: Qf32::from_f32(5.0),
+                duration: 4.0,
+                revolutions: -1.0,
+                axis: [0.0, 0.0, 1.0],
+                cone_angle_degrees: 35.0,
+                start_angle_degrees: 20.0,
+            }),
+        };
+        animation.validate(&base).unwrap();
+
+        let expected_height = 35_f64.to_radians().cos();
+        let first = animation.sample(&base, 0).unwrap();
+        let quarter = animation.sample(&base, 4).unwrap();
+        let last = animation.sample(&base, 16).unwrap();
+        for frame in [&first, &quarter, &last] {
+            assert_eq!(frame.config.camera.target, base.camera.target);
+            assert_eq!(frame.camera_distance, Qf32::from_f32(5.0));
+            let offset = (frame.config.camera.position - frame.config.camera.target)
+                .normalized_to_f32()
+                .unwrap();
+            assert!((f64::from(offset[2]) - expected_height).abs() < 1.0e-6);
+        }
+        assert_ne!(first.config.camera.position, quarter.config.camera.position);
+        assert_eq!(first.config.camera.position, last.config.camera.position);
     }
 
     #[test]

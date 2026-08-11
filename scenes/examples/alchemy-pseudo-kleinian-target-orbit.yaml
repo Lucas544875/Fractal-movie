@@ -1,0 +1,144 @@
+version: 1
+name: alchemy-pseudo-kleinian-target-orbit
+precision: f32
+seed: 20260811
+
+# Adapted from alchemy-pseudo-kleinian.yaml. The target remains the ornate
+# surface feature at the center of the original composition. The position is
+# remains identical to the static scene at the start of the orbit.
+camera:
+  position: [1.5525534530, 0.7731444559, 2.3163748925]
+  target: [1.9631059978, 1.3969453485, 2.0551372989]
+  up: [0.1818096677, 0.2756373131, 0.9439117100]
+  vertical_fov_degrees: 14.04
+  aperture_radius: 0.015
+  focus_distance: 0.7787810564
+
+# Geometry, palette, and material are intentionally identical to the static
+# Alchemy reproduction so only the viewpoint changes over the orbit.
+fractal:
+  kind: dsl
+  parameters:
+    iterations: 125
+    orbit_period: 120
+    color_iterations: 500
+    bailout: 100.0
+    normal_epsilon: 2.5e-6
+    orbit:
+      - op: amazing-surf-fold
+        start_iteration: 0
+        stop_iteration: 20
+        limits: [0.985, 0.985]
+        minimum_radius_squared: 0.0
+        scale: 1.0
+        rotation_degrees: [0.0, 90.0, 0.0]
+      - op: mandelbox-julia-fold
+        start_iteration: 20
+        stop_iteration: 120
+        fold_limit: 1.0
+        min_radius_squared: 0.04
+        fixed_radius_squared: 1.0
+        scale: -1.15
+        constant: [1.8079716023, 1.3327508580, 1.9122450043]
+        rotation_degrees: [-1.811288, 1.112361, 7.052841]
+    material:
+      base_color: [0.12, 0.045, 0.012]
+      accent_color: [1.0, 0.75, 0.12]
+      surface_palette:
+        - { position: 0.0,    color: [0.12, 0.055, 0.025] }
+        - { position: 0.1,    color: [0.38, 0.170, 0.060] }
+        - { position: 0.2,    color: [1.00, 0.780, 0.180] }
+        - { position: 0.3,    color: [0.88, 0.420, 0.070] }
+        - { position: 0.4,    color: [0.10, 0.040, 0.020] }
+        - { position: 0.4593, color: [0.34, 0.130, 0.045] }
+        - { position: 0.58,   color: [0.50, 0.340, 0.180] }
+        - { position: 0.60,   color: [0.75, 0.780, 0.820] }
+        - { position: 0.68,   color: [0.98, 0.980, 0.980] }
+        - { position: 0.72,   color: [0.25, 0.075, 0.020] }
+        - { position: 0.8,    color: [1.00, 0.780, 0.320] }
+        - { position: 0.9,    color: [0.64, 0.320, 0.055] }
+        - { position: 1.0,    color: [0.12, 0.055, 0.025] }
+      orbit_palette_weight: 1.0
+      palette_offset: 0.0
+      specular_color: [1.0, 1.0, 1.0]
+      background_bottom: [0.008, 0.012, 0.10]
+      background_top: [0.035, 0.059, 0.09]
+      color_frequency: 18.0
+      camera_palette_weight: 0.0
+      normal_palette_weight: 0.0
+      ambient_strength: 0.28
+      diffuse_strength: 0.8
+      specular_strength: 0.8
+      shininess: 300.0
+      metallic_specular_strength: 3.2
+      metallic_shininess: 30.0
+      rim_strength: 0.0
+      fog_density: 0.065
+
+# Lighting is kept in world space and is identical to the static scene. This
+# lets the highlights respond naturally as the camera circles the object.
+light:
+  direction: [0.027485, -0.580573, 0.813744]
+
+render:
+  width: 1620
+  height: 1080
+  max_steps: 768
+  max_distance: 9.86698
+  epsilon: 2.0e-7
+  step_safety: 0.78
+  pixel_epsilon_multiplier: 0.72
+
+quality:
+  samples_per_pixel: 128
+  ambient_occlusion:
+    max_steps: 96
+    radius: 0.12
+    strength: 0.88
+  soft_shadow:
+    max_steps: 128
+    angular_radius_degrees: 2.2
+    max_distance: 1.8
+  reflection:
+    max_steps: 0
+    max_distance: 1.4
+    strength: 0.0
+    roughness: 0.025
+  tone_mapping:
+    enabled: true
+    operator: mandelbulber
+    exposure_stops: 0.0
+    white_point: 6.0
+    brightness: 1.20
+    contrast: 1.08
+    gamma: 1.4
+    saturation: 0.82
+  post_process:
+    enabled: true
+    exposure_stops: 0.05
+    contrast: 0.96
+    saturation: 0.92
+    gamma: 1.0
+    vignette_strength: 0.08
+
+animation:
+  fps: 30
+  frame_count: 721
+  path:
+    kind: target-orbit
+    parameters:
+      radius: 0.7911548236
+      duration: 24.0
+      revolutions: 1.0
+      # This axis was derived from the original sight line and effective up
+      # vector. Consequently frame 0 retains the source image's orientation.
+      axis: [-0.4373478957, -0.6647018211, 0.6057213115]
+      cone_angle_degrees: 18.0
+      start_angle_degrees: 0.0
+
+video:
+  codec: libx264
+  pixel_format: yuv420p
+  crf: 14
+  preset: slow
+  faststart: true
