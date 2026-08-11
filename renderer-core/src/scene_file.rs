@@ -6,9 +6,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AmbientOcclusionConfig, AnimationConfig, AnimationPath, CameraConfig, DslFractalConfig,
     DslMaterial, DslPaletteStop, ExponentialDivePath, FractalConfig, LightConfig, MandelboxConfig,
-    MandelbulbConfig, OrbitTransform, PostProcessConfig, Precision, Qf32, QfVec3, QualityConfig,
-    ReflectionConfig, RenderConfig, RenderSettings, SoftShadowConfig, ToneMappingConfig,
-    ToneMappingOperator, VideoConfig,
+    MandelbulbConfig, MultiTargetDivePath, OrbitTransform, PostProcessConfig, Precision, Qf32,
+    QfVec3, QualityConfig, ReflectionConfig, RenderConfig, RenderSettings, SoftShadowConfig,
+    SurfaceFlyoverPath, TargetSearchConfig, ToneMappingConfig, ToneMappingOperator, VideoConfig,
 };
 
 pub const CURRENT_SCENE_VERSION: u32 = 1;
@@ -354,6 +354,8 @@ struct SceneAnimation {
 #[serde(tag = "kind", content = "parameters", rename_all = "kebab-case")]
 enum SceneAnimationPath {
     ExponentialDive(SceneExponentialDive),
+    MultiTargetDive(SceneMultiTargetDive),
+    SurfaceFlyover(SceneSurfaceFlyover),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -363,6 +365,53 @@ struct SceneExponentialDive {
     minimum_distance: SceneScalar,
     overview_duration: f64,
     dive_duration: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SceneMultiTargetDive {
+    overview_distance: SceneScalar,
+    minimum_distance: SceneScalar,
+    overview_duration: f64,
+    dive_duration: f64,
+    transition_duration: f64,
+    #[serde(default)]
+    search: SceneTargetSearch,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SceneSurfaceFlyover {
+    camera_height: f64,
+    travel_distance: f64,
+    duration: f64,
+    look_ahead: f64,
+    travel_direction: [f64; 3],
+    normal_epsilon: f64,
+    #[serde(default)]
+    search: SceneTargetSearch,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+struct SceneTargetSearch {
+    bound_radius: f64,
+    hit_epsilon: f64,
+    max_steps: u32,
+    attempts: u32,
+    aim_jitter: f64,
+}
+
+impl Default for SceneTargetSearch {
+    fn default() -> Self {
+        Self {
+            bound_radius: 4.2,
+            hit_epsilon: 1.0e-6,
+            max_steps: 800,
+            attempts: 128,
+            aim_jitter: 0.25,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -463,12 +512,15 @@ impl TryFrom<SceneDocument> for LoadedScene {
             .validate()
             .context("scene configuration is invalid")?;
 
-        let animation = document
+        let mut animation = document
             .animation
             .map(AnimationConfig::try_from)
             .transpose()
             .context("invalid animation configuration")?;
-        if let Some(animation) = &animation {
+        if let Some(animation) = &mut animation {
+            animation
+                .plan(&config)
+                .context("automatic path planning failed")?;
             animation
                 .validate(&config)
                 .context("animation configuration is invalid")?;
@@ -899,6 +951,27 @@ impl TryFrom<SceneAnimation> for AnimationConfig {
                     dive_duration: path.dive_duration,
                 })
             }
+            SceneAnimationPath::MultiTargetDive(path) => {
+                AnimationPath::MultiTargetDive(MultiTargetDivePath::new(
+                    parse_scalar(path.overview_distance).context("invalid overview_distance")?,
+                    parse_scalar(path.minimum_distance).context("invalid minimum_distance")?,
+                    path.overview_duration,
+                    path.dive_duration,
+                    path.transition_duration,
+                    TargetSearchConfig::from(path.search),
+                ))
+            }
+            SceneAnimationPath::SurfaceFlyover(path) => {
+                AnimationPath::SurfaceFlyover(SurfaceFlyoverPath::new(
+                    path.camera_height,
+                    path.travel_distance,
+                    path.duration,
+                    path.look_ahead,
+                    path.travel_direction,
+                    path.normal_epsilon,
+                    TargetSearchConfig::from(path.search),
+                ))
+            }
         };
         Ok(Self {
             fps: animation.fps,
@@ -919,11 +992,56 @@ impl From<&AnimationConfig> for SceneAnimation {
                     dive_duration: path.dive_duration,
                 })
             }
+            AnimationPath::MultiTargetDive(path) => {
+                SceneAnimationPath::MultiTargetDive(SceneMultiTargetDive {
+                    overview_distance: SceneScalar::Expansion(path.overview_distance.limbs()),
+                    minimum_distance: SceneScalar::Expansion(path.minimum_distance.limbs()),
+                    overview_duration: path.overview_duration,
+                    dive_duration: path.dive_duration,
+                    transition_duration: path.transition_duration,
+                    search: SceneTargetSearch::from(path.search),
+                })
+            }
+            AnimationPath::SurfaceFlyover(path) => {
+                SceneAnimationPath::SurfaceFlyover(SceneSurfaceFlyover {
+                    camera_height: path.camera_height,
+                    travel_distance: path.travel_distance,
+                    duration: path.duration,
+                    look_ahead: path.look_ahead,
+                    travel_direction: path.travel_direction,
+                    normal_epsilon: path.normal_epsilon,
+                    search: SceneTargetSearch::from(path.search),
+                })
+            }
         };
         Self {
             fps: animation.fps,
             frame_count: animation.frame_count,
             path,
+        }
+    }
+}
+
+impl From<SceneTargetSearch> for TargetSearchConfig {
+    fn from(search: SceneTargetSearch) -> Self {
+        Self {
+            bound_radius: search.bound_radius,
+            hit_epsilon: search.hit_epsilon,
+            max_steps: search.max_steps,
+            attempts: search.attempts,
+            aim_jitter: search.aim_jitter,
+        }
+    }
+}
+
+impl From<TargetSearchConfig> for SceneTargetSearch {
+    fn from(search: TargetSearchConfig) -> Self {
+        Self {
+            bound_radius: search.bound_radius,
+            hit_epsilon: search.hit_epsilon,
+            max_steps: search.max_steps,
+            attempts: search.attempts,
+            aim_jitter: search.aim_jitter,
         }
     }
 }
@@ -991,6 +1109,10 @@ mod tests {
         include_str!("../../scenes/examples/mandelbox-first-descent-youtube.yaml");
     const ALCHEMY_PSEUDO_KLEINIAN: &str =
         include_str!("../../scenes/examples/alchemy-pseudo-kleinian.yaml");
+    const MANDELBOX_MULTI_TARGET_DIVE: &str =
+        include_str!("../../scenes/examples/mandelbox-multi-target-dive.yaml");
+    const MANDELBOX_SURFACE_FLYOVER: &str =
+        include_str!("../../scenes/examples/mandelbox-surface-flyover.yaml");
 
     #[test]
     fn parses_both_example_scenes() {
@@ -1250,6 +1372,62 @@ mod tests {
             .sample(&reparsed.config, reparsed_animation.frame_count - 1)
             .unwrap();
         assert_eq!(reparsed_final.camera_distance, final_frame.camera_distance);
+    }
+
+    #[test]
+    fn automatic_multi_target_dive_plans_and_switches_targets() {
+        let scene = parse_scene(MANDELBOX_MULTI_TARGET_DIVE)
+            .expect("multi-target animation must plan and validate");
+        let animation = scene.animation.as_ref().expect("animation must exist");
+        let AnimationPath::MultiTargetDive(path) = &animation.path else {
+            panic!("scene must retain the multi-target path kind");
+        };
+        assert_eq!(path.target_count(), 3);
+
+        let first = animation.sample(&scene.config, 0).unwrap();
+        let blackout = animation.sample(&scene.config, 285).unwrap();
+        let second = animation.sample(&scene.config, 300).unwrap();
+        assert_ne!(first.config.camera.target, second.config.camera.target);
+        assert!(blackout.config.quality.post_process.enabled);
+        assert!(blackout.config.quality.post_process.exposure_stops <= -15.9);
+
+        let yaml = scene.to_yaml().expect("automatic path must serialize");
+        let reparsed = parse_scene(&yaml).expect("serialized automatic path must replan");
+        let reparsed_first = reparsed
+            .animation
+            .as_ref()
+            .unwrap()
+            .sample(&reparsed.config, 0)
+            .unwrap();
+        assert_eq!(
+            reparsed_first.config.camera.target,
+            first.config.camera.target
+        );
+    }
+
+    #[test]
+    fn automatic_surface_flyover_keeps_motion_in_the_tangent_plane() {
+        let scene =
+            parse_scene(MANDELBOX_SURFACE_FLYOVER).expect("surface flyover must plan and validate");
+        let animation = scene.animation.as_ref().expect("animation must exist");
+        let AnimationPath::SurfaceFlyover(path) = &animation.path else {
+            panic!("scene must retain the surface-flyover path kind");
+        };
+        let start = animation.sample(&scene.config, 0).unwrap();
+        let end = animation.sample(&scene.config, 540).unwrap();
+        let displacement = end.config.camera.position.to_f64();
+        let origin = start.config.camera.position.to_f64();
+        let displacement = [
+            displacement[0] - origin[0],
+            displacement[1] - origin[1],
+            displacement[2] - origin[2],
+        ];
+        let normal_motion = displacement[0] * path.normal[0]
+            + displacement[1] * path.normal[1]
+            + displacement[2] * path.normal[2];
+        assert!(normal_motion.abs() < 1.0e-6);
+        assert!((start.camera_distance.to_f64() - end.camera_distance.to_f64()).abs() < 1.0e-9);
+        assert_ne!(start.config.camera.position, end.config.camera.position);
     }
 
     #[test]

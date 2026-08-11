@@ -1,0 +1,135 @@
+version: 1
+name: mandelbox-multi-target-dive
+precision: f32
+seed: 774103
+
+# "Midnight Opal" — a sequence of monumental, black-glass Mandelbox spaces.
+# The automatic path replaces position/target on every frame. This fallback
+# camera remains valid and defines the screen-up convention.
+camera:
+  position: [10.4, -5.2, 6.8]
+  target: [1.1, 0.2, 0.4]
+  up: [0.0, 0.0, 1.0]
+  vertical_fov_degrees: 32.0
+  aperture_radius: 0.014
+  focus_distance: 7.2
+
+# A newly tuned Mandelbox variant expressed as typed DSL so geometry and
+# material stay reusable by the CPU target search and generated WGSL.
+fractal:
+  kind: dsl
+  parameters:
+    iterations: 28
+    color_iterations: 72
+    normal_epsilon: 2.0e-6
+    orbit:
+      - op: box-fold
+        limit: 1.06
+      - op: sphere-fold
+        min_radius_squared: 0.42
+        fixed_radius_squared: 2.30
+      - op: scale-add-point
+        scale: -2.36
+    material:
+      base_color: [0.001, 0.003, 0.012]
+      accent_color: [0.02, 0.90, 1.35]
+      surface_palette:
+        - { position: 0.00, color: [0.001, 0.003, 0.012] }
+        - { position: 0.15, color: [0.004, 0.015, 0.050] }
+        - { position: 0.22, color: [0.008, 0.120, 0.180] }
+        - { position: 0.25, color: [0.020, 0.850, 1.500] }
+        - { position: 0.29, color: [0.005, 0.050, 0.080] }
+        - { position: 0.46, color: [0.015, 0.004, 0.035] }
+        - { position: 0.56, color: [0.080, 0.005, 0.060] }
+        - { position: 0.60, color: [1.200, 0.015, 0.500] }
+        - { position: 0.64, color: [0.050, 0.003, 0.040] }
+        - { position: 0.78, color: [0.060, 0.012, 0.003] }
+        - { position: 0.84, color: [1.600, 0.280, 0.010] }
+        - { position: 0.89, color: [0.030, 0.006, 0.002] }
+        - { position: 1.00, color: [0.001, 0.003, 0.012] }
+      orbit_palette_weight: 0.72
+      palette_offset: 0.07
+      color_frequency: 11.5
+      camera_palette_weight: 0.58
+      normal_palette_weight: 0.16
+      # A narrow ice-white reflection sits over a broad palette-tinted lobe,
+      # producing polished opal/black-glass edges without a separate material.
+      specular_color: [0.62, 0.96, 1.42]
+      ambient_strength: 0.08
+      diffuse_strength: 0.78
+      specular_strength: 1.15
+      shininess: 168.0
+      metallic_specular_strength: 1.70
+      metallic_shininess: 24.0
+      rim_strength: 0.30
+      background_bottom: [0.0004, 0.0008, 0.0040]
+      background_top: [0.0200, 0.0025, 0.0420]
+      fog_density: 0.0014
+
+# A high, off-axis key gives the recesses enough darkness while catching both
+# specular lobes on the many fold edges.
+light:
+  direction: [-0.55, -0.82, 1.25]
+
+render:
+  width: 1920
+  height: 1080
+  max_steps: 512
+  max_distance: 80.0
+  epsilon: 2.0e-8
+  step_safety: 0.86
+  pixel_epsilon_multiplier: 1.15
+
+quality:
+  samples_per_pixel: 32
+  ambient_occlusion:
+    max_steps: 72
+    radius: 1.15
+    strength: 0.78
+  soft_shadow:
+    max_steps: 96
+    angular_radius_degrees: 1.8
+    max_distance: 18.0
+  reflection:
+    max_steps: 96
+    max_distance: 16.0
+    strength: 0.16
+    roughness: 0.11
+  tone_mapping:
+    enabled: true
+    exposure_stops: -0.60
+    white_point: 4.5
+  post_process:
+    enabled: true
+    exposure_stops: 0.20
+    contrast: 1.18
+    saturation: 1.22
+    gamma: 0.96
+    vignette_strength: 0.17
+
+# Three complete targets: two hidden cuts and a final uninterrupted dive.
+# The last frame stops immediately before a fourth transition would begin.
+animation:
+  fps: 30
+  frame_count: 870
+  path:
+    kind: multi-target-dive
+    parameters:
+      overview_distance: 7.2
+      minimum_distance: 1.0e-4
+      overview_duration: 2.0
+      dive_duration: 7.0
+      transition_duration: 1.0
+      search:
+        bound_radius: 4.8
+        hit_epsilon: 8.0e-7
+        max_steps: 1000
+        attempts: 192
+        aim_jitter: 0.30
+
+video:
+  codec: libx264
+  pixel_format: yuv420p
+  crf: 14
+  preset: slow
+  faststart: true

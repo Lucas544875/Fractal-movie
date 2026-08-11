@@ -26,7 +26,10 @@ pub use dsl::{
     MAX_DSL_TRANSFORMS, OrbitTransform,
 };
 pub use fractal::{DistanceEstimator, HighPrecisionDistanceEstimator};
-pub use path::{ExponentialDivePath, PathTarget, TargetPicker, TargetSearchConfig};
+pub use path::{
+    ExponentialDivePath, MultiTargetDivePath, PathTarget, SurfaceFlyoverPath, TargetPicker,
+    TargetSearchConfig,
+};
 pub use precision::{Qf32, QfParseError, QfVec3};
 pub use renderer::{RenderedImage, Renderer, RendererOptions, adapter_is_software};
 pub use scene_file::{CURRENT_SCENE_VERSION, LoadedScene, load_scene, parse_scene};

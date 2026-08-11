@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, bail};
 
 use crate::{
-    ExponentialDivePath, FractalConfig, MIN_QUAD_CAMERA_DISTANCE, Precision, Qf32, QfVec3,
-    RenderConfig,
+    ExponentialDivePath, FractalConfig, MIN_QUAD_CAMERA_DISTANCE, MultiTargetDivePath, Precision,
+    Qf32, QfVec3, RenderConfig, SurfaceFlyoverPath,
 };
 
 /// Safety ceilings for scene-driven image sequences.
@@ -20,6 +20,8 @@ pub struct AnimationConfig {
 #[derive(Clone, Debug)]
 pub enum AnimationPath {
     ExponentialDive(ExponentialDivePath),
+    MultiTargetDive(MultiTargetDivePath),
+    SurfaceFlyover(SurfaceFlyoverPath),
 }
 
 /// A complete per-frame sample, ready to pass to [`crate::Renderer`].
@@ -32,6 +34,70 @@ pub struct AnimationFrame {
 }
 
 impl AnimationConfig {
+    /// Resolves automatic path searches once from the CPU distance estimator.
+    /// Calling this again deliberately replans from the effective scene seed,
+    /// which keeps CLI seed overrides deterministic.
+    pub fn plan(&mut self, base: &RenderConfig) -> Result<()> {
+        if self.fps == 0 || self.fps > MAX_ANIMATION_FPS {
+            bail!("animation fps must be in 1..={MAX_ANIMATION_FPS}");
+        }
+        if self.frame_count == 0 || self.frame_count > MAX_ANIMATION_FRAMES {
+            bail!("animation frame_count must be in 1..={MAX_ANIMATION_FRAMES}");
+        }
+        let light_direction = base.light.direction.map(f64::from);
+        match &mut self.path {
+            AnimationPath::ExponentialDive(_) => {}
+            AnimationPath::MultiTargetDive(path) => {
+                if base.precision != Precision::F32 {
+                    bail!("multi-target-dive currently requires f32 precision");
+                }
+                path.validate_parameters()
+                    .context("invalid multi-target-dive path")?;
+                let cycle_duration = path.cycle_duration();
+                if cycle_duration < 1.0 / f64::from(self.fps) {
+                    bail!("multi-target-dive cycle duration must be at least one animation frame");
+                }
+                let final_time =
+                    f64::from(self.frame_count.saturating_sub(1)) / f64::from(self.fps.max(1));
+                let final_cycle = (final_time / cycle_duration).floor() as usize;
+                let final_local_time = final_time - final_cycle as f64 * cycle_duration;
+                let target_count = final_cycle
+                    + 1
+                    + usize::from(final_local_time >= path.overview_duration + path.dive_duration);
+                match &base.fractal {
+                    FractalConfig::Mandelbulb(fractal) => {
+                        path.plan(fractal, light_direction, base.seed, target_count.max(1))?
+                    }
+                    FractalConfig::Mandelbox(fractal) => {
+                        path.plan(fractal, light_direction, base.seed, target_count.max(1))?
+                    }
+                    FractalConfig::Dsl(fractal) => {
+                        path.plan(fractal, light_direction, base.seed, target_count.max(1))?
+                    }
+                }
+            }
+            AnimationPath::SurfaceFlyover(path) => {
+                if base.precision != Precision::F32 {
+                    bail!("surface-flyover currently requires f32 precision");
+                }
+                path.validate_parameters()
+                    .context("invalid surface-flyover path")?;
+                match &base.fractal {
+                    FractalConfig::Mandelbulb(fractal) => {
+                        path.plan(fractal, light_direction, base.seed)?
+                    }
+                    FractalConfig::Mandelbox(fractal) => {
+                        path.plan(fractal, light_direction, base.seed)?
+                    }
+                    FractalConfig::Dsl(fractal) => {
+                        path.plan(fractal, light_direction, base.seed)?
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Validates timeline limits and whether the path is representable by the
     /// selected renderer precision.
     pub fn validate(&self, base: &RenderConfig) -> Result<()> {
@@ -55,6 +121,18 @@ impl AnimationConfig {
                         );
                     }
                 }
+            }
+            AnimationPath::MultiTargetDive(path) => {
+                if base.precision != Precision::F32 {
+                    bail!("multi-target-dive currently requires f32 precision");
+                }
+                path.validate().context("invalid multi-target-dive path")?;
+            }
+            AnimationPath::SurfaceFlyover(path) => {
+                if base.precision != Precision::F32 {
+                    bail!("surface-flyover currently requires f32 precision");
+                }
+                path.validate().context("invalid surface-flyover path")?;
             }
         }
 
@@ -86,20 +164,35 @@ impl AnimationConfig {
             );
         }
         let time_seconds = self.time_for_frame(frame_index);
-        let camera_distance = match &self.path {
+        let mut config = base.clone();
+        let (camera_distance, fade_to_black) = match &self.path {
             AnimationPath::ExponentialDive(path) => {
                 path.validate().context("invalid exponential-dive path")?;
-                path.distance_qf_at(time_seconds)
+                let camera_distance = path.distance_qf_at(time_seconds);
+                let view_direction = (base.camera.target - base.camera.position)
+                    .normalized()
+                    .context("base camera position and target do not define a view direction")?;
+                config.camera.position = config.camera.target - view_direction * camera_distance;
+                (camera_distance, 0.0)
+            }
+            AnimationPath::MultiTargetDive(path) => {
+                let sample = path.sample(time_seconds)?;
+                config.camera.target = sample.target.point;
+                config.camera.position = sample.target.point
+                    - QfVec3::from_f64(sample.target.view_direction) * sample.distance;
+                (sample.distance, sample.fade_to_black)
+            }
+            AnimationPath::SurfaceFlyover(path) => {
+                let sample = path.sample(time_seconds)?;
+                config.camera.position = sample.position;
+                config.camera.target = sample.target;
+                config.camera.up = sample.up;
+                (sample.camera_distance, 0.0)
             }
         };
-        let view_direction = (base.camera.target - base.camera.position)
-            .normalized()
-            .context("base camera position and target do not define a view direction")?;
-
-        let mut config = base.clone();
-        config.camera.position = config.camera.target - view_direction * camera_distance;
         if config.precision == Precision::F32 {
             config.camera.position = QfVec3::from_f32(config.camera.position.to_f32());
+            config.camera.target = QfVec3::from_f32(config.camera.target.to_f32());
         }
         if config.precision == Precision::QuadFloat {
             config
@@ -109,6 +202,11 @@ impl AnimationConfig {
             config
                 .tune_camera_relative_effects(camera_distance.to_f32())
                 .context("could not tune camera-relative effects for animation frame")?;
+        }
+        if fade_to_black > 0.0 {
+            config.quality.post_process.enabled = true;
+            config.quality.post_process.exposure_stops +=
+                (-20.0 - config.quality.post_process.exposure_stops) * fade_to_black;
         }
         config
             .validate()
@@ -167,7 +265,9 @@ mod tests {
         let base = RenderConfig::mandelbox_quad(12_345, Qf32::ONE).unwrap();
         let mut animation = deep_animation();
         assert!(animation.sample(&base, 5).is_err());
-        let AnimationPath::ExponentialDive(path) = &mut animation.path;
+        let AnimationPath::ExponentialDive(path) = &mut animation.path else {
+            unreachable!();
+        };
         path.minimum_distance = Qf32::from_str("1e-27").unwrap();
         assert!(animation.validate(&base).is_err());
     }

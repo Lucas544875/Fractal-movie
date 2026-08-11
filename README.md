@@ -104,7 +104,7 @@ cargo run --release -p fractal-renderer-cli -- render \
   --output output/phase1/mandelbox-alt.png
 ```
 
-経路関連のコードはGPUレンダラーから独立しています。`DistanceEstimator` を実装したフラクタルは `TargetPicker` による表面ターゲット探索を再利用でき、`ExponentialDivePath::distance_at()` は参照JSの overview→dive の距離曲線を提供します。将来の連番アニメーションでは、この結果を各フレームのcamera設定へ渡せます。
+経路関連のコードはGPUレンダラーから独立しています。`DistanceEstimator`を実装したフラクタルは`TargetPicker`による表面ターゲット探索を再利用でき、`ExponentialDivePath::distance_at()`は参照JSのoverview→diveの距離曲線を提供します。この探索は後述の`multi-target-dive`と`surface-flyover`からscene経由で利用できます。
 
 ## Scene file（Phase 2・実装済み）
 
@@ -219,6 +219,73 @@ cargo run --release -p fractal-renderer-cli -- render \
 各PNGは一時ファイルへのencode完了後にrenameされるため、中断時に未完成のフレームを完成済みとして扱いません。quad-float Mandelboxでは各フレームのcamera distanceに合わせてDE反復数、`max_distance`、`epsilon`を再計算し、GPU pipeline・texture・readback bufferは連番全体で再利用します。経路は`renderer-core/src/path.rs`、timelineとcamera合成は`renderer-core/src/animation.rs`に分離してあり、予定している経路選択アルゴリズムからも再利用できます。
 
 RTX 3070 / GL backendの320x180回帰テストでは、同一rendererで始点・中間・終点を連続描画し、距離1e-26の終点まで有効な色分布を確認しています。Phase 3時点の1 spp・追加効果offでは、実測した単一フレーム時間は0.42〜0.45秒でした。
+
+## 自動経路探索
+
+portfolio由来の`pickOriginGapDir()`は以前から、+X付近へ96本のCPUレイを投げ、原点へ最も深く到達した命中点を組み込みMandelboxの初期構図に使用していました。ただし静止画preset専用で、sceneのanimationからは選べませんでした。現在は全候補を評価する`TargetPicker::pick_best()`を追加し、Mandelbulb、Mandelbox、typed DSLのCPU DEから次の2経路を事前計画できます。同じscene seedなら探索結果も同一です。
+
+`multi-target-dive`は候補の奥行き、面の見やすい角度、照明方向をscore化して全探索レイからターゲットを選びます。overviewから指数ズームした後、暗転中に次の事前計画済みターゲットへ切り替えて繰り返します。必要ターゲット数はfps、frame count、各durationから自動算出され、描画中にCPU探索を繰り返しません。
+
+```yaml
+animation:
+  fps: 30
+  frame_count: 870
+  path:
+    kind: multi-target-dive
+    parameters:
+      overview_distance: 7.2
+      minimum_distance: 1.0e-4
+      overview_duration: 2.0
+      dive_duration: 7.0
+      transition_duration: 1.0
+      search:
+        bound_radius: 4.8
+        hit_epsilon: 8.0e-7
+        max_steps: 1000
+        attempts: 192
+        aim_jitter: 0.30
+```
+
+サンプル`mandelbox-multi-target-dive.yaml`は経路確認用の既存materialを流用せず、「Midnight Opal」をテーマに新規設計しています。scale -2.36、fold limit 1.06のMandelbox派生をtyped DSLで構成し、黒曜石色の基材へ狭いcyan、magenta、amberのorbit palette帯を配置しました。168乗の冷白色highlightと24乗のpalette着色highlight、強いAO、暗紫色の背景を組み合わせ、3つの自動ターゲットを巨大な異なる建築物として見せます。29秒弱のシーケンスは2回の暗転切替後、3番目の最深部で終了します。
+
+`surface-flyover`は探索した表面のDE勾配を局所的な鉛直法線とし、`travel_direction`を接平面へ射影します。さらに接平面内の16方向について経路上へ各12本の確認レイを投げ、同じ向きの面が最も長く続く方向を採用します。cameraは`camera_height`を維持し、接平面内をsmoothstepで移動します。`look_ahead: 0.0`なら真下、それより大きい値では進行方向を少し見下ろします。十分な面を確認できない場合は、空を映したままrenderせずscene読込時にエラーにします。
+
+```yaml
+animation:
+  fps: 30
+  frame_count: 541
+  path:
+    kind: surface-flyover
+    parameters:
+      camera_height: 1.25
+      travel_distance: 2.9
+      duration: 18.0
+      look_ahead: 0.0
+      travel_direction: [0.2, 1.0, 0.35]
+      normal_epsilon: 1.5e-4
+      search:
+        bound_radius: 5.0
+        hit_epsilon: 8.0e-7
+        max_steps: 1000
+        attempts: 192
+        aim_jitter: 0.28
+```
+
+サンプル`mandelbox-surface-flyover.yaml`は「Verdigris Atlas」をテーマにした独自sceneです。scale -1.86と広いfoldで上空から読みやすい段丘を作り、orbit coloringによる深緑、緑青、象牙、珊瑚色の領域を地表へ固定しました。暖色の低い斜光、強いAO、粗い半光沢によって、航空写真や古い立体地図のような質感を狙っています。cameraは局所法線を真下に取り、18秒かけて接平面内を2.9 world単位移動します。終点まで地表を画面内に維持し、細密な反射を動画で安定させるため32 sppを使用します。
+
+実行可能なsceneは`scenes/examples/mandelbox-multi-target-dive.yaml`と`scenes/examples/mandelbox-surface-flyover.yaml`です。まず`--frame`と低解像度overrideで始点・切替後・終点を確認できます。
+
+```bash
+WGPU_BACKEND=gl cargo run --release -p fractal-renderer-cli -- render \
+  scenes/examples/mandelbox-multi-target-dive.yaml \
+  --frame 300 --width 640 --height 360 --output output/path-proof --overwrite
+
+WGPU_BACKEND=gl cargo run --release -p fractal-renderer-cli -- render \
+  scenes/examples/mandelbox-surface-flyover.yaml \
+  --frame 540 --width 640 --height 360 --output output/flyover-proof --overwrite
+```
+
+自動探索経路は現在f32専用です。quad-float Mandelboxの超深度shaderは解析的な+X境界への座標rebaseを前提とするため、任意の探索ターゲットをそのまま使うと精度保証が崩れるためです。
 
 ## FFmpeg による動画生成（Phase 4・実装済み）
 
@@ -450,8 +517,8 @@ WGPU_BACKEND=gl cargo run --release -p fractal-renderer-cli -- render \
 │   └── src/
 │       ├── fractal.rs           # CPU DistanceEstimator
 │       ├── dsl.rs               # typed AST / validation / WGSL generator
-│       ├── path.rs              # target search / dive path
-│       ├── animation.rs         # timeline / quad-float camera合成
+│       ├── path.rs              # target search / dive / surface flyover
+│       ├── animation.rs         # timeline / 自動経路 / camera合成
 │       ├── video.rs             # codec設定とscene validation
 │       ├── precision/            # CPU Qf32 / QfVec3
 │       ├── scene.rs             # scene presets

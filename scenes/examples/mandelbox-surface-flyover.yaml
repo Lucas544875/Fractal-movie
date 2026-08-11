@@ -1,0 +1,134 @@
+version: 1
+name: mandelbox-surface-flyover
+precision: f32
+seed: 921704
+
+# "Verdigris Atlas" — an aerial survey over mineral-like Mandelbox terrain.
+# The automatic path replaces position, target, and up after constructing a
+# local tangent plane. These values are only a valid fallback camera.
+camera:
+  position: [8.6, -6.4, 7.3]
+  target: [0.7, 0.1, 0.2]
+  up: [0.0, 0.0, 1.0]
+  vertical_fov_degrees: 38.0
+  aperture_radius: 0.0
+  focus_distance: 1.25
+
+# Wide folds and a gentler negative scale form terraces that remain readable
+# from above. The typed DSL also exposes a completely new surface treatment.
+fractal:
+  kind: dsl
+  parameters:
+    iterations: 26
+    color_iterations: 64
+    normal_epsilon: 8.0e-6
+    orbit:
+      - op: box-fold
+        limit: 1.22
+      - op: sphere-fold
+        min_radius_squared: 0.34
+        fixed_radius_squared: 2.08
+      - op: scale-add-point
+        scale: -1.86
+    material:
+      base_color: [0.012, 0.035, 0.028]
+      accent_color: [0.92, 0.72, 0.42]
+      surface_palette:
+        - { position: 0.00, color: [0.010, 0.030, 0.024] }
+        - { position: 0.13, color: [0.012, 0.110, 0.095] }
+        - { position: 0.25, color: [0.018, 0.390, 0.330] }
+        - { position: 0.38, color: [0.060, 0.740, 0.610] }
+        - { position: 0.46, color: [0.012, 0.135, 0.120] }
+        - { position: 0.52, color: [0.950, 0.780, 0.500] }
+        - { position: 0.58, color: [0.550, 0.500, 0.290] }
+        - { position: 0.63, color: [1.450, 0.120, 0.018] }
+        - { position: 0.68, color: [0.085, 0.014, 0.007] }
+        - { position: 0.82, color: [0.160, 0.390, 0.170] }
+        - { position: 1.00, color: [0.010, 0.030, 0.024] }
+      # Orbit coloring glues the map-like regions to the moving terrain;
+      # camera-relative color is deliberately low so motion remains visible.
+      orbit_palette_weight: 0.82
+      palette_offset: 0.08
+      color_frequency: 5.8
+      camera_palette_weight: 0.08
+      normal_palette_weight: 0.18
+      specular_color: [1.18, 1.02, 0.82]
+      ambient_strength: 0.24
+      diffuse_strength: 1.04
+      specular_strength: 0.48
+      shininess: 92.0
+      metallic_specular_strength: 0.62
+      metallic_shininess: 18.0
+      rim_strength: 0.10
+      background_bottom: [0.003, 0.008, 0.007]
+      background_top: [0.018, 0.055, 0.045]
+      fog_density: 0.0022
+
+# Low, warm side-light converts the DE relief into long readable gradients
+# while the cool-green material supplies the complementary hue.
+light:
+  direction: [0.48, -0.76, 1.18]
+
+render:
+  width: 1920
+  height: 1080
+  max_steps: 416
+  max_distance: 32.0
+  epsilon: 3.0e-7
+  step_safety: 0.87
+  pixel_epsilon_multiplier: 1.15
+
+quality:
+  samples_per_pixel: 32
+  ambient_occlusion:
+    max_steps: 72
+    radius: 0.52
+    strength: 0.74
+  soft_shadow:
+    max_steps: 88
+    angular_radius_degrees: 2.2
+    max_distance: 8.0
+  reflection:
+    max_steps: 72
+    max_distance: 6.0
+    strength: 0.08
+    roughness: 0.14
+  tone_mapping:
+    enabled: true
+    exposure_stops: -0.30
+    white_point: 4.0
+  post_process:
+    enabled: true
+    exposure_stops: 0.12
+    contrast: 1.12
+    saturation: 1.15
+    gamma: 1.02
+    vignette_strength: 0.05
+
+animation:
+  fps: 30
+  frame_count: 541
+  path:
+    kind: surface-flyover
+    parameters:
+      camera_height: 1.25
+      travel_distance: 2.90
+      duration: 18.0
+      # Looking exactly along the local normal keeps the automatically probed
+      # surface centered throughout the complete tangent-plane translation.
+      look_ahead: 0.0
+      travel_direction: [0.20, 1.00, 0.35]
+      normal_epsilon: 1.5e-4
+      search:
+        bound_radius: 5.0
+        hit_epsilon: 8.0e-7
+        max_steps: 1000
+        attempts: 192
+        aim_jitter: 0.28
+
+video:
+  codec: libx264
+  pixel_format: yuv420p
+  crf: 14
+  preset: slow
+  faststart: true

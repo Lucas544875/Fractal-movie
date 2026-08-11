@@ -6,9 +6,9 @@ use std::{path::Path, path::PathBuf, process::ExitCode, time::Instant};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use fractal_renderer_core::{
-    AnimationConfig, FractalConfig, FractalKind, MIN_QUAD_CAMERA_DISTANCE, MandelboxConfig,
-    MandelbulbConfig, Precision, Qf32, RenderConfig, Renderer, RendererOptions, VideoConfig,
-    adapter_is_software, load_scene,
+    AnimationConfig, AnimationPath, FractalConfig, FractalKind, MIN_QUAD_CAMERA_DISTANCE,
+    MandelboxConfig, MandelbulbConfig, Precision, Qf32, RenderConfig, Renderer, RendererOptions,
+    VideoConfig, adapter_is_software, load_scene,
 };
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -441,6 +441,16 @@ fn render_animation(
         "Animation: {} fps, {} frames",
         animation.fps, animation.frame_count
     );
+    match &animation.path {
+        AnimationPath::ExponentialDive(_) => println!("Path: exponential-dive"),
+        AnimationPath::MultiTargetDive(path) => println!(
+            "Path: multi-target-dive ({} preplanned targets)",
+            path.target_count()
+        ),
+        AnimationPath::SurfaceFlyover(_) => {
+            println!("Path: surface-flyover (DE normal + probed tangent)")
+        }
+    }
     println!("Output: {}", output_directory.display());
     if request.frame.is_some()
         && prepared.video.is_some()
@@ -678,7 +688,7 @@ fn prepare_scene(
     height_override: Option<u32>,
 ) -> Result<PreparedScene> {
     let has_scene_file = scene_path.is_some();
-    let (name, mut config, animation, video) = if let Some(path) = scene_path {
+    let (name, mut config, mut animation, video) = if let Some(path) = scene_path {
         if camera_distance.is_some() {
             bail!(
                 "--camera-distance is available only with the built-in quad-float Mandelbox preset"
@@ -738,7 +748,12 @@ fn prepare_scene(
     config
         .validate()
         .context("render configuration is invalid after applying CLI overrides")?;
-    if let Some(animation) = &animation {
+    if let Some(animation) = &mut animation {
+        if fractal_override.is_some() || seed_override.is_some() {
+            animation
+                .plan(&config)
+                .context("could not replan automatic path after CLI overrides")?;
+        }
         animation
             .validate(&config)
             .context("animation is invalid after applying CLI overrides")?;
@@ -965,6 +980,35 @@ mod tests {
             final_frame.config.camera.position,
             final_frame.config.camera.target
         );
+    }
+
+    #[test]
+    fn automatic_path_is_replanned_after_a_seed_override() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../scenes/examples/mandelbox-multi-target-dive.yaml");
+        let original = prepare_scene(Some(&path), None, None, None, None, Some(80), Some(45))
+            .expect("automatic scene must load");
+        let overridden = prepare_scene(Some(&path), None, None, None, Some(99), Some(80), Some(45))
+            .expect("seed override must replan the automatic path");
+        let original_target = original
+            .animation
+            .as_ref()
+            .unwrap()
+            .sample(&original.config, 0)
+            .unwrap()
+            .config
+            .camera
+            .target;
+        let overridden_target = overridden
+            .animation
+            .as_ref()
+            .unwrap()
+            .sample(&overridden.config, 0)
+            .unwrap()
+            .config
+            .camera
+            .target;
+        assert_ne!(original_target, overridden_target);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::{DslFractalConfig, MandelboxConfig, OrbitTransform, Qf32, QfVec3};
+use crate::{DslFractalConfig, MandelboxConfig, MandelbulbConfig, OrbitTransform, Qf32, QfVec3};
 
 /// CPU-side counterpart of a shader distance estimator.
 ///
@@ -12,6 +12,43 @@ pub trait DistanceEstimator {
 /// coordinate resolution.
 pub trait HighPrecisionDistanceEstimator {
     fn distance_estimate_qf(&self, point: QfVec3) -> Qf32;
+}
+
+impl DistanceEstimator for MandelbulbConfig {
+    fn distance_estimate(&self, point: [f64; 3]) -> f64 {
+        let mut z = point;
+        let mut derivative = 1.0_f64;
+        let mut radius = dot(z, z).sqrt();
+        let power = f64::from(self.power);
+
+        for _ in 0..self.iterations {
+            radius = dot(z, z).sqrt();
+            if radius > f64::from(self.bailout) {
+                break;
+            }
+            let safe_radius = radius.max(1.0e-12);
+            let polar = (z[2] / safe_radius).clamp(-1.0, 1.0).acos();
+            let azimuth = z[1].atan2(z[0]);
+            derivative = safe_radius.powf(power - 1.0) * power * derivative + 1.0;
+            let powered_radius = safe_radius.powf(power);
+            let powered_polar = polar * power;
+            let powered_azimuth = azimuth * power;
+            z = add(
+                scale_vector(
+                    [
+                        powered_polar.sin() * powered_azimuth.cos(),
+                        powered_polar.sin() * powered_azimuth.sin(),
+                        powered_polar.cos(),
+                    ],
+                    powered_radius,
+                ),
+                point,
+            );
+        }
+
+        let safe_radius = radius.max(1.0e-12);
+        0.5 * safe_radius.ln() * safe_radius / derivative.max(1.0e-12)
+    }
 }
 
 impl DistanceEstimator for MandelboxConfig {
@@ -280,6 +317,13 @@ mod tests {
         let negative = fractal.distance_estimate([-3.0, -1.25, -0.5]);
         assert!((positive - negative).abs() < 1.0e-12);
         assert!(positive.is_finite() && positive > 0.0);
+    }
+
+    #[test]
+    fn mandelbulb_estimator_is_finite_outside_the_bound() {
+        let fractal = MandelbulbConfig::default();
+        let distance = fractal.distance_estimate([3.0, 0.5, 0.25]);
+        assert!(distance.is_finite() && distance > 0.0);
     }
 
     #[test]
