@@ -15,8 +15,9 @@ complete when an agent can:
 6. encode either the complete result or the contiguous frames currently
    available.
 
-The human CLI remains supported and is intended to become an adapter over the
-same workflow services used by the harness before P1 schema work begins.
+The human CLI remains supported. Its preview, static render, animation render,
+sequence validation, and FFmpeg execution now delegate to the same workflow
+services used by the harness.
 
 ## Implementation status
 
@@ -26,10 +27,14 @@ transactional patch/promotion, idempotent JSON tools, DE target/route
 inspection, preview metrics/contact sheets, revision-bound render sequences,
 persisted controllable jobs, and independent complete/range/available encode.
 
-The existing `fractal-render` commands remain compatible. Their internal
-preview/render loops still predate `renderer-workflow`; consolidating those
-loops is deliberately scheduled before any P1 scene-schema change so it cannot
-fork the future object/material implementation.
+The existing `fractal-render` command line remains compatible. Preview profile
+application, representative-frame selection, scene sampling, adapter policy,
+pipeline reuse, frame progress, and GPU execution now converge on
+`FrameRenderSession` in `renderer-workflow`. Sequence frame naming, complete
+PNG validation, FFmpeg preflight/arguments, cancellation, temporary output,
+and atomic publication converge on the workflow encoder as well. The CLI now
+contains transport, compatibility overrides, and human-readable reporting,
+not a second renderer or encoder implementation.
 
 ## Architectural boundaries
 
@@ -66,11 +71,21 @@ format, or job-model migration.
 9. Complete and contiguous-partial sequence encoding.
 10. Newline-delimited JSON harness with discoverable tool schemas.
 11. Preserve the existing CLI contract while the harness uses the workflow
-    layer. Moving the remaining legacy CLI loops onto the same services is the
-    first migration task after the milestone and must finish before P1 schema
-    work begins.
+    layer. Preview, render, sequence validation, and FFmpeg execution are
+    migrated to shared workflow services.
 12. End-to-end Alchemy milestone test that does not require a GPU, plus ignored
     GPU/FFmpeg integration tests.
+
+### P0 hardening — current next work
+
+1. Add protocol-level subprocess tests that exercise the JSONL server over
+   stdin/stdout rather than calling its handler directly.
+2. Add persisted recovery tests covering process interruption during preview,
+   render, and encode publication.
+3. Make job manifest publication resilient to a panic in an operation thread,
+   so every accepted asynchronous job still reaches a persisted terminal state.
+4. Add artifact publication tests for same-filesystem atomic rename and
+   cleanup of abandoned temporary files.
 
 ### P0 architecture provisions for later work
 

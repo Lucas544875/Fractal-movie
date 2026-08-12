@@ -53,10 +53,3 @@ pub fn save_png(path: &Path, image: &RenderedImage, overwrite: bool) -> Result<(
     }
     Ok(())
 }
-
-/// Fully decodes a PNG before accepting it as a resumable sequence frame.
-pub fn png_dimensions(path: &Path) -> Result<(u32, u32)> {
-    let image =
-        image::open(path).with_context(|| format!("could not decode {}", path.display()))?;
-    Ok((image.width(), image.height()))
-}

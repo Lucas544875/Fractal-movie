@@ -1,14 +1,12 @@
 use std::{collections::BTreeSet, path::Path, time::Instant};
 
 use anyhow::{Context, Result, bail};
-use fractal_renderer_core::{
-    AnimationConfig, AnimationFrame, LoadedScene, RenderRegion, Renderer, RendererOptions,
-};
+use fractal_renderer_core::{AnimationConfig, LoadedScene, RenderRegion};
 use image::{Rgba, RgbaImage, imageops};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Artifact, ImageMetrics, ProjectStore, RenderEnvironment,
+    Artifact, FrameRenderSession, ImageMetrics, ProjectStore, RenderEnvironment, RendererPolicy,
     artifact::{save_png_atomic, write_atomic},
 };
 
@@ -98,24 +96,18 @@ pub(crate) fn render_preview_with_progress(
     validate_request(request)?;
     let (revision, spec) = store.scene(&request.project_id, request.revision_id.as_deref())?;
     let mut scene = spec.resolve()?;
-    apply_profile(&mut scene, request.profile, request.width, request.height)?;
+    apply_preview_profile(&mut scene, request.profile, request.width, request.height)?;
     let frame_indices = preview_frame_indices(scene.animation.as_ref(), &request.frames)?;
-    let first_frame = frame_config(&scene, frame_indices[0])?;
-    let region = render_region(
-        first_frame.config.render.width,
-        first_frame.config.render.height,
+    let region = normalized_render_region(
+        scene.config.render.width,
+        scene.config.render.height,
         request.region,
     )?;
-    let renderer = pollster::block_on(Renderer::new_with_options(
-        first_frame.config.clone(),
-        RendererOptions {
-            allow_software_adapter: request.allow_software,
-            adapter_name: request.adapter.clone(),
-            gpu_duty_cycle: request.gpu_duty_cycle.map(|percent| percent / 100.0),
-        },
-    ))
-    .context("could not initialize preview renderer")?;
-    let environment = RenderEnvironment::from_renderer(&renderer);
+    let mut session = FrameRenderSession::new(RendererPolicy {
+        allow_software: request.allow_software,
+        adapter: request.adapter.clone(),
+        gpu_duty_cycle: request.gpu_duty_cycle,
+    })?;
 
     std::fs::create_dir_all(output_directory).with_context(|| {
         format!(
@@ -125,50 +117,48 @@ pub(crate) fn render_preview_with_progress(
     })?;
     let total_started = Instant::now();
     let mut frames = Vec::with_capacity(frame_indices.len());
-    let total = frame_indices.len() as u32;
-    for (position, frame_index) in frame_indices.into_iter().enumerate() {
-        progress(position as u32, total)?;
-        let frame = if frame_index == first_frame.index {
-            first_frame.clone()
-        } else {
-            frame_config(&scene, frame_index)?
-        };
-        let started = Instant::now();
-        let rendered = renderer
-            .render_region_with_config(
-                &frame.config,
-                frame.index,
-                frame.time_seconds as f32,
-                region,
-            )
-            .with_context(|| format!("failed to render preview frame {frame_index}"))?;
-        let render_seconds = started.elapsed().as_secs_f64();
-        let image = RgbaImage::from_raw(
-            rendered.width(),
-            rendered.height(),
-            rendered.pixels().to_vec(),
+    let mut environment = None;
+    session
+        .render_frames(
+            &scene,
+            &frame_indices,
+            Some(region),
+            |start| {
+                environment = Some(start.environment.clone());
+                Ok(())
+            },
+            &mut *progress,
+            |rendered| {
+                let frame_index = rendered.frame.index;
+                let image = RgbaImage::from_raw(
+                    rendered.image.width(),
+                    rendered.image.height(),
+                    rendered.image.pixels().to_vec(),
+                )
+                .context("renderer returned an invalid RGBA image")?;
+                let metrics = ImageMetrics::from_rgba(&image);
+                let path = output_directory.join(format!("frame_{frame_index:06}.png"));
+                save_png_atomic(&path, &image)?;
+                let mut artifact = Artifact::from_file("preview-frame", "image/png", path)?;
+                artifact
+                    .metadata
+                    .insert("frame_index".to_owned(), serde_json::json!(frame_index));
+                artifact.metadata.insert(
+                    "render_pass".to_owned(),
+                    serde_json::Value::String("beauty".to_owned()),
+                );
+                frames.push(PreviewFrameResult {
+                    frame_index,
+                    time_seconds: rendered.frame.time_seconds,
+                    render_seconds: rendered.render_seconds,
+                    metrics,
+                    artifact,
+                });
+                Ok(())
+            },
         )
-        .context("renderer returned an invalid RGBA image")?;
-        let metrics = ImageMetrics::from_rgba(&image);
-        let path = output_directory.join(format!("frame_{frame_index:06}.png"));
-        save_png_atomic(&path, &image)?;
-        let mut artifact = Artifact::from_file("preview-frame", "image/png", path)?;
-        artifact
-            .metadata
-            .insert("frame_index".to_owned(), serde_json::json!(frame_index));
-        artifact.metadata.insert(
-            "render_pass".to_owned(),
-            serde_json::Value::String("beauty".to_owned()),
-        );
-        frames.push(PreviewFrameResult {
-            frame_index,
-            time_seconds: frame.time_seconds,
-            render_seconds,
-            metrics,
-            artifact,
-        });
-    }
-    progress(total, total)?;
+        .context("could not execute preview frames")?;
+    let environment = environment.context("preview renderer did not report its environment")?;
 
     let contact_sheet_path = output_directory.join("contact-sheet.png");
     create_contact_sheet(&frames, &contact_sheet_path)?;
@@ -217,7 +207,7 @@ fn validate_request(request: &PreviewRequest) -> Result<()> {
     Ok(())
 }
 
-fn apply_profile(
+pub fn apply_preview_profile(
     scene: &mut LoadedScene,
     profile: PreviewProfile,
     width_override: Option<u32>,
@@ -257,21 +247,20 @@ fn apply_profile(
         PreviewProfile::Composition => {
             scene.config.quality.samples_per_pixel = 1;
             scene.config.camera.aperture_radius = 0.0;
+            scene.config.render.max_steps = scene.config.render.max_steps.min(256);
             scene.config.quality.ambient_occlusion.max_steps = 0;
-            scene.config.quality.ambient_occlusion.strength = 0.0;
             scene.config.quality.soft_shadow.max_steps = 0;
             scene.config.quality.reflection.max_steps = 0;
-            scene.config.quality.reflection.strength = 0.0;
         }
         PreviewProfile::Lookdev => {
             scene.config.quality.samples_per_pixel = scene.config.quality.samples_per_pixel.min(8);
             scene.config.camera.aperture_radius = 0.0;
             scene.config.quality.ambient_occlusion.max_steps =
-                scene.config.quality.ambient_occlusion.max_steps.min(16);
+                scene.config.quality.ambient_occlusion.max_steps.min(24);
             scene.config.quality.soft_shadow.max_steps =
-                scene.config.quality.soft_shadow.max_steps.min(24);
-            scene.config.quality.reflection.max_steps = 0;
-            scene.config.quality.reflection.strength = 0.0;
+                scene.config.quality.soft_shadow.max_steps.min(32);
+            scene.config.quality.reflection.max_steps =
+                scene.config.quality.reflection.max_steps.min(16);
         }
         PreviewProfile::Proof => {
             scene.config.quality.samples_per_pixel = scene.config.quality.samples_per_pixel.min(32);
@@ -280,17 +269,23 @@ fn apply_profile(
             scene.config.quality.soft_shadow.max_steps =
                 scene.config.quality.soft_shadow.max_steps.min(64);
             scene.config.quality.reflection.max_steps =
-                scene.config.quality.reflection.max_steps.min(48);
+                scene.config.quality.reflection.max_steps.min(32);
         }
         PreviewProfile::Final => {}
     }
     scene
         .config
         .validate()
-        .context("preview profile is invalid")
+        .context("preview profile is invalid")?;
+    if let Some(animation) = &scene.animation {
+        animation
+            .validate(&scene.config)
+            .context("preview profile is incompatible with the animation")?;
+    }
+    Ok(())
 }
 
-fn preview_frame_indices(
+pub fn preview_frame_indices(
     animation: Option<&AnimationConfig>,
     requested_frames: &[u32],
 ) -> Result<Vec<u32>> {
@@ -313,28 +308,15 @@ fn preview_frame_indices(
     Ok(unique.into_iter().collect())
 }
 
-fn frame_config(scene: &LoadedScene, frame_index: u32) -> Result<AnimationFrame> {
-    if let Some(animation) = &scene.animation {
-        return animation.sample(&scene.config, frame_index);
-    }
-    if frame_index != 0 {
-        bail!("static preview has only frame 0");
-    }
-    let camera_distance = (scene.config.camera.target - scene.config.camera.position)
-        .length_squared()
-        .sqrt();
-    Ok(AnimationFrame {
-        index: 0,
-        time_seconds: 0.0,
-        camera_distance,
-        config: scene.config.clone(),
-    })
-}
-
-fn render_region(width: u32, height: u32, normalized: Option<[f64; 4]>) -> Result<RenderRegion> {
+pub fn normalized_render_region(
+    width: u32,
+    height: u32,
+    normalized: Option<[f64; 4]>,
+) -> Result<RenderRegion> {
     let Some([x, y, region_width, region_height]) = normalized else {
         return Ok(RenderRegion::full(width, height));
     };
+    validate_normalized_region([x, y, region_width, region_height])?;
     let left = (x * f64::from(width)).floor() as u32;
     let top = (y * f64::from(height)).floor() as u32;
     let right = ((x + region_width) * f64::from(width)).ceil() as u32;
@@ -345,6 +327,21 @@ fn render_region(width: u32, height: u32, normalized: Option<[f64; 4]>) -> Resul
         width: right.clamp(left + 1, width) - left,
         height: bottom.clamp(top + 1, height) - top,
     })
+}
+
+fn validate_normalized_region(region: [f64; 4]) -> Result<()> {
+    let [x, y, width, height] = region;
+    if region.iter().any(|value| !value.is_finite())
+        || x < 0.0
+        || y < 0.0
+        || width <= 0.0
+        || height <= 0.0
+        || x + width > 1.0
+        || y + height > 1.0
+    {
+        bail!("preview region must be positive and contained in normalized coordinates");
+    }
+    Ok(())
 }
 
 fn create_contact_sheet(frames: &[PreviewFrameResult], output: &Path) -> Result<()> {

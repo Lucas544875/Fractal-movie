@@ -1,8 +1,6 @@
 mod output;
-mod video;
 
 use std::{
-    collections::BTreeSet,
     fs,
     path::Path,
     path::PathBuf,
@@ -15,9 +13,15 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use fractal_renderer_core::{
-    AnimationConfig, AnimationFrame, AnimationPath, FractalConfig, FractalKind,
+    AnimationConfig, AnimationPath, FractalConfig, FractalKind, LoadedScene,
     MIN_QUAD_CAMERA_DISTANCE, MandelboxConfig, MandelbulbConfig, Precision, Qf32, RenderConfig,
-    RenderRegion, Renderer, RendererOptions, VideoConfig, adapter_is_software, load_scene,
+    Renderer, VideoConfig, adapter_is_software, load_scene,
+};
+use fractal_renderer_workflow::{
+    FrameRenderSession, PreviewProfile as WorkflowPreviewProfile, RenderEnvironment,
+    RendererPolicy, VideoEncodeJob, apply_preview_profile as apply_workflow_preview_profile,
+    normalized_render_region, preview_frame_indices as workflow_preview_frame_indices,
+    sequence_frame_path, validate_sequence_png,
 };
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -48,6 +52,17 @@ impl PreviewProfile {
             Self::Lookdev => "lookdev",
             Self::Proof => "proof",
             Self::Final => "final",
+        }
+    }
+}
+
+impl From<PreviewProfile> for WorkflowPreviewProfile {
+    fn from(value: PreviewProfile) -> Self {
+        match value {
+            PreviewProfile::Composition => Self::Composition,
+            PreviewProfile::Lookdev => Self::Lookdev,
+            PreviewProfile::Proof => Self::Proof,
+            PreviewProfile::Final => Self::Final,
         }
     }
 }
@@ -101,19 +116,6 @@ impl NormalizedRegion {
             );
         }
         Ok(())
-    }
-
-    fn to_render_region(self, width: u32, height: u32) -> RenderRegion {
-        let x = (self.x * f64::from(width)).floor() as u32;
-        let y = (self.y * f64::from(height)).floor() as u32;
-        let right = ((self.x + self.width) * f64::from(width)).ceil() as u32;
-        let bottom = ((self.y + self.height) * f64::from(height)).ceil() as u32;
-        RenderRegion {
-            x: x.min(width - 1),
-            y: y.min(height - 1),
-            width: right.clamp(x + 1, width) - x,
-            height: bottom.clamp(y + 1, height) - y,
-        }
     }
 }
 
@@ -467,7 +469,7 @@ fn resolve_video_job(
     render_config: &RenderConfig,
     frames_directory: &Path,
     request: &RenderRequest,
-) -> Result<Option<video::VideoJob>> {
+) -> Result<Option<VideoEncodeJob>> {
     if request.no_video {
         return Ok(None);
     }
@@ -508,7 +510,7 @@ fn resolve_video_job(
         .video_output
         .clone()
         .unwrap_or_else(|| frames_directory.with_extension("mp4"));
-    let job = video::VideoJob {
+    let job = VideoEncodeJob {
         ffmpeg: request
             .ffmpeg
             .clone()
@@ -516,9 +518,12 @@ fn resolve_video_job(
         frames_directory: frames_directory.to_owned(),
         output_path,
         fps: animation.fps,
+        start_frame: 0,
         frame_count: animation.frame_count,
         config,
         overwrite: request.overwrite || request.video_overwrite,
+        diagnostic_log: None,
+        show_progress: true,
     };
     job.validate(render_config.render.width, render_config.render.height)
         .context("invalid effective video configuration")?;
@@ -549,8 +554,12 @@ fn render(request: RenderRequest) -> Result<()> {
 
 fn preview(request: PreviewRequest) -> Result<()> {
     gpu_duty_cycle_fraction(request.gpu_duty_cycle)?;
-    let mut renderer = None;
-    render_preview_iteration(&request, &mut renderer)?;
+    let mut session = FrameRenderSession::new(RendererPolicy {
+        allow_software: request.allow_software,
+        adapter: request.adapter.clone(),
+        gpu_duty_cycle: request.gpu_duty_cycle,
+    })?;
+    render_preview_iteration(&request, &mut session)?;
     if !request.watch {
         return Ok(());
     }
@@ -571,7 +580,7 @@ fn preview(request: PreviewRequest) -> Result<()> {
         }
         previous_contents = contents;
         println!("\nScene changed; refreshing preview...");
-        if let Err(error) = render_preview_iteration(&request, &mut renderer) {
+        if let Err(error) = render_preview_iteration(&request, &mut session) {
             eprintln!("preview refresh failed: {error:#}");
         }
     }
@@ -579,21 +588,30 @@ fn preview(request: PreviewRequest) -> Result<()> {
 
 fn render_preview_iteration(
     request: &PreviewRequest,
-    renderer: &mut Option<Renderer>,
+    session: &mut FrameRenderSession,
 ) -> Result<()> {
-    let mut prepared = prepare_scene(Some(&request.scene), None, None, None, None, None, None)?;
-    apply_preview_profile(
-        &mut prepared,
-        request.profile,
+    let prepared = prepare_scene(Some(&request.scene), None, None, None, None, None, None)?;
+    let mut scene = LoadedScene {
+        name: prepared.name,
+        config: prepared.config,
+        animation: prepared.animation,
+        video: prepared.video,
+    };
+    apply_workflow_preview_profile(
+        &mut scene,
+        request.profile.into(),
         request.width,
         request.height,
     )?;
+    let requested_frames = request
+        .frame
+        .map_or_else(|| request.frames.clone(), |frame| vec![frame]);
     let frame_indices =
-        preview_frame_indices(prepared.animation.as_ref(), request.frame, &request.frames)?;
+        workflow_preview_frame_indices(scene.animation.as_ref(), &requested_frames)?;
     let output_directory = request.output.clone().unwrap_or_else(|| {
         let directory = PathBuf::from("output")
             .join("preview")
-            .join(&prepared.name)
+            .join(&scene.name)
             .join(request.profile.label());
         if request.region.is_some() {
             directory.join("crop")
@@ -601,216 +619,62 @@ fn render_preview_iteration(
             directory
         }
     });
-    let first_frame = preview_frame_config(&prepared, frame_indices[0])?;
-    let rebuild_pipeline = renderer
-        .as_ref()
-        .is_none_or(|renderer| !renderer.supports_config(&first_frame.config));
-    if rebuild_pipeline {
-        *renderer = Some(create_renderer_with_options(
-            first_frame.config.clone(),
-            request.allow_software,
-            request.adapter.clone(),
-            request.gpu_duty_cycle,
-        )?);
-    }
-    let renderer = renderer.as_ref().expect("preview renderer was initialized");
-
-    println!("Scene: {}", prepared.name);
-    println!("Preview profile: {}", request.profile.label());
-    println!(
-        "Pipeline: {}",
-        if rebuild_pipeline {
-            "rebuilt"
-        } else {
-            "reused"
-        }
+    let normalized_region = request
+        .region
+        .map(|region| [region.x, region.y, region.width, region.height]);
+    let region = normalized_render_region(
+        scene.config.render.width,
+        scene.config.render.height,
+        normalized_region,
     );
-    print_renderer_summary(renderer, &first_frame.config);
-    let region = request.region.map_or_else(
-        || {
-            RenderRegion::full(
-                first_frame.config.render.width,
-                first_frame.config.render.height,
-            )
-        },
-        |region| {
-            region.to_render_region(
-                first_frame.config.render.width,
-                first_frame.config.render.height,
-            )
-        },
-    );
-    if request.region.is_some() {
-        println!(
-            "Preview crop: x={}, y={}, {}x{} within {}x{} viewport",
-            region.x,
-            region.y,
-            region.width,
-            region.height,
-            first_frame.config.render.width,
-            first_frame.config.render.height
-        );
-    }
-    println!("Preview frames: {frame_indices:?}");
-    println!("Output: {}", output_directory.display());
-
-    for frame_index in frame_indices {
-        let frame = if frame_index == first_frame.index {
-            first_frame.clone()
-        } else {
-            preview_frame_config(&prepared, frame_index)?
-        };
-        let started = Instant::now();
-        let image = renderer
-            .render_region_with_config(
-                &frame.config,
-                frame.index,
-                frame.time_seconds as f32,
-                region,
-            )
-            .with_context(|| format!("failed to render preview frame {frame_index}"))?;
-        let path = output_directory.join(format!("frame_{frame_index:06}.png"));
-        output::save_png(&path, &image, true)
-            .with_context(|| format!("failed to write preview {}", path.display()))?;
-        println!(
-            "Saved: {} ({:.3}s)",
-            path.display(),
-            started.elapsed().as_secs_f64()
-        );
-    }
+    let region = region?;
+    session
+        .render_frames(
+            &scene,
+            &frame_indices,
+            Some(region),
+            |start| {
+                println!("Scene: {}", scene.name);
+                println!("Preview profile: {}", request.profile.label());
+                println!(
+                    "Pipeline: {}",
+                    if start.pipeline_rebuilt {
+                        "rebuilt"
+                    } else {
+                        "reused"
+                    }
+                );
+                print_renderer_summary(&start.environment, &start.initial_config);
+                if request.region.is_some() {
+                    println!(
+                        "Preview crop: x={}, y={}, {}x{} within {}x{} viewport",
+                        start.region.x,
+                        start.region.y,
+                        start.region.width,
+                        start.region.height,
+                        start.initial_config.render.width,
+                        start.initial_config.render.height
+                    );
+                }
+                println!("Preview frames: {:?}", start.frame_indices);
+                println!("Output: {}", output_directory.display());
+                Ok(())
+            },
+            |_, _| Ok(()),
+            |rendered| {
+                let path = output_directory.join(format!("frame_{:06}.png", rendered.frame.index));
+                output::save_png(&path, &rendered.image, true)
+                    .with_context(|| format!("failed to write preview {}", path.display()))?;
+                println!(
+                    "Saved: {} ({:.3}s)",
+                    path.display(),
+                    rendered.render_seconds
+                );
+                Ok(())
+            },
+        )
+        .context("preview execution failed")?;
     Ok(())
-}
-
-fn preview_frame_config(prepared: &PreparedScene, frame_index: u32) -> Result<AnimationFrame> {
-    if let Some(animation) = &prepared.animation {
-        return animation
-            .sample(&prepared.config, frame_index)
-            .with_context(|| format!("could not sample preview frame {frame_index}"));
-    }
-    if frame_index != 0 {
-        bail!("static preview has only frame 0");
-    }
-    let camera_distance = (prepared.config.camera.target - prepared.config.camera.position)
-        .length_squared()
-        .sqrt();
-    Ok(AnimationFrame {
-        index: 0,
-        time_seconds: 0.0,
-        camera_distance,
-        config: prepared.config.clone(),
-    })
-}
-
-fn preview_frame_indices(
-    animation: Option<&AnimationConfig>,
-    frame: Option<u32>,
-    frames: &[u32],
-) -> Result<Vec<u32>> {
-    let frame_count = animation.map_or(1, |animation| animation.frame_count);
-    let requested = if let Some(frame) = frame {
-        vec![frame]
-    } else if !frames.is_empty() {
-        frames.to_vec()
-    } else if frame_count == 1 {
-        vec![0]
-    } else {
-        let last = frame_count - 1;
-        vec![0, last / 4, last / 2, last.saturating_mul(3) / 4, last]
-    };
-    let unique = requested.into_iter().collect::<BTreeSet<_>>();
-    if let Some(invalid) = unique.iter().find(|&&frame| frame >= frame_count) {
-        bail!(
-            "preview frame {invalid} is outside this scene's frame range 0..{}",
-            frame_count - 1
-        );
-    }
-    Ok(unique.into_iter().collect())
-}
-
-fn apply_preview_profile(
-    prepared: &mut PreparedScene,
-    profile: PreviewProfile,
-    width_override: Option<u32>,
-    height_override: Option<u32>,
-) -> Result<()> {
-    let source_width = prepared.config.render.width;
-    let source_height = prepared.config.render.height;
-    let maximum_width = match profile {
-        PreviewProfile::Composition => Some(320),
-        PreviewProfile::Lookdev => Some(480),
-        PreviewProfile::Proof => Some(810),
-        PreviewProfile::Final => None,
-    };
-    if let Some(maximum_width) = maximum_width
-        && source_width > maximum_width
-    {
-        prepared.config.render.width = maximum_width;
-        prepared.config.render.height =
-            scaled_dimension(source_height, source_width, maximum_width);
-    }
-    match (width_override, height_override) {
-        (Some(width), Some(height)) => {
-            prepared.config.render.width = width;
-            prepared.config.render.height = height;
-        }
-        (Some(width), None) => {
-            prepared.config.render.width = width;
-            prepared.config.render.height = scaled_dimension(source_height, source_width, width);
-        }
-        (None, Some(height)) => {
-            prepared.config.render.width = scaled_dimension(source_width, source_height, height);
-            prepared.config.render.height = height;
-        }
-        (None, None) => {}
-    }
-
-    match profile {
-        PreviewProfile::Composition => {
-            prepared.config.quality.samples_per_pixel = 1;
-            prepared.config.camera.aperture_radius = 0.0;
-            prepared.config.render.max_steps = prepared.config.render.max_steps.min(256);
-            prepared.config.quality.ambient_occlusion.max_steps = 0;
-            prepared.config.quality.soft_shadow.max_steps = 0;
-            prepared.config.quality.reflection.max_steps = 0;
-        }
-        PreviewProfile::Lookdev => {
-            prepared.config.quality.samples_per_pixel =
-                prepared.config.quality.samples_per_pixel.min(8);
-            prepared.config.camera.aperture_radius = 0.0;
-            prepared.config.quality.ambient_occlusion.max_steps =
-                prepared.config.quality.ambient_occlusion.max_steps.min(24);
-            prepared.config.quality.soft_shadow.max_steps =
-                prepared.config.quality.soft_shadow.max_steps.min(32);
-            prepared.config.quality.reflection.max_steps =
-                prepared.config.quality.reflection.max_steps.min(16);
-        }
-        PreviewProfile::Proof => {
-            prepared.config.quality.samples_per_pixel =
-                prepared.config.quality.samples_per_pixel.min(32);
-            prepared.config.quality.ambient_occlusion.max_steps =
-                prepared.config.quality.ambient_occlusion.max_steps.min(48);
-            prepared.config.quality.soft_shadow.max_steps =
-                prepared.config.quality.soft_shadow.max_steps.min(64);
-            prepared.config.quality.reflection.max_steps =
-                prepared.config.quality.reflection.max_steps.min(32);
-        }
-        PreviewProfile::Final => {}
-    }
-    prepared
-        .config
-        .validate()
-        .context("preview profile produced an invalid render configuration")?;
-    if let Some(animation) = &prepared.animation {
-        animation
-            .validate(&prepared.config)
-            .context("preview profile is incompatible with the animation")?;
-    }
-    Ok(())
-}
-
-fn scaled_dimension(value: u32, original: u32, resized: u32) -> u32 {
-    ((u64::from(value) * u64::from(resized) + u64::from(original) / 2) / u64::from(original)).max(1)
-        as u32
 }
 
 fn render_static(
@@ -829,28 +693,47 @@ fn render_static(
     }
     ensure_output_is_available(output_path, request.overwrite)?;
 
-    let scene_name = prepared.name;
-    let config = prepared.config;
-    let renderer = create_renderer(config.clone(), request)?;
-    println!("Scene: {scene_name}");
-    print_renderer_summary(&renderer, &config);
-    println!("Frames: 1");
-    println!("Rendering frame 1/1");
-
-    let total_start = Instant::now();
-    let frame_start = Instant::now();
-    let image = renderer
-        .render_frame(0, 0.0)
-        .with_context(|| format!("failed to render {scene_name} frame 0"))?;
-    let frame_time = frame_start.elapsed();
-    println!("Frame render time: {:.3}s", frame_time.as_secs_f64());
-
-    output::save_png(output_path, &image, request.overwrite)
-        .with_context(|| format!("failed to write {}", output_path.display()))?;
-    let total_time = total_start.elapsed();
-    println!("Saved: {}", output_path.display());
-    println!("Total render time: {:.3}s", total_time.as_secs_f64());
-    println!("Average frame time: {:.3}s", frame_time.as_secs_f64());
+    let scene = LoadedScene {
+        name: prepared.name,
+        config: prepared.config,
+        animation: None,
+        video: None,
+    };
+    let mut session = FrameRenderSession::new(RendererPolicy {
+        allow_software: request.allow_software,
+        adapter: request.adapter.clone(),
+        gpu_duty_cycle: request.gpu_duty_cycle,
+    })?;
+    let mut frame_seconds = 0.0;
+    let summary = session
+        .render_frames(
+            &scene,
+            &[0],
+            None,
+            |start| {
+                println!("Scene: {}", scene.name);
+                print_renderer_summary(&start.environment, &start.initial_config);
+                println!("Frames: 1");
+                Ok(())
+            },
+            |completed, _| {
+                if completed == 0 {
+                    println!("Rendering frame 1/1");
+                }
+                Ok(())
+            },
+            |rendered| {
+                frame_seconds = rendered.render_seconds;
+                println!("Frame render time: {frame_seconds:.3}s");
+                output::save_png(output_path, &rendered.image, request.overwrite)
+                    .with_context(|| format!("failed to write {}", output_path.display()))?;
+                println!("Saved: {}", output_path.display());
+                Ok(())
+            },
+        )
+        .with_context(|| format!("failed to render {} frame 0", scene.name))?;
+    println!("Total render time: {:.3}s", summary.total_seconds);
+    println!("Average frame time: {frame_seconds:.3}s");
     Ok(())
 }
 
@@ -878,7 +761,7 @@ fn render_animation(
     )?;
     let ffmpeg_version = video_job
         .as_ref()
-        .map(video::VideoJob::ffmpeg_version)
+        .map(VideoEncodeJob::ffmpeg_version)
         .transpose()
         .context("FFmpeg is unavailable for the requested video encode")?;
 
@@ -945,42 +828,58 @@ fn render_animation(
     if pending_frames.is_empty() {
         println!("Nothing to render; every requested frame is already complete.");
     } else {
-        let initial_frame = animation.sample(&prepared.config, pending_frames[0])?;
-        let renderer = create_renderer(initial_frame.config.clone(), request)?;
-        print_renderer_summary(&renderer, &initial_frame.config);
-        println!("Frames to render: {}", pending_frames.len());
-
-        let total_start = Instant::now();
+        let scene = LoadedScene {
+            name: prepared.name.clone(),
+            config: prepared.config.clone(),
+            animation: prepared.animation.clone(),
+            video: prepared.video.clone(),
+        };
+        let mut session = FrameRenderSession::new(RendererPolicy {
+            allow_software: request.allow_software,
+            adapter: request.adapter.clone(),
+            gpu_duty_cycle: request.gpu_duty_cycle,
+        })?;
         let mut accumulated_frame_seconds = 0.0;
-        for frame_index in pending_frames.iter().copied() {
-            let sample = animation
-                .sample(&prepared.config, frame_index)
-                .with_context(|| format!("could not sample animation frame {frame_index}"))?;
-            println!(
-                "Rendering frame {}/{} (t={:.6}s, distance={:.6e})",
-                frame_index + 1,
-                animation.frame_count,
-                sample.time_seconds,
-                sample.camera_distance.to_f64()
-            );
-            let frame_start = Instant::now();
-            let image = renderer
-                .render_frame_with_config(&sample.config, sample.index, sample.time_seconds as f32)
-                .with_context(|| {
-                    format!("failed to render {} frame {frame_index}", prepared.name)
-                })?;
-            let frame_seconds = frame_start.elapsed().as_secs_f64();
-            accumulated_frame_seconds += frame_seconds;
-            println!("Frame render time: {frame_seconds:.3}s");
-
-            let frame_path = animation_frame_path(output_directory, frame_index);
-            output::save_png(&frame_path, &image, request.overwrite)
-                .with_context(|| format!("failed to write {}", frame_path.display()))?;
-            println!("Saved: {}", frame_path.display());
-        }
-
-        let total_seconds = total_start.elapsed().as_secs_f64();
-        println!("Total render time: {total_seconds:.3}s");
+        let summary = session
+            .render_frames(
+                &scene,
+                &pending_frames,
+                None,
+                |start| {
+                    print_renderer_summary(&start.environment, &start.initial_config);
+                    println!("Frames to render: {}", start.frame_indices.len());
+                    Ok(())
+                },
+                |completed, total| {
+                    if completed < total {
+                        let frame_index = pending_frames[completed as usize];
+                        let sample = animation
+                            .sample(&prepared.config, frame_index)
+                            .with_context(|| {
+                                format!("could not sample animation frame {frame_index}")
+                            })?;
+                        println!(
+                            "Rendering frame {}/{} (t={:.6}s, distance={:.6e})",
+                            frame_index + 1,
+                            animation.frame_count,
+                            sample.time_seconds,
+                            sample.camera_distance.to_f64()
+                        );
+                    }
+                    Ok(())
+                },
+                |rendered| {
+                    accumulated_frame_seconds += rendered.render_seconds;
+                    println!("Frame render time: {:.3}s", rendered.render_seconds);
+                    let frame_path = sequence_frame_path(output_directory, rendered.frame.index);
+                    output::save_png(&frame_path, &rendered.image, request.overwrite)
+                        .with_context(|| format!("failed to write {}", frame_path.display()))?;
+                    println!("Saved: {}", frame_path.display());
+                    Ok(())
+                },
+            )
+            .with_context(|| format!("failed to render {} animation", prepared.name))?;
+        println!("Total render time: {:.3}s", summary.total_seconds);
         println!(
             "Average frame time: {:.3}s",
             accumulated_frame_seconds / pending_frames.len() as f64
@@ -1010,50 +909,23 @@ fn render_animation(
     Ok(())
 }
 
-fn create_renderer(config: RenderConfig, request: &RenderRequest) -> Result<Renderer> {
-    create_renderer_with_options(
-        config,
-        request.allow_software,
-        request.adapter.clone(),
-        request.gpu_duty_cycle,
-    )
-}
-
-fn create_renderer_with_options(
-    config: RenderConfig,
-    allow_software: bool,
-    adapter: Option<String>,
-    gpu_duty_cycle: Option<f64>,
-) -> Result<Renderer> {
-    pollster::block_on(Renderer::new_with_options(
-        config,
-        RendererOptions {
-            allow_software_adapter: allow_software,
-            adapter_name: adapter,
-            gpu_duty_cycle: gpu_duty_cycle_fraction(gpu_duty_cycle)?,
-        },
-    ))
-    .context("could not initialize the offscreen renderer")
-}
-
-fn print_renderer_summary(renderer: &Renderer, config: &RenderConfig) {
-    let adapter = renderer.adapter_info();
+fn print_renderer_summary(environment: &RenderEnvironment, config: &RenderConfig) {
     println!(
-        "Adapter: {} ({:?}, {:?})",
-        adapter.name, adapter.backend, adapter.device_type
+        "Adapter: {} ({}, {})",
+        environment.adapter_name, environment.backend, environment.device_type
     );
     println!(
         "Acceleration: {}",
-        if renderer.is_hardware_accelerated() {
+        if environment.hardware_accelerated {
             "hardware GPU"
         } else {
             "software (CPU)"
         }
     );
-    if let Some(duty_cycle) = renderer.gpu_duty_cycle() {
+    if let Some(duty_cycle) = environment.gpu_duty_cycle_percent {
         println!(
             "GPU duty-cycle cap: {:.1}% (average, strip-paced)",
-            duty_cycle * 100.0
+            duty_cycle
         );
     }
     println!("Fractal: {}", fractal_label(config.fractal.kind()));
@@ -1093,10 +965,6 @@ fn gpu_duty_cycle_fraction(percent: Option<f64>) -> Result<Option<f64>> {
     Ok(Some(percent / 100.0))
 }
 
-fn animation_frame_path(directory: &Path, frame_index: u32) -> PathBuf {
-    directory.join(format!("frame_{frame_index:06}.png"))
-}
-
 fn ensure_output_is_available(path: &Path, overwrite: bool) -> Result<()> {
     if !path.exists() || overwrite {
         return Ok(());
@@ -1118,7 +986,7 @@ fn plan_animation_outputs(
     let mut pending = Vec::with_capacity(requested_frames.len());
     let mut skipped = 0;
     for &frame_index in requested_frames {
-        let path = animation_frame_path(directory, frame_index);
+        let path = sequence_frame_path(directory, frame_index);
         if !path.exists() || overwrite {
             pending.push(frame_index);
             continue;
@@ -1129,22 +997,12 @@ fn plan_animation_outputs(
                 path.display()
             );
         }
-        let dimensions = output::png_dimensions(&path).with_context(|| {
+        validate_sequence_png(&path, width, height).with_context(|| {
             format!(
                 "existing frame {} is not a valid resumable PNG; use --overwrite to replace it",
                 path.display()
             )
         })?;
-        if dimensions != (width, height) {
-            bail!(
-                "existing frame {} is {}x{}, expected {}x{}; use --overwrite to replace it",
-                path.display(),
-                dimensions.0,
-                dimensions.1,
-                width,
-                height
-            );
-        }
         skipped += 1;
     }
     Ok((pending, skipped))
@@ -1157,23 +1015,13 @@ fn validate_complete_sequence(
     height: u32,
 ) -> Result<()> {
     for frame_index in 0..frame_count {
-        let path = animation_frame_path(directory, frame_index);
-        let dimensions = output::png_dimensions(&path).with_context(|| {
+        let path = sequence_frame_path(directory, frame_index);
+        validate_sequence_png(&path, width, height).with_context(|| {
             format!(
                 "animation frame {} is missing or invalid; PNG frames were preserved and FFmpeg was not started",
                 path.display()
             )
         })?;
-        if dimensions != (width, height) {
-            bail!(
-                "animation frame {} is {}x{}, expected {}x{}; PNG frames were preserved and FFmpeg was not started",
-                path.display(),
-                dimensions.0,
-                dimensions.1,
-                width,
-                height
-            );
-        }
     }
     Ok(())
 }
@@ -1423,9 +1271,15 @@ mod tests {
         assert_eq!(profile, PreviewProfile::Proof);
         assert_eq!(frames, vec![0, 180, 360]);
         assert!(watch);
+        let region = region.unwrap();
         assert_eq!(
-            region.unwrap().to_render_region(1_620, 1_080),
-            RenderRegion {
+            normalized_render_region(
+                1_620,
+                1_080,
+                Some([region.x, region.y, region.width, region.height])
+            )
+            .unwrap(),
+            fractal_renderer_core::RenderRegion {
                 x: 405,
                 y: 216,
                 width: 810,
@@ -1448,15 +1302,15 @@ mod tests {
             }),
         };
         assert_eq!(
-            preview_frame_indices(Some(&animation), None, &[]).unwrap(),
+            workflow_preview_frame_indices(Some(&animation), &[]).unwrap(),
             vec![0, 180, 360, 540, 720]
         );
         assert_eq!(
-            preview_frame_indices(Some(&animation), None, &[360, 0, 360]).unwrap(),
+            workflow_preview_frame_indices(Some(&animation), &[360, 0, 360]).unwrap(),
             vec![0, 360]
         );
-        assert!(preview_frame_indices(Some(&animation), Some(721), &[]).is_err());
-        assert!(preview_frame_indices(None, Some(1), &[]).is_err());
+        assert!(workflow_preview_frame_indices(Some(&animation), &[721]).is_err());
+        assert!(workflow_preview_frame_indices(None, &[1]).is_err());
     }
 
     #[test]
@@ -1471,15 +1325,20 @@ mod tests {
         source.quality.soft_shadow.max_steps = 128;
         source.quality.reflection.max_steps = 64;
 
-        let make_scene = || PreparedScene {
+        let make_scene = || LoadedScene {
             name: "preview-test".to_owned(),
             config: source.clone(),
             animation: None,
             video: None,
-            default_output: PathBuf::new(),
         };
         let mut composition = make_scene();
-        apply_preview_profile(&mut composition, PreviewProfile::Composition, None, None).unwrap();
+        apply_workflow_preview_profile(
+            &mut composition,
+            WorkflowPreviewProfile::Composition,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             (
                 composition.config.render.width,
@@ -1492,7 +1351,8 @@ mod tests {
         assert_eq!(composition.config.camera.aperture_radius, 0.0);
 
         let mut lookdev = make_scene();
-        apply_preview_profile(&mut lookdev, PreviewProfile::Lookdev, None, None).unwrap();
+        apply_workflow_preview_profile(&mut lookdev, WorkflowPreviewProfile::Lookdev, None, None)
+            .unwrap();
         assert_eq!(
             (lookdev.config.render.width, lookdev.config.render.height),
             (480, 320)
@@ -1503,7 +1363,8 @@ mod tests {
         assert_eq!(lookdev.config.quality.reflection.max_steps, 16);
 
         let mut proof = make_scene();
-        apply_preview_profile(&mut proof, PreviewProfile::Proof, None, None).unwrap();
+        apply_workflow_preview_profile(&mut proof, WorkflowPreviewProfile::Proof, None, None)
+            .unwrap();
         assert_eq!(
             (proof.config.render.width, proof.config.render.height),
             (810, 540)
@@ -1512,7 +1373,13 @@ mod tests {
         assert_eq!(proof.config.camera.aperture_radius, 0.015);
 
         let mut final_preview = make_scene();
-        apply_preview_profile(&mut final_preview, PreviewProfile::Final, None, None).unwrap();
+        apply_workflow_preview_profile(
+            &mut final_preview,
+            WorkflowPreviewProfile::Final,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(final_preview.config.render.width, 1_620);
         assert_eq!(final_preview.config.quality.samples_per_pixel, 128);
         assert_eq!(source.render.width, 1_620);
@@ -1773,7 +1640,7 @@ mod tests {
 
         render_animation(prepared, &RenderRequest::default(), &frames).unwrap();
         for frame_index in 0..3_u32 {
-            assert!(animation_frame_path(&frames, frame_index).exists());
+            assert!(sequence_frame_path(&frames, frame_index).exists());
         }
         let movie = frames.with_extension("mp4");
         assert!(std::fs::metadata(movie).unwrap().len() > 0);
@@ -1783,7 +1650,7 @@ mod tests {
     #[test]
     fn sequence_frame_names_are_ffmpeg_compatible() {
         assert_eq!(
-            animation_frame_path(Path::new("frames"), 120),
+            sequence_frame_path(Path::new("frames"), 120),
             PathBuf::from("frames/frame_000120.png")
         );
     }
@@ -1799,7 +1666,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&directory).unwrap();
-        let existing = animation_frame_path(&directory, 0);
+        let existing = sequence_frame_path(&directory, 0);
         image::save_buffer_with_format(
             &existing,
             &[0_u8; 4 * 4 * 3],

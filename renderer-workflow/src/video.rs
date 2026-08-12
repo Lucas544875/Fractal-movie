@@ -1,30 +1,49 @@
 use std::{
     ffi::OsString,
-    fs,
+    fs::{self, File},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
 use fractal_renderer_core::VideoConfig;
 
-#[derive(Debug)]
-pub struct VideoJob {
+/// A transport-independent FFmpeg image-sequence job shared by the CLI and
+/// agent workflow. Frame selection and project authorization stay in their
+/// respective adapters; process execution and atomic publication live here.
+#[derive(Clone, Debug)]
+pub struct VideoEncodeJob {
     pub ffmpeg: PathBuf,
     pub frames_directory: PathBuf,
     pub output_path: PathBuf,
     pub fps: u32,
+    pub start_frame: u32,
     pub frame_count: u32,
     pub config: VideoConfig,
     pub overwrite: bool,
+    /// Capture FFmpeg stderr here. `None` inherits the operator's stderr.
+    pub diagnostic_log: Option<PathBuf>,
+    /// Ask FFmpeg to print its normal progress statistics.
+    pub show_progress: bool,
 }
 
-impl VideoJob {
+#[derive(Clone, Debug)]
+pub struct VideoEncodeSummary {
+    pub output_path: PathBuf,
+    pub total_seconds: f64,
+}
+
+impl VideoEncodeJob {
     pub fn validate(&self, width: u32, height: u32) -> Result<()> {
         self.config.validate_dimensions(width, height)?;
         if self.fps == 0 || self.frame_count == 0 {
             bail!("video fps and frame_count must be greater than zero");
         }
+        self.start_frame
+            .checked_add(self.frame_count)
+            .context("video frame range overflows u32")?;
         if self.output_path.extension().is_none() {
             bail!(
                 "video output {} must have a container extension such as .mp4",
@@ -36,11 +55,13 @@ impl VideoJob {
                 bail!("video output {} is not a file", self.output_path.display());
             }
             if !self.overwrite {
-                bail!(
-                    "video output {} already exists; pass --video-overwrite (or --overwrite) to replace it",
-                    self.output_path.display()
-                );
+                bail!("video output {} already exists", self.output_path.display());
             }
+        }
+        if let Some(log) = &self.diagnostic_log
+            && log == &self.output_path
+        {
+            bail!("FFmpeg diagnostic log must differ from the video output");
         }
         Ok(())
     }
@@ -59,16 +80,21 @@ impl VideoJob {
                 output.status
             );
         }
-        let first_line = String::from_utf8_lossy(&output.stdout)
+        Ok(String::from_utf8_lossy(&output.stdout)
             .lines()
             .next()
             .unwrap_or("FFmpeg version unknown")
-            .to_owned();
-        Ok(first_line)
+            .to_owned())
     }
 
-    /// Encodes a complete image sequence. PNG inputs are never removed.
-    pub fn encode(&self) -> Result<()> {
+    pub fn encode(&self) -> Result<VideoEncodeSummary> {
+        self.encode_with_cancel(&|| false)
+    }
+
+    pub fn encode_with_cancel(&self, cancelled: &dyn Fn() -> bool) -> Result<VideoEncodeSummary> {
+        if cancelled() {
+            bail!("encode cancelled before FFmpeg started");
+        }
         if let Some(parent) = self
             .output_path
             .parent()
@@ -81,44 +107,90 @@ impl VideoJob {
                 )
             })?;
         }
-        let temporary_path = temporary_video_path(&self.output_path)?;
-        let status = Command::new(&self.ffmpeg)
-            .args(self.arguments(&temporary_path))
+        if let Some(log) = &self.diagnostic_log
+            && let Some(parent) = log.parent().filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("could not create FFmpeg log directory {}", parent.display())
+            })?;
+        }
+
+        let temporary = temporary_video_path(&self.output_path)?;
+        let stderr = match &self.diagnostic_log {
+            Some(path) => Stdio::from(
+                File::create(path)
+                    .with_context(|| format!("could not create {}", path.display()))?,
+            ),
+            None => Stdio::inherit(),
+        };
+        let started = Instant::now();
+        let child = Command::new(&self.ffmpeg)
+            .args(self.arguments(&temporary))
             .stdin(Stdio::null())
-            .status();
-        let status = match status {
-            Ok(status) => status,
+            .stdout(Stdio::null())
+            .stderr(stderr)
+            .spawn();
+        let mut child = match child {
+            Ok(child) => child,
             Err(error) => {
-                let _ = fs::remove_file(&temporary_path);
+                let _ = fs::remove_file(&temporary);
+                self.remove_diagnostic_log();
                 return Err(error)
                     .with_context(|| format!("could not execute {}", self.ffmpeg.display()));
             }
         };
-        if !status.success() {
-            let _ = fs::remove_file(&temporary_path);
-            bail!(
-                "FFmpeg failed with status {status}; PNG frames remain in {}",
-                self.frames_directory.display()
-            );
+        loop {
+            if let Some(status) = child
+                .try_wait()
+                .context("could not inspect FFmpeg status")?
+            {
+                if !status.success() {
+                    let _ = fs::remove_file(&temporary);
+                    let diagnostic = self.diagnostic();
+                    let message = if diagnostic.is_empty() {
+                        format!(
+                            "FFmpeg failed with status {status}; PNG frames remain in {}",
+                            self.frames_directory.display()
+                        )
+                    } else {
+                        format!("FFmpeg failed with status {status}: {diagnostic}")
+                    };
+                    return Err(anyhow::anyhow!(message));
+                }
+                break;
+            }
+            if cancelled() {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = fs::remove_file(&temporary);
+                self.remove_diagnostic_log();
+                bail!("encode cancelled while FFmpeg was running");
+            }
+            thread::sleep(Duration::from_millis(100));
         }
-        move_completed_video(&temporary_path, &self.output_path, self.overwrite)?;
-        Ok(())
+        publish_video(&temporary, &self.output_path, self.overwrite)?;
+        self.remove_diagnostic_log();
+        Ok(VideoEncodeSummary {
+            output_path: self.output_path.clone(),
+            total_seconds: started.elapsed().as_secs_f64(),
+        })
     }
 
-    fn arguments(&self, temporary_path: &Path) -> Vec<OsString> {
-        let input_pattern = self.frames_directory.join("frame_%06d.png");
-        let mut arguments = vec![
-            "-hide_banner".into(),
-            "-loglevel".into(),
-            "warning".into(),
-            "-stats".into(),
+    fn arguments(&self, temporary: &Path) -> Vec<OsString> {
+        let mut arguments = vec!["-hide_banner".into(), "-loglevel".into(), "warning".into()];
+        if self.show_progress {
+            arguments.push("-stats".into());
+        }
+        arguments.extend([
             "-y".into(),
             "-framerate".into(),
             self.fps.to_string().into(),
             "-start_number".into(),
-            "0".into(),
+            self.start_frame.to_string().into(),
             "-i".into(),
-            input_pattern.into_os_string(),
+            self.frames_directory
+                .join("frame_%06d.png")
+                .into_os_string(),
             "-frames:v".into(),
             self.frame_count.to_string().into(),
             "-an".into(),
@@ -130,12 +202,29 @@ impl VideoJob {
             self.config.crf.to_string().into(),
             "-preset".into(),
             self.config.preset.clone().into(),
-        ];
+        ]);
         if self.config.faststart {
             arguments.extend([OsString::from("-movflags"), OsString::from("+faststart")]);
         }
-        arguments.push(temporary_path.as_os_str().to_owned());
+        arguments.push(temporary.as_os_str().to_owned());
         arguments
+    }
+
+    fn diagnostic(&self) -> String {
+        self.diagnostic_log
+            .as_ref()
+            .and_then(|path| fs::read_to_string(path).ok())
+            .unwrap_or_default()
+            .trim()
+            .chars()
+            .take(2_000)
+            .collect()
+    }
+
+    fn remove_diagnostic_log(&self) {
+        if let Some(path) = &self.diagnostic_log {
+            let _ = fs::remove_file(path);
+        }
     }
 }
 
@@ -151,13 +240,10 @@ fn temporary_video_path(output_path: &Path) -> Result<PathBuf> {
     Ok(output_path.with_file_name(format!(".{stem}.{}.tmp.{extension}", std::process::id())))
 }
 
-fn move_completed_video(temporary: &Path, output: &Path, overwrite: bool) -> Result<()> {
+fn publish_video(temporary: &Path, output: &Path, overwrite: bool) -> Result<()> {
     if output.exists() && !overwrite {
         let _ = fs::remove_file(temporary);
-        bail!(
-            "video output {} appeared while encoding; pass --video-overwrite (or --overwrite) to replace it",
-            output.display()
-        );
+        bail!("video output {} appeared while encoding", output.display());
     }
     let mut moved = fs::rename(temporary, output);
     if moved.is_err() && overwrite && output.is_file() {
@@ -178,19 +264,30 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn ffmpeg_arguments_preserve_paths_and_bound_the_frame_count() {
-        let job = VideoJob {
+    fn job() -> VideoEncodeJob {
+        VideoEncodeJob {
             ffmpeg: "ffmpeg".into(),
             frames_directory: "frames with spaces".into(),
             output_path: "movie.mp4".into(),
             fps: 60,
+            start_frame: 120,
             frame_count: 1_621,
             config: VideoConfig::default(),
             overwrite: false,
-        };
-        let arguments = job.arguments(Path::new(".movie.123.tmp.mp4"));
+            diagnostic_log: None,
+            show_progress: true,
+        }
+    }
+
+    #[test]
+    fn ffmpeg_arguments_preserve_paths_and_bound_the_frame_range() {
+        let arguments = job().arguments(Path::new(".movie.123.tmp.mp4"));
         assert!(arguments.contains(&OsString::from("frames with spaces/frame_%06d.png")));
+        let start = arguments
+            .iter()
+            .position(|argument| argument == "-start_number")
+            .unwrap();
+        assert_eq!(arguments[start + 1], "120");
         let frame_limit = arguments
             .iter()
             .position(|argument| argument == "-frames:v")
@@ -214,13 +311,13 @@ mod tests {
 
     #[test]
     #[ignore = "requires FFmpeg"]
-    fn ffmpeg_encodes_sequence_and_failure_preserves_png_frames() {
+    fn ffmpeg_failure_preserves_frames_and_an_existing_video() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let directory = std::env::temp_dir().join(format!(
-            "fractal-renderer-ffmpeg-{}-{nonce}",
+            "fractal-workflow-ffmpeg-{}-{nonce}",
             std::process::id()
         ));
         fs::create_dir_all(&directory).unwrap();
@@ -242,23 +339,24 @@ mod tests {
         }
 
         let movie = directory.join("movie.mp4");
-        let job = VideoJob {
+        let job = VideoEncodeJob {
             ffmpeg: "ffmpeg".into(),
             frames_directory: directory.clone(),
             output_path: movie.clone(),
             fps: 2,
+            start_frame: 0,
             frame_count: 3,
             config: VideoConfig::default(),
             overwrite: false,
+            diagnostic_log: Some(directory.join("ffmpeg.log")),
+            show_progress: false,
         };
         job.validate(64, 36).unwrap();
         assert!(job.ffmpeg_version().unwrap().starts_with("ffmpeg version"));
         job.encode().unwrap();
-        assert!(fs::metadata(&movie).unwrap().len() > 0);
         let completed_movie = fs::read(&movie).unwrap();
 
-        let failed_job = VideoJob {
-            output_path: movie.clone(),
+        let failed_job = VideoEncodeJob {
             config: VideoConfig {
                 codec: "not_a_real_encoder".to_owned(),
                 ..VideoConfig::default()
@@ -275,7 +373,6 @@ mod tests {
                     .exists()
             );
         }
-
         fs::remove_dir_all(directory).unwrap();
     }
 }

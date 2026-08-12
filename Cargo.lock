@@ -356,6 +356,7 @@ dependencies = [
  "anyhow",
  "clap",
  "fractal-renderer-core",
+ "fractal-renderer-workflow",
  "image",
  "pollster",
 ]

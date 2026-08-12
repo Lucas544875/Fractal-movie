@@ -5,12 +5,11 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use fractal_renderer_core::{AnimationFrame, LoadedScene, Renderer, RendererOptions};
 use image::RgbaImage;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Artifact, ProjectStore, RenderEnvironment,
+    Artifact, FrameRenderSession, ProjectStore, RenderEnvironment, RendererPolicy,
     artifact::{save_png_atomic, write_atomic},
     project::unix_time_ms,
 };
@@ -140,38 +139,33 @@ pub(crate) fn render_sequence_with_progress(
 
     let total_started = Instant::now();
     let mut environment = None;
-    if let Some(&first_index) = pending.first() {
-        let first = sample_frame(&scene, first_index)?;
-        let renderer = pollster::block_on(Renderer::new_with_options(
-            first.config.clone(),
-            RendererOptions {
-                allow_software_adapter: request.allow_software,
-                adapter_name: request.adapter.clone(),
-                gpu_duty_cycle: request.gpu_duty_cycle.map(|percent| percent / 100.0),
-            },
-        ))
-        .context("could not initialize final renderer")?;
-        environment = Some(RenderEnvironment::from_renderer(&renderer));
-        let total = pending.len() as u32;
-        for (position, frame_index) in pending.iter().copied().enumerate() {
-            progress(position as u32, total)?;
-            let frame = if frame_index == first.index {
-                first.clone()
-            } else {
-                sample_frame(&scene, frame_index)?
-            };
-            let rendered = renderer
-                .render_frame_with_config(&frame.config, frame.index, frame.time_seconds as f32)
-                .with_context(|| format!("failed to render frame {frame_index}"))?;
-            let image = RgbaImage::from_raw(
-                rendered.width(),
-                rendered.height(),
-                rendered.pixels().to_vec(),
+    if !pending.is_empty() {
+        let mut session = FrameRenderSession::new(RendererPolicy {
+            allow_software: request.allow_software,
+            adapter: request.adapter.clone(),
+            gpu_duty_cycle: request.gpu_duty_cycle,
+        })?;
+        session
+            .render_frames(
+                &scene,
+                &pending,
+                None,
+                |start| {
+                    environment = Some(start.environment.clone());
+                    Ok(())
+                },
+                &mut *progress,
+                |rendered| {
+                    let image = RgbaImage::from_raw(
+                        rendered.image.width(),
+                        rendered.image.height(),
+                        rendered.image.pixels().to_vec(),
+                    )
+                    .context("renderer returned an invalid RGBA image")?;
+                    save_png_atomic(&frame_path(frames_directory, rendered.frame.index), &image)
+                },
             )
-            .context("renderer returned an invalid RGBA image")?;
-            save_png_atomic(&frame_path(frames_directory, frame_index), &image)?;
-        }
-        progress(total, total)?;
+            .context("could not execute final render frames")?;
     }
 
     let mut sequence_artifact =
@@ -205,11 +199,11 @@ pub fn read_sequence_manifest(frames_directory: &Path) -> Result<SequenceManifes
         .with_context(|| format!("sequence manifest {} is invalid", path.display()))
 }
 
-pub(crate) fn frame_path(directory: &Path, frame_index: u32) -> PathBuf {
+pub fn frame_path(directory: &Path, frame_index: u32) -> PathBuf {
     directory.join(format!("frame_{frame_index:06}.png"))
 }
 
-pub(crate) fn validate_png(path: &Path, width: u32, height: u32) -> Result<()> {
+pub fn validate_png(path: &Path, width: u32, height: u32) -> Result<()> {
     let image = image::open(path)
         .with_context(|| format!("could not decode sequence frame {}", path.display()))?;
     if image.width() != width || image.height() != height {
@@ -271,24 +265,6 @@ fn prepare_sequence_manifest(
     let bytes = serde_json::to_vec_pretty(expected)?;
     write_atomic(path, &bytes)?;
     Ok(expected.clone())
-}
-
-fn sample_frame(scene: &LoadedScene, frame_index: u32) -> Result<AnimationFrame> {
-    if let Some(animation) = &scene.animation {
-        return animation.sample(&scene.config, frame_index);
-    }
-    if frame_index != 0 {
-        bail!("static scene has only frame 0");
-    }
-    let camera_distance = (scene.config.camera.target - scene.config.camera.position)
-        .length_squared()
-        .sqrt();
-    Ok(AnimationFrame {
-        index: 0,
-        time_seconds: 0.0,
-        camera_distance,
-        config: scene.config.clone(),
-    })
 }
 
 #[cfg(test)]

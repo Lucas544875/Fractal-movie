@@ -13,6 +13,6 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 fractal-renderer-core = { path = "../renderer-core" }
+fractal-renderer-workflow = { path = "../renderer-workflow" }
 image.workspace = true
 pollster.workspace = true
-

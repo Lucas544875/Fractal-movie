@@ -1,11 +1,6 @@
 use std::{
-    ffi::OsString,
     fs,
-    fs::File,
     path::{Component, Path, PathBuf},
-    process::{Command, Stdio},
-    thread,
-    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -13,7 +8,7 @@ use fractal_renderer_core::VideoConfig;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Artifact, ProjectStore,
+    Artifact, ProjectStore, VideoEncodeJob,
     render::{SequenceManifest, frame_path, read_sequence_manifest, validate_png},
 };
 
@@ -103,59 +98,34 @@ pub(crate) fn encode_sequence(
     if output.exists() {
         bail!("encode output {} already exists", output.display());
     }
-    let temporary = temporary_video_path(&output)?;
     let ffmpeg_log = output_directory.join("ffmpeg.stderr.log");
-    let stderr = File::create(&ffmpeg_log)
-        .with_context(|| format!("could not create {}", ffmpeg_log.display()))?;
     let ffmpeg = request
         .ffmpeg
         .clone()
         .unwrap_or_else(|| PathBuf::from("ffmpeg"));
-    verify_ffmpeg(&ffmpeg)?;
     let frame_count = end_frame - start_frame + 1;
-    let started = Instant::now();
-    let mut child = Command::new(&ffmpeg)
-        .args(ffmpeg_arguments(
-            frames_directory,
-            &temporary,
-            sequence.fps,
-            start_frame,
-            frame_count,
-            &video,
-        ))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr))
-        .spawn()
-        .with_context(|| format!("could not execute {}", ffmpeg.display()))?;
-    loop {
-        if let Some(status) = child
-            .try_wait()
-            .context("could not inspect FFmpeg status")?
-        {
-            if !status.success() {
-                let _ = fs::remove_file(&temporary);
-                let diagnostic = fs::read_to_string(&ffmpeg_log).unwrap_or_default();
-                bail!(
-                    "FFmpeg failed with status {status}: {}",
-                    diagnostic.trim().chars().take(2_000).collect::<String>()
-                );
-            }
-            break;
-        }
-        if cancelled() {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = fs::remove_file(&temporary);
-            let _ = fs::remove_file(&ffmpeg_log);
-            bail!("encode cancelled while FFmpeg was running");
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    fs::rename(&temporary, &output)
-        .with_context(|| format!("could not publish video {}", output.display()))?;
-    let _ = fs::remove_file(&ffmpeg_log);
-    let mut artifact = Artifact::from_file("video", video_media_type(&output), output)?;
+    let job = VideoEncodeJob {
+        ffmpeg,
+        frames_directory: frames_directory.to_owned(),
+        output_path: output,
+        fps: sequence.fps,
+        start_frame,
+        frame_count,
+        config: video,
+        overwrite: false,
+        diagnostic_log: Some(ffmpeg_log),
+        show_progress: false,
+    };
+    job.validate(sequence.width, sequence.height)
+        .context("invalid effective video configuration")?;
+    job.ffmpeg_version()
+        .context("FFmpeg is unavailable for the requested encode")?;
+    let summary = job.encode_with_cancel(cancelled)?;
+    let mut artifact = Artifact::from_file(
+        "video",
+        video_media_type(&summary.output_path),
+        summary.output_path,
+    )?;
     artifact.metadata.insert(
         "selection".to_owned(),
         serde_json::json!({"start_frame": start_frame, "end_frame": end_frame}),
@@ -167,7 +137,7 @@ pub(crate) fn encode_sequence(
         start_frame,
         frame_count,
         output: artifact,
-        total_seconds: started.elapsed().as_secs_f64(),
+        total_seconds: summary.total_seconds,
     })
 }
 
@@ -254,58 +224,6 @@ fn select_frames(
     }
 }
 
-fn verify_ffmpeg(ffmpeg: &Path) -> Result<()> {
-    let status = Command::new(ffmpeg)
-        .arg("-version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .with_context(|| format!("could not execute {}", ffmpeg.display()))?;
-    if !status.success() {
-        bail!("{} -version failed with status {status}", ffmpeg.display());
-    }
-    Ok(())
-}
-
-fn ffmpeg_arguments(
-    frames_directory: &Path,
-    temporary: &Path,
-    fps: u32,
-    start_frame: u32,
-    frame_count: u32,
-    config: &VideoConfig,
-) -> Vec<OsString> {
-    let mut arguments = vec![
-        "-hide_banner".into(),
-        "-loglevel".into(),
-        "warning".into(),
-        "-y".into(),
-        "-framerate".into(),
-        fps.to_string().into(),
-        "-start_number".into(),
-        start_frame.to_string().into(),
-        "-i".into(),
-        frames_directory.join("frame_%06d.png").into_os_string(),
-        "-frames:v".into(),
-        frame_count.to_string().into(),
-        "-an".into(),
-        "-c:v".into(),
-        config.codec.clone().into(),
-        "-pix_fmt".into(),
-        config.pixel_format.clone().into(),
-        "-crf".into(),
-        config.crf.to_string().into(),
-        "-preset".into(),
-        config.preset.clone().into(),
-    ];
-    if config.faststart {
-        arguments.extend([OsString::from("-movflags"), OsString::from("+faststart")]);
-    }
-    arguments.push(temporary.as_os_str().to_owned());
-    arguments
-}
-
 fn default_output_name(sequence: &SequenceManifest, start: u32, end: u32) -> String {
     if start == 0 && end + 1 == sequence.frame_count {
         format!("{}.mp4", sequence.revision_id)
@@ -324,18 +242,6 @@ fn validate_output_name(name: &str) -> Result<()> {
         bail!("encode output_name must be one file name with a container extension");
     }
     Ok(())
-}
-
-fn temporary_video_path(output: &Path) -> Result<PathBuf> {
-    let stem = output
-        .file_stem()
-        .context("video output must have a file stem")?
-        .to_string_lossy();
-    let extension = output
-        .extension()
-        .context("video output must have an extension")?
-        .to_string_lossy();
-    Ok(output.with_file_name(format!(".{stem}.{}.tmp.{extension}", std::process::id())))
 }
 
 fn video_media_type(output: &Path) -> &'static str {

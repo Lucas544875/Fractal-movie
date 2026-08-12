@@ -632,9 +632,9 @@ WGPU_BACKEND=gl cargo run --release -p fractal-renderer-cli -- render \
 │       ├── scene_file.rs        # versioned YAML schema / validation
 │       └── ...                  # config、wgpu、readback
 ├── renderer-cli/
-│   └── src/                      # 既存の人間向けCLI
+│   └── src/                      # workflowを利用する人間向けCLI adapter
 ├── renderer-workflow/
-│   └── src/                      # revision、job、preview、render、encode、artifact
+│   └── src/                      # 共通frame/FFmpeg実行、revision、job、preview、render、artifact
 ├── renderer-harness/
 │   └── src/                      # LLM向けJSONL tool protocolとresource policy
 ├── docs/
