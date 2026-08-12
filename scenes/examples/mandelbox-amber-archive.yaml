@@ -1,0 +1,125 @@
+version: 1
+name: mandelbox-amber-archive
+precision: f32
+seed: 20260811
+
+# "Amber Archive" studies one analytically stable axial feature across almost
+# six orders of magnitude. The sixteen-second dive starts immediately and
+# moves slowly enough to hold each -2.18 self-similar layer for roughly one
+# second instead of turning the recursion into motion blur.
+camera:
+  position: [13.28, 0.0, 0.0]
+  target: [2.28, 0.0, 0.0]
+  up: [0.0, 0.0, 1.0]
+  vertical_fov_degrees: 28.0
+  # The animation scales aperture and focus with camera distance. The small
+  # initial aperture separates the full form without hiding surface relief.
+  aperture_radius: 0.018
+  focus_distance: 11.0
+
+# The typed DSL retains the classic Mandelbox geometry while exposing a
+# restrained gold/blue-grey material. Normal-dependent colour is deliberately
+# strong: it makes folds readable even when a repeated cell fills the frame.
+fractal:
+  kind: dsl
+  parameters:
+    iterations: 24
+    normal_epsilon: 2.0e-9
+    orbit:
+      - op: box-fold
+        limit: 1.14
+      - op: sphere-fold
+        min_radius_squared: 0.60
+        fixed_radius_squared: 2.65
+      - op: scale-add-point
+        scale: -2.18
+    material:
+      base_color: [0.002, 0.090, 0.150]
+      accent_color: [1.100, 0.520, 0.035]
+      specular_color: [0.850, 1.050, 1.200]
+      background_bottom: [0.0005, 0.0020, 0.0040]
+      background_top: [0.0040, 0.0260, 0.0380]
+      color_frequency: 6.0
+      surface_palette: []
+      orbit_palette_weight: 0.0
+      palette_offset: 0.0
+      camera_palette_weight: 1.0
+      normal_palette_weight: 0.38
+      ambient_strength: 0.16
+      diffuse_strength: 1.0
+      specular_strength: 0.28
+      shininess: 72.0
+      metallic_specular_strength: 0.0
+      metallic_shininess: 30.0
+      rim_strength: 0.12
+      fog_density: 0.0003
+
+# The high lateral key alternates cool recesses with amber-facing ridges. It
+# was selected over the more colourful candidate because fine edge density
+# remained twice as high at the final representative frame.
+light:
+  direction: [0.6, 0.8, 1.8]
+
+render:
+  width: 1920
+  height: 1080
+  max_steps: 512
+  max_distance: 60.0
+  epsilon: 2.0e-10
+  step_safety: 0.90
+  pixel_epsilon_multiplier: 1.05
+
+quality:
+  samples_per_pixel: 96
+  ambient_occlusion:
+    max_steps: 64
+    radius: 1.0
+    strength: 0.68
+  soft_shadow:
+    max_steps: 80
+    angular_radius_degrees: 1.2
+    max_distance: 18.0
+  # Reflection was removed: it consumed budget and made the recursive relief
+  # less legible. Samples are spent on clean lens, AO, and shadow integration.
+  reflection:
+    max_steps: 0
+    max_distance: 14.0
+    strength: 0.0
+    roughness: 0.04
+  tone_mapping:
+    enabled: true
+    operator: extended-reinhard
+    exposure_stops: -0.55
+    white_point: 4.5
+    brightness: 1.0
+    contrast: 1.0
+    gamma: 1.0
+    saturation: 1.0
+  post_process:
+    enabled: true
+    exposure_stops: 0.0
+    contrast: 1.16
+    saturation: 0.98
+    gamma: 0.98
+    vignette_strength: 0.10
+
+# 16 seconds at 24 fps, including both endpoints. On the harness host's RTX
+# 3070 at 80% GPU duty, the slowest tested final frame took 8.384 seconds:
+# 385 * 8.384 s = 53.8 minutes. A 2x contingency remains below 1 h 48 min.
+animation:
+  fps: 24
+  frame_count: 385
+  path:
+    kind: exponential-dive
+    parameters:
+      overview_distance: "11"
+      minimum_distance: "2e-5"
+      overview_duration: 0.0
+      dive_duration: 16.0
+
+video:
+  codec: libx264
+  pixel_format: yuv420p
+  crf: 15
+  preset: slow
+  faststart: true
