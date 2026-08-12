@@ -1,4 +1,9 @@
-use std::{borrow::Cow, sync::mpsc};
+use std::{
+    borrow::Cow,
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, anyhow};
 use bytemuck::{Pod, Zeroable};
@@ -12,6 +17,9 @@ const BYTES_PER_PIXEL: u32 = 4;
 /// operating system's graphics watchdog. Fragment positions remain global
 /// because scissoring does not change the render target coordinate system.
 const MAX_FRAGMENT_INVOCATIONS_PER_SUBMISSION: u32 = 131_072;
+/// A duty-cycle cap needs shorter submissions so it can yield to other GPU
+/// clients regularly instead of alternating multi-second bursts and sleeps.
+const MAX_THROTTLED_FRAGMENT_INVOCATIONS_PER_SUBMISSION: u32 = 16_384;
 
 /// Controls which adapter may be used by [`Renderer`].
 #[derive(Clone, Debug, Default)]
@@ -26,6 +34,24 @@ pub struct RendererOptions {
     /// When omitted, `WGPU_ADAPTER_NAME` is used if it is set. Otherwise the
     /// highest-ranked hardware adapter is selected.
     pub adapter_name: Option<String>,
+    /// Average fraction of wall time this renderer may keep the GPU busy.
+    ///
+    /// Values are in `0.01..=1.0`. Each completed render strip is followed by
+    /// a proportional host-side pause. This bounds this renderer's average
+    /// duty cycle; it does not control instantaneous hardware utilization or
+    /// account for unrelated GPU processes.
+    pub gpu_duty_cycle: Option<f64>,
+}
+
+impl RendererOptions {
+    fn validate(&self) -> Result<()> {
+        if let Some(duty_cycle) = self.gpu_duty_cycle
+            && (!duty_cycle.is_finite() || !(0.01..=1.0).contains(&duty_cycle))
+        {
+            return Err(anyhow!("GPU duty cycle must be finite and in 0.01..=1.0"));
+        }
+        Ok(())
+    }
 }
 
 /// Returns whether an adapter is known to be backed by software rendering.
@@ -237,6 +263,7 @@ pub struct Renderer {
     target: wgpu::Texture,
     readback_buffer: wgpu::Buffer,
     padded_bytes_per_row: u32,
+    gpu_duty_cycle: Option<f64>,
 }
 
 impl Renderer {
@@ -262,6 +289,7 @@ impl Renderer {
     /// Initializes the renderer with an explicit adapter policy.
     pub async fn new_with_options(config: RenderConfig, options: RendererOptions) -> Result<Self> {
         config.validate().context("invalid render configuration")?;
+        options.validate().context("invalid renderer options")?;
 
         let (instance, backends) = create_instance();
         let adapter = select_adapter(&instance, backends, &options).await?;
@@ -396,6 +424,7 @@ impl Renderer {
             target,
             readback_buffer,
             padded_bytes_per_row,
+            gpu_duty_cycle: options.gpu_duty_cycle,
         })
     }
 
@@ -408,6 +437,12 @@ impl Renderer {
     #[must_use]
     pub fn is_hardware_accelerated(&self) -> bool {
         !adapter_is_software(&self.adapter_info)
+    }
+
+    /// Configured average GPU duty-cycle cap, as a fraction in `0.01..=1.0`.
+    #[must_use]
+    pub const fn gpu_duty_cycle(&self) -> Option<f64> {
+        self.gpu_duty_cycle
     }
 
     /// Renders one deterministic frame and reads it back from GPU memory.
@@ -458,10 +493,18 @@ impl Renderer {
         let view = self
             .target
             .create_view(&wgpu::TextureViewDescriptor::default());
-        for (strip_index, (strip_y, strip_height)) in
-            render_strips(self.config.render.width, self.config.render.height)
-                .into_iter()
-                .enumerate()
+        let fragment_limit = if self.gpu_duty_cycle.is_some_and(|limit| limit < 1.0) {
+            MAX_THROTTLED_FRAGMENT_INVOCATIONS_PER_SUBMISSION
+        } else {
+            MAX_FRAGMENT_INVOCATIONS_PER_SUBMISSION
+        };
+        for (strip_index, (strip_y, strip_height)) in render_strips_with_limit(
+            self.config.render.width,
+            self.config.render.height,
+            fragment_limit,
+        )
+        .into_iter()
+        .enumerate()
         {
             let mut encoder = self
                 .device
@@ -496,10 +539,14 @@ impl Renderer {
                 pass.set_scissor_rect(0, strip_y, self.config.render.width, strip_height);
                 pass.draw(0..3, 0..1);
             }
+            let gpu_work_started = Instant::now();
             self.queue.submit([encoder.finish()]);
             self.device
                 .poll(wgpu::PollType::wait_indefinitely())
                 .context("failed while waiting for a GPU render strip")?;
+            if let Some(duty_cycle) = self.gpu_duty_cycle {
+                thread::sleep(throttle_delay(gpu_work_started.elapsed(), duty_cycle));
+            }
         }
 
         let mut encoder = self
@@ -554,12 +601,23 @@ impl Renderer {
     }
 }
 
-fn render_strips(width: u32, height: u32) -> Vec<(u32, u32)> {
-    let strip_height = (MAX_FRAGMENT_INVOCATIONS_PER_SUBMISSION / width).max(1);
+fn render_strips_with_limit(
+    width: u32,
+    height: u32,
+    max_fragment_invocations: u32,
+) -> Vec<(u32, u32)> {
+    let strip_height = (max_fragment_invocations / width).max(1);
     (0..height)
         .step_by(strip_height as usize)
         .map(|y| (y, strip_height.min(height - y)))
         .collect()
+}
+
+fn throttle_delay(active_time: Duration, duty_cycle: f64) -> Duration {
+    if duty_cycle >= 1.0 || active_time.is_zero() {
+        return Duration::ZERO;
+    }
+    active_time.mul_f64((1.0 - duty_cycle) / duty_cycle)
 }
 
 fn create_instance() -> (wgpu::Instance, wgpu::Backends) {
@@ -681,7 +739,7 @@ mod tests {
     #[test]
     fn render_height_is_split_into_watchdog_safe_strips() {
         assert_eq!(
-            render_strips(1_620, 1_080),
+            render_strips_with_limit(1_620, 1_080, MAX_FRAGMENT_INVOCATIONS_PER_SUBMISSION),
             vec![
                 (0, 80),
                 (80, 80),
@@ -699,8 +757,54 @@ mod tests {
                 (1_040, 40),
             ]
         );
-        assert_eq!(render_strips(256, 256), vec![(0, 256)]);
-        assert_eq!(render_strips(200_000, 2), vec![(0, 1), (1, 1)]);
+        assert_eq!(
+            render_strips_with_limit(256, 256, MAX_FRAGMENT_INVOCATIONS_PER_SUBMISSION),
+            vec![(0, 256)]
+        );
+        assert_eq!(
+            render_strips_with_limit(200_000, 2, MAX_FRAGMENT_INVOCATIONS_PER_SUBMISSION),
+            vec![(0, 1), (1, 1)]
+        );
+    }
+
+    #[test]
+    fn throttled_rendering_uses_shorter_strips() {
+        let strips = render_strips_with_limit(
+            1_620,
+            1_080,
+            MAX_THROTTLED_FRAGMENT_INVOCATIONS_PER_SUBMISSION,
+        );
+        assert_eq!(strips.len(), 108);
+        assert_eq!(strips.first(), Some(&(0, 10)));
+        assert_eq!(strips.last(), Some(&(1_070, 10)));
+    }
+
+    #[test]
+    fn throttle_delay_enforces_the_requested_average_duty_cycle() {
+        assert_eq!(
+            throttle_delay(Duration::from_millis(100), 0.4),
+            Duration::from_millis(150)
+        );
+        assert_eq!(
+            throttle_delay(Duration::from_millis(100), 0.25),
+            Duration::from_millis(300)
+        );
+        assert_eq!(
+            throttle_delay(Duration::from_millis(100), 1.0),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn renderer_options_reject_invalid_duty_cycles() {
+        assert!(RendererOptions::default().validate().is_ok());
+        for duty_cycle in [0.0, 0.009, 1.001, f64::NAN, f64::INFINITY] {
+            let options = RendererOptions {
+                gpu_duty_cycle: Some(duty_cycle),
+                ..RendererOptions::default()
+            };
+            assert!(options.validate().is_err());
+        }
     }
 
     #[test]

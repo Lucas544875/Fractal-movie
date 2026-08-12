@@ -127,6 +127,10 @@ enum Command {
         #[arg(long)]
         height: Option<u32>,
 
+        /// Limit this renderer's average GPU duty cycle, as a percentage.
+        #[arg(long, value_name = "PERCENT")]
+        gpu_duty_cycle: Option<f64>,
+
         /// Permit CPU/software rendering when no hardware GPU is available.
         #[arg(long)]
         allow_software: bool,
@@ -176,6 +180,7 @@ fn run() -> Result<()> {
             seed,
             width,
             height,
+            gpu_duty_cycle,
             allow_software,
             adapter,
         } => render(RenderRequest {
@@ -201,6 +206,7 @@ fn run() -> Result<()> {
             seed,
             width,
             height,
+            gpu_duty_cycle,
             allow_software,
             adapter,
         }),
@@ -232,6 +238,7 @@ struct RenderRequest {
     seed: Option<u32>,
     width: Option<u32>,
     height: Option<u32>,
+    gpu_duty_cycle: Option<f64>,
     allow_software: bool,
     adapter: Option<String>,
 }
@@ -327,6 +334,7 @@ fn resolve_video_job(
 }
 
 fn render(request: RenderRequest) -> Result<()> {
+    gpu_duty_cycle_fraction(request.gpu_duty_cycle)?;
     let prepared = prepare_scene(
         request.scene.as_deref(),
         request.fractal,
@@ -550,6 +558,7 @@ fn create_renderer(config: RenderConfig, request: &RenderRequest) -> Result<Rend
         RendererOptions {
             allow_software_adapter: request.allow_software,
             adapter_name: request.adapter.clone(),
+            gpu_duty_cycle: gpu_duty_cycle_fraction(request.gpu_duty_cycle)?,
         },
     ))
     .context("could not initialize the offscreen renderer")
@@ -569,6 +578,12 @@ fn print_renderer_summary(renderer: &Renderer, config: &RenderConfig) {
             "software (CPU)"
         }
     );
+    if let Some(duty_cycle) = renderer.gpu_duty_cycle() {
+        println!(
+            "GPU duty-cycle cap: {:.1}% (average, strip-paced)",
+            duty_cycle * 100.0
+        );
+    }
     println!("Fractal: {}", fractal_label(config.fractal.kind()));
     println!("Precision: {}", precision_label(config.precision));
     println!(
@@ -594,6 +609,16 @@ fn print_renderer_summary(renderer: &Renderer, config: &RenderConfig) {
 
 const fn enabled_label(enabled: bool) -> &'static str {
     if enabled { "on" } else { "off" }
+}
+
+fn gpu_duty_cycle_fraction(percent: Option<f64>) -> Result<Option<f64>> {
+    let Some(percent) = percent else {
+        return Ok(None);
+    };
+    if !percent.is_finite() || !(1.0..=100.0).contains(&percent) {
+        bail!("--gpu-duty-cycle must be finite and in 1.0..=100.0 percent");
+    }
+    Ok(Some(percent / 100.0))
 }
 
 fn animation_frame_path(directory: &Path, frame_index: u32) -> PathBuf {
@@ -880,6 +905,23 @@ mod tests {
 
     use super::*;
     use fractal_renderer_core::{AnimationPath, ExponentialDivePath};
+
+    #[test]
+    fn parses_and_validates_gpu_duty_cycle_percentages() {
+        let cli =
+            Cli::try_parse_from(["fractal-render", "render", "--gpu-duty-cycle", "37.5"]).unwrap();
+        let Command::Render { gpu_duty_cycle, .. } = cli.command else {
+            panic!("render subcommand must parse");
+        };
+        assert_eq!(
+            gpu_duty_cycle_fraction(gpu_duty_cycle).unwrap(),
+            Some(0.375)
+        );
+        assert_eq!(gpu_duty_cycle_fraction(None).unwrap(), None);
+        for invalid in [0.0, 0.99, 100.01, f64::NAN, f64::INFINITY] {
+            assert!(gpu_duty_cycle_fraction(Some(invalid)).is_err());
+        }
+    }
 
     #[test]
     fn built_in_defaults_remain_backwards_compatible() {

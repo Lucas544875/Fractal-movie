@@ -70,6 +70,18 @@ WSLではWindows側の対応GPUドライバー、WSL2、`/dev/dxg` が必要で�
 cargo run -p fractal-renderer-cli -- render --allow-software
 ```
 
+### GPUデューティ比の制限
+
+対話作業中にoffline renderがGPUを占有し続けないよう、`--gpu-duty-cycle`でこのrendererの平均GPU稼働時間を1〜100%に制限できます。たとえば40%では、各GPU stripに100 msかかった場合、その完了後に150 ms休止します。制限中はstripも短く分割されるため、ほかのGPU clientへ定期的に実行機会を返します。
+
+```bash
+cargo run --release -p fractal-renderer-cli -- render \
+  scenes/examples/alchemy-pseudo-kleinian-target-orbit.yaml \
+  --gpu-duty-cycle 40
+```
+
+これはstrip単位の平均デューティ比であり、処理中の瞬間的なhardware utilizationや、ほかのprocessを含むGPU全体の使用率を保証するものではありません。未指定時は休止を入れず従来どおり最大速度で描画し、`100`も休止なしになります。PNGと動画の画質・決定性は変わらず、設定値に応じて所要時間だけが増えます。
+
 ## Mandelbulb を1フレーム出力
 
 デフォルトは 640x360 の画像を `output/phase1/mandelbulb.png` に保存します。
