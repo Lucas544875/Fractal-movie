@@ -82,6 +82,55 @@ cargo run --release -p fractal-renderer-cli -- render \
 
 これはstrip単位の平均デューティ比であり、処理中の瞬間的なhardware utilizationや、ほかのprocessを含むGPU全体の使用率を保証するものではありません。未指定時は休止を入れず従来どおり最大速度で描画し、`100`も休止なしになります。PNGと動画の画質・決定性は変わらず、設定値に応じて所要時間だけが増えます。
 
+## 作業用プレビュー
+
+`preview`はsceneをメモリ上で一時的に軽量化し、元のYAMLを書き換えずに構図、軌道、色、照明、被写界深度を確認します。animationでframeを指定しなければ、始点、1/4、1/2、3/4、終点の代表5 frameを自動選択します。
+
+```bash
+cargo run --release -p fractal-renderer-cli -- preview \
+  scenes/examples/alchemy-pseudo-kleinian-target-orbit.yaml \
+  --profile composition
+```
+
+各profileは次の用途を想定しています。
+
+| profile | 既定の最大幅 | sampling / effect | 用途 |
+|---|---:|---|---|
+| `composition` | 320 px | 1 spp、DOF・AO・shadow・reflectionなし | camera、target、軌道、遮蔽 |
+| `lookdev` | 480 px | 最大8 spp、軽量AO・shadow、DOFなし | palette、material、light、tone mapping |
+| `proof` | 810 px | 最大32 spp、DOFと中品質の二次効果 | ボケ、highlight、最終印象 |
+| `final` | sceneの解像度 | sceneの設定をすべて維持 | 本番品質の部分確認 |
+
+任意frameは単数またはカンマ区切りで指定できます。出力先の既定値は`output/preview/<scene>/<profile>/`です。
+
+```bash
+# 代表位置を指定してlook development
+cargo run --release -p fractal-renderer-cli -- preview \
+  scenes/examples/alchemy-pseudo-kleinian-target-orbit.yaml \
+  --profile lookdev --frames 0,180,360,540
+
+# sceneのaspect ratioを保ったまま幅だけoverride
+cargo run --release -p fractal-renderer-cli -- preview \
+  scenes/examples/alchemy-pseudo-kleinian-target-orbit.yaml \
+  --profile proof --frame 180 --width 640
+```
+
+`--watch`は250 ms間隔でscene内容を監視し、保存後に同じframeを再描画します。camera、light、render parameterなどuniformだけの変更ではGPU pipelineとallocationを再利用します。fractal DSLのgeometryやmaterialはshader定数なので、その変更時だけpipelineを再構築します。編集中に一時的にYAMLが不正になっても監視は終了せず、次の保存を待ちます。
+
+```bash
+cargo run --release -p fractal-renderer-cli -- preview \
+  scenes/examples/alchemy-pseudo-kleinian-target-orbit.yaml \
+  --profile lookdev --frame 180 --watch --gpu-duty-cycle 60
+```
+
+`--region x,y,width,height`は左上を原点とする0〜1の正規化座標です。カメラを寄せるのではなく、完全なviewportの投影と画素密度を維持したまま指定範囲だけをGPUで描画します。下の例は本番解像度・本番品質で中央50%だけを確認し、計算対象を約1/4にします。cropは既定ではprofile directory内の`crop/`へ保存されるため、全画面previewを上書きしません。
+
+```bash
+cargo run --release -p fractal-renderer-cli -- preview \
+  scenes/examples/alchemy-pseudo-kleinian-target-orbit.yaml \
+  --profile final --frame 180 --region 0.25,0.25,0.5,0.5
+```
+
 ## Mandelbulb を1フレーム出力
 
 デフォルトは 640x360 の画像を `output/phase1/mandelbulb.png` に保存します。
@@ -532,7 +581,7 @@ WGPU_BACKEND=gl cargo run --release -p fractal-renderer-cli -- render \
   --output output/alchemy-pseudo-kleinian-preview.png --overwrite
 ```
 
-`scenes/examples/alchemy-pseudo-kleinian-target-orbit.yaml`は、視線中央の装飾表面を`camera.target`に固定した24秒・30 fpsの周回作例です。元のcamera位置と画面上方向から18度の円錐軸を逆算しているため、frame 0は静止画の構図をほぼそのまま再現します。fractal geometry、orbit palette、material、world-space light、FOV、tone mapping、post process、128 spp設定は静止画sceneと同一です。円錐が狭いため視点は元方向から最大36度の範囲に留まり、中央の被写体を見失わずに立体感を見せます。
+`scenes/examples/alchemy-pseudo-kleinian-target-orbit.yaml`は、視線中央の装飾表面を`camera.target`に固定した24秒・30 fpsの周回作例です。frame 0の`camera.up`を鉛直軸とする大円上を50度進むため、画面を水平に保ちながら元の正面構図から対象の側面奥へ回り込みます。180度の裏側まで回るとcameraがDE表面内へ入るため、composition previewで形状密度を比較し、対象を見失わない50度を終点にしました。fractal geometry、orbit palette、material、world-space light、FOV、tone mapping、post process、128 spp設定は静止画sceneと同一です。
 
 ```bash
 WGPU_BACKEND=gl cargo run --release -p fractal-renderer-cli -- render \

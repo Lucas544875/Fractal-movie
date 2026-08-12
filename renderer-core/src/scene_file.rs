@@ -1355,11 +1355,27 @@ mod tests {
             panic!("Alchemy animation must use target-orbit");
         };
         assert_eq!((animation.fps, animation.frame_count), (30, 721));
-        assert_eq!(path.cone_angle_degrees, 18.0);
+        assert_eq!(path.cone_angle_degrees, 90.0);
+        assert!((path.revolutions - 50.0 / 360.0).abs() < 1.0e-10);
+        for (axis, camera_up) in path.axis.into_iter().zip(orbit_scene.config.camera.up) {
+            assert!((axis - f64::from(camera_up)).abs() < 1.0e-7);
+        }
         let first = animation.sample(&orbit_scene.config, 0).unwrap();
         let last = animation.sample(&orbit_scene.config, 720).unwrap();
         assert_eq!(first.config.camera.target, orbit_scene.config.camera.target);
-        assert_eq!(first.config.camera.position, last.config.camera.position);
+        assert_ne!(first.config.camera.position, last.config.camera.position);
+        let first_direction = (first.config.camera.position - first.config.camera.target)
+            .normalized_to_f32()
+            .unwrap();
+        let last_direction = (last.config.camera.position - last.config.camera.target)
+            .normalized_to_f32()
+            .unwrap();
+        let direction_dot = first_direction
+            .into_iter()
+            .zip(last_direction)
+            .map(|(left, right)| f64::from(left) * f64::from(right))
+            .sum::<f64>();
+        assert!((direction_dot - 50_f64.to_radians().cos()).abs() < 1.0e-6);
         for (sampled, original) in first
             .config
             .camera

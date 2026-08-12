@@ -234,6 +234,51 @@ pub struct RenderedImage {
     pixels: Vec<u8>,
 }
 
+/// Pixel-space portion of the configured camera viewport to render.
+///
+/// Camera projection still uses the complete render resolution, so a region
+/// is a true crop of the final image rather than a resized or reframed view.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RenderRegion {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl RenderRegion {
+    #[must_use]
+    pub const fn full(width: u32, height: u32) -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }
+    }
+
+    fn validate(self, width: u32, height: u32) -> Result<()> {
+        let right = self.x.checked_add(self.width);
+        let bottom = self.y.checked_add(self.height);
+        if self.width == 0
+            || self.height == 0
+            || right.is_none_or(|right| right > width)
+            || bottom.is_none_or(|bottom| bottom > height)
+        {
+            return Err(anyhow!(
+                "render region x={}, y={}, width={}, height={} is outside {}x{}",
+                self.x,
+                self.y,
+                self.width,
+                self.height,
+                width,
+                height
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl RenderedImage {
     #[must_use]
     pub fn width(&self) -> u32 {
@@ -445,6 +490,17 @@ impl Renderer {
         self.gpu_duty_cycle
     }
 
+    /// Reports whether a frame can reuse this renderer's pipeline and
+    /// allocations. Uniform-only changes such as camera, light, and tone
+    /// mapping return true; resolution, precision, or DSL AST changes do not.
+    #[must_use]
+    pub fn supports_config(&self, config: &RenderConfig) -> bool {
+        config.render.width == self.config.render.width
+            && config.render.height == self.config.render.height
+            && config.precision == self.config.precision
+            && config.fractal.shader_compatible_with(&self.config.fractal)
+    }
+
     /// Renders one deterministic frame and reads it back from GPU memory.
     pub fn render_frame(&self, frame_index: u32, time_seconds: f32) -> Result<RenderedImage> {
         self.render_frame_with_config(&self.config, frame_index, time_seconds)
@@ -461,30 +517,37 @@ impl Renderer {
         frame_index: u32,
         time_seconds: f32,
     ) -> Result<RenderedImage> {
+        self.render_region_with_config(
+            config,
+            frame_index,
+            time_seconds,
+            RenderRegion::full(config.render.width, config.render.height),
+        )
+    }
+
+    /// Renders only a rectangular crop while retaining the complete camera
+    /// projection. Fragment work outside the region is skipped.
+    pub fn render_region_with_config(
+        &self,
+        config: &RenderConfig,
+        frame_index: u32,
+        time_seconds: f32,
+        region: RenderRegion,
+    ) -> Result<RenderedImage> {
         if !time_seconds.is_finite() || time_seconds < 0.0 {
             return Err(anyhow!("frame time must be finite and non-negative"));
         }
         config
             .validate()
             .context("invalid per-frame render configuration")?;
-        if config.render.width != self.config.render.width
-            || config.render.height != self.config.render.height
-        {
+        if !self.supports_config(config) {
             return Err(anyhow!(
-                "per-frame resolution {}x{} does not match renderer resolution {}x{}",
-                config.render.width,
-                config.render.height,
-                self.config.render.width,
-                self.config.render.height
+                "per-frame resolution, fractal shader configuration, and precision must match the renderer pipeline"
             ));
         }
-        if !config.fractal.shader_compatible_with(&self.config.fractal)
-            || config.precision != self.config.precision
-        {
-            return Err(anyhow!(
-                "per-frame fractal shader configuration and precision must match the renderer pipeline"
-            ));
-        }
+        region
+            .validate(config.render.width, config.render.height)
+            .context("invalid render region")?;
 
         let uniforms = RenderUniforms::new(config, frame_index, time_seconds);
         self.queue
@@ -498,13 +561,10 @@ impl Renderer {
         } else {
             MAX_FRAGMENT_INVOCATIONS_PER_SUBMISSION
         };
-        for (strip_index, (strip_y, strip_height)) in render_strips_with_limit(
-            self.config.render.width,
-            self.config.render.height,
-            fragment_limit,
-        )
-        .into_iter()
-        .enumerate()
+        for (strip_index, (strip_y, strip_height)) in
+            render_strips_with_limit(region.width, region.height, fragment_limit)
+                .into_iter()
+                .enumerate()
         {
             let mut encoder = self
                 .device
@@ -536,7 +596,7 @@ impl Renderer {
                 });
                 pass.set_pipeline(&self.render_pipeline);
                 pass.set_bind_group(0, &self.bind_group, &[]);
-                pass.set_scissor_rect(0, strip_y, self.config.render.width, strip_height);
+                pass.set_scissor_rect(region.x, region.y + strip_y, region.width, strip_height);
                 pass.draw(0..3, 0..1);
             }
             let gpu_work_started = Instant::now();
@@ -584,18 +644,23 @@ impl Renderer {
         let mapped = slice
             .get_mapped_range()
             .context("GPU readback buffer was not mapped")?;
-        let unpadded_bytes_per_row = self.config.render.width as usize * BYTES_PER_PIXEL as usize;
-        let mut pixels =
-            Vec::with_capacity(unpadded_bytes_per_row * self.config.render.height as usize);
-        for row in mapped.chunks_exact(self.padded_bytes_per_row as usize) {
-            pixels.extend_from_slice(&row[..unpadded_bytes_per_row]);
+        let region_bytes_per_row = region.width as usize * BYTES_PER_PIXEL as usize;
+        let region_start = region.x as usize * BYTES_PER_PIXEL as usize;
+        let region_end = region_start + region_bytes_per_row;
+        let mut pixels = Vec::with_capacity(region_bytes_per_row * region.height as usize);
+        for row in mapped
+            .chunks_exact(self.padded_bytes_per_row as usize)
+            .skip(region.y as usize)
+            .take(region.height as usize)
+        {
+            pixels.extend_from_slice(&row[region_start..region_end]);
         }
         drop(mapped);
         self.readback_buffer.unmap();
 
         Ok(RenderedImage {
-            width: self.config.render.width,
-            height: self.config.render.height,
+            width: region.width,
+            height: region.height,
             pixels,
         })
     }
@@ -737,6 +802,43 @@ mod tests {
     }
 
     #[test]
+    fn render_region_rejects_empty_overflowing_and_out_of_bounds_crops() {
+        assert!(RenderRegion::full(640, 360).validate(640, 360).is_ok());
+        assert!(
+            RenderRegion {
+                x: 160,
+                y: 90,
+                width: 320,
+                height: 180,
+            }
+            .validate(640, 360)
+            .is_ok()
+        );
+        for invalid in [
+            RenderRegion {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 1,
+            },
+            RenderRegion {
+                x: 639,
+                y: 0,
+                width: 2,
+                height: 1,
+            },
+            RenderRegion {
+                x: u32::MAX,
+                y: 0,
+                width: 2,
+                height: 1,
+            },
+        ] {
+            assert!(invalid.validate(640, 360).is_err());
+        }
+    }
+
+    #[test]
     fn render_height_is_split_into_watchdog_safe_strips() {
         assert_eq!(
             render_strips_with_limit(1_620, 1_080, MAX_FRAGMENT_INVOCATIONS_PER_SUBMISSION),
@@ -830,6 +932,38 @@ mod tests {
 
         assert!(adapter_rank(&discrete) > adapter_rank(&integrated));
         assert!(adapter_rank(&integrated) > adapter_rank(&cpu));
+    }
+
+    #[test]
+    #[ignore = "requires a hardware GPU"]
+    fn region_render_matches_the_same_pixels_from_a_full_frame() {
+        let mut config = RenderConfig::default();
+        config.render.width = 64;
+        config.render.height = 36;
+        let renderer = pollster::block_on(Renderer::new(config.clone())).expect("GPU renderer");
+        let full = renderer.render_frame(0, 0.0).expect("full render");
+        let region = RenderRegion {
+            x: 16,
+            y: 9,
+            width: 32,
+            height: 18,
+        };
+        let crop = renderer
+            .render_region_with_config(&config, 0, 0.0, region)
+            .expect("region render");
+        let full_row_bytes = full.width() as usize * BYTES_PER_PIXEL as usize;
+        let crop_row_bytes = crop.width() as usize * BYTES_PER_PIXEL as usize;
+        let crop_start = region.x as usize * BYTES_PER_PIXEL as usize;
+        let mut expected = Vec::with_capacity(crop.pixels().len());
+        for row in full
+            .pixels()
+            .chunks_exact(full_row_bytes)
+            .skip(region.y as usize)
+            .take(region.height as usize)
+        {
+            expected.extend_from_slice(&row[crop_start..crop_start + crop_row_bytes]);
+        }
+        assert_eq!(crop.pixels(), expected);
     }
 
     #[test]

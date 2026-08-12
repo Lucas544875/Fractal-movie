@@ -1,5 +1,5 @@
 version: 1
-name: alchemy-pseudo-kleinian-target-orbit
+name: alchemy-pseudo-kleinian-target-orbit-vertical
 precision: f32
 seed: 20260811
 
@@ -129,11 +129,14 @@ animation:
     parameters:
       radius: 0.7911548236
       duration: 24.0
-      revolutions: 1.0
-      # This axis was derived from the original sight line and effective up
-      # vector. Consequently frame 0 retains the source image's orientation.
-      axis: [-0.4373478957, -0.6647018211, 0.6057213115]
-      cone_angle_degrees: 18.0
+      # Arc from the original view toward the far side. A 50-degree turn keeps
+      # the camera outside the DE surface while still revealing its depth.
+      revolutions: 0.1388888889
+      # Orbit around the vertical direction visible at frame 0. Since this is
+      # also the original camera up vector, the move stays level while it wraps
+      # horizontally behind the object.
+      axis: [0.1818096677, 0.2756373131, 0.9439117100]
+      cone_angle_degrees: 90.0
       start_angle_degrees: 0.0
 
 video:

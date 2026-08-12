@@ -1,14 +1,23 @@
 mod output;
 mod video;
 
-use std::{path::Path, path::PathBuf, process::ExitCode, time::Instant};
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::Path,
+    path::PathBuf,
+    process::ExitCode,
+    str::FromStr,
+    thread,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use fractal_renderer_core::{
-    AnimationConfig, AnimationPath, FractalConfig, FractalKind, MIN_QUAD_CAMERA_DISTANCE,
-    MandelboxConfig, MandelbulbConfig, Precision, Qf32, RenderConfig, Renderer, RendererOptions,
-    VideoConfig, adapter_is_software, load_scene,
+    AnimationConfig, AnimationFrame, AnimationPath, FractalConfig, FractalKind,
+    MIN_QUAD_CAMERA_DISTANCE, MandelboxConfig, MandelbulbConfig, Precision, Qf32, RenderConfig,
+    RenderRegion, Renderer, RendererOptions, VideoConfig, adapter_is_software, load_scene,
 };
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -21,6 +30,91 @@ enum FractalName {
 enum PrecisionName {
     F32,
     QuadFloat,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum PreviewProfile {
+    Composition,
+    #[default]
+    Lookdev,
+    Proof,
+    Final,
+}
+
+impl PreviewProfile {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Composition => "composition",
+            Self::Lookdev => "lookdev",
+            Self::Proof => "proof",
+            Self::Final => "final",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct NormalizedRegion {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+impl FromStr for NormalizedRegion {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let components = value
+            .split(',')
+            .map(str::trim)
+            .map(str::parse::<f64>)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| "region must contain four comma-separated numbers".to_owned())?;
+        let [x, y, width, height] = components.as_slice() else {
+            return Err("region must be x,y,width,height".to_owned());
+        };
+        let region = Self {
+            x: *x,
+            y: *y,
+            width: *width,
+            height: *height,
+        };
+        region.validate().map_err(|error| error.to_string())?;
+        Ok(region)
+    }
+}
+
+impl NormalizedRegion {
+    fn validate(self) -> Result<()> {
+        if [self.x, self.y, self.width, self.height]
+            .into_iter()
+            .any(|value| !value.is_finite())
+            || self.x < 0.0
+            || self.y < 0.0
+            || self.width <= 0.0
+            || self.height <= 0.0
+            || self.x + self.width > 1.0
+            || self.y + self.height > 1.0
+        {
+            bail!(
+                "preview region must be finite, positive, and contained in normalized 0.0..=1.0 coordinates"
+            );
+        }
+        Ok(())
+    }
+
+    fn to_render_region(self, width: u32, height: u32) -> RenderRegion {
+        let x = (self.x * f64::from(width)).floor() as u32;
+        let y = (self.y * f64::from(height)).floor() as u32;
+        let right = ((self.x + self.width) * f64::from(width)).ceil() as u32;
+        let bottom = ((self.y + self.height) * f64::from(height)).ceil() as u32;
+        RenderRegion {
+            x: x.min(width - 1),
+            y: y.min(height - 1),
+            width: right.clamp(x + 1, width) - x,
+            height: bottom.clamp(y + 1, height) - y,
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -140,6 +234,62 @@ enum Command {
         adapter: Option<String>,
     },
 
+    /// Rapidly render representative frames without modifying the scene.
+    Preview {
+        /// Versioned YAML scene file to preview.
+        #[arg(value_name = "SCENE")]
+        scene: PathBuf,
+
+        /// Preview quality and fidelity tradeoff.
+        #[arg(long, value_enum, default_value_t)]
+        profile: PreviewProfile,
+
+        /// Render one zero-based animation frame.
+        #[arg(long, value_name = "INDEX", conflicts_with = "frames")]
+        frame: Option<u32>,
+
+        /// Render comma-separated animation frames. Defaults to five key views.
+        #[arg(
+            long,
+            value_name = "INDICES",
+            value_delimiter = ',',
+            conflicts_with = "frame"
+        )]
+        frames: Vec<u32>,
+
+        /// Re-render after the scene file changes. Outputs are replaced.
+        #[arg(long)]
+        watch: bool,
+
+        /// Render a normalized crop as x,y,width,height while preserving projection.
+        #[arg(long, value_name = "X,Y,W,H")]
+        region: Option<NormalizedRegion>,
+
+        /// Preview output directory.
+        #[arg(long)]
+        output: Option<PathBuf>,
+
+        /// Override preview viewport width after applying the profile.
+        #[arg(long)]
+        width: Option<u32>,
+
+        /// Override preview viewport height after applying the profile.
+        #[arg(long)]
+        height: Option<u32>,
+
+        /// Limit this renderer's average GPU duty cycle, as a percentage.
+        #[arg(long, value_name = "PERCENT")]
+        gpu_duty_cycle: Option<f64>,
+
+        /// Permit CPU/software rendering when no hardware GPU is available.
+        #[arg(long)]
+        allow_software: bool,
+
+        /// Select an adapter by a case-insensitive name substring.
+        #[arg(long, value_name = "NAME")]
+        adapter: Option<String>,
+    },
+
     /// List wgpu adapters and report whether hardware acceleration is available.
     GpuInfo,
 }
@@ -210,6 +360,33 @@ fn run() -> Result<()> {
             allow_software,
             adapter,
         }),
+        Command::Preview {
+            scene,
+            profile,
+            frame,
+            frames,
+            watch,
+            region,
+            output,
+            width,
+            height,
+            gpu_duty_cycle,
+            allow_software,
+            adapter,
+        } => preview(PreviewRequest {
+            scene,
+            profile,
+            frame,
+            frames,
+            watch,
+            region,
+            output,
+            width,
+            height,
+            gpu_duty_cycle,
+            allow_software,
+            adapter,
+        }),
         Command::GpuInfo => gpu_info(),
     }
 }
@@ -236,6 +413,21 @@ struct RenderRequest {
     precision: Option<PrecisionName>,
     camera_distance: Option<Qf32>,
     seed: Option<u32>,
+    width: Option<u32>,
+    height: Option<u32>,
+    gpu_duty_cycle: Option<f64>,
+    allow_software: bool,
+    adapter: Option<String>,
+}
+
+struct PreviewRequest {
+    scene: PathBuf,
+    profile: PreviewProfile,
+    frame: Option<u32>,
+    frames: Vec<u32>,
+    watch: bool,
+    region: Option<NormalizedRegion>,
+    output: Option<PathBuf>,
     width: Option<u32>,
     height: Option<u32>,
     gpu_duty_cycle: Option<f64>,
@@ -353,6 +545,272 @@ fn render(request: RenderRequest) -> Result<()> {
     } else {
         render_static(prepared, &request, &output_path)
     }
+}
+
+fn preview(request: PreviewRequest) -> Result<()> {
+    gpu_duty_cycle_fraction(request.gpu_duty_cycle)?;
+    let mut renderer = None;
+    render_preview_iteration(&request, &mut renderer)?;
+    if !request.watch {
+        return Ok(());
+    }
+
+    println!(
+        "Watching {} for changes (Ctrl+C to stop)",
+        request.scene.display()
+    );
+    let mut previous_contents = fs::read(&request.scene)
+        .with_context(|| format!("could not monitor {}", request.scene.display()))?;
+    loop {
+        thread::sleep(Duration::from_millis(250));
+        let Ok(contents) = fs::read(&request.scene) else {
+            continue;
+        };
+        if contents == previous_contents {
+            continue;
+        }
+        previous_contents = contents;
+        println!("\nScene changed; refreshing preview...");
+        if let Err(error) = render_preview_iteration(&request, &mut renderer) {
+            eprintln!("preview refresh failed: {error:#}");
+        }
+    }
+}
+
+fn render_preview_iteration(
+    request: &PreviewRequest,
+    renderer: &mut Option<Renderer>,
+) -> Result<()> {
+    let mut prepared = prepare_scene(Some(&request.scene), None, None, None, None, None, None)?;
+    apply_preview_profile(
+        &mut prepared,
+        request.profile,
+        request.width,
+        request.height,
+    )?;
+    let frame_indices =
+        preview_frame_indices(prepared.animation.as_ref(), request.frame, &request.frames)?;
+    let output_directory = request.output.clone().unwrap_or_else(|| {
+        let directory = PathBuf::from("output")
+            .join("preview")
+            .join(&prepared.name)
+            .join(request.profile.label());
+        if request.region.is_some() {
+            directory.join("crop")
+        } else {
+            directory
+        }
+    });
+    let first_frame = preview_frame_config(&prepared, frame_indices[0])?;
+    let rebuild_pipeline = renderer
+        .as_ref()
+        .is_none_or(|renderer| !renderer.supports_config(&first_frame.config));
+    if rebuild_pipeline {
+        *renderer = Some(create_renderer_with_options(
+            first_frame.config.clone(),
+            request.allow_software,
+            request.adapter.clone(),
+            request.gpu_duty_cycle,
+        )?);
+    }
+    let renderer = renderer.as_ref().expect("preview renderer was initialized");
+
+    println!("Scene: {}", prepared.name);
+    println!("Preview profile: {}", request.profile.label());
+    println!(
+        "Pipeline: {}",
+        if rebuild_pipeline {
+            "rebuilt"
+        } else {
+            "reused"
+        }
+    );
+    print_renderer_summary(renderer, &first_frame.config);
+    let region = request.region.map_or_else(
+        || {
+            RenderRegion::full(
+                first_frame.config.render.width,
+                first_frame.config.render.height,
+            )
+        },
+        |region| {
+            region.to_render_region(
+                first_frame.config.render.width,
+                first_frame.config.render.height,
+            )
+        },
+    );
+    if request.region.is_some() {
+        println!(
+            "Preview crop: x={}, y={}, {}x{} within {}x{} viewport",
+            region.x,
+            region.y,
+            region.width,
+            region.height,
+            first_frame.config.render.width,
+            first_frame.config.render.height
+        );
+    }
+    println!("Preview frames: {frame_indices:?}");
+    println!("Output: {}", output_directory.display());
+
+    for frame_index in frame_indices {
+        let frame = if frame_index == first_frame.index {
+            first_frame.clone()
+        } else {
+            preview_frame_config(&prepared, frame_index)?
+        };
+        let started = Instant::now();
+        let image = renderer
+            .render_region_with_config(
+                &frame.config,
+                frame.index,
+                frame.time_seconds as f32,
+                region,
+            )
+            .with_context(|| format!("failed to render preview frame {frame_index}"))?;
+        let path = output_directory.join(format!("frame_{frame_index:06}.png"));
+        output::save_png(&path, &image, true)
+            .with_context(|| format!("failed to write preview {}", path.display()))?;
+        println!(
+            "Saved: {} ({:.3}s)",
+            path.display(),
+            started.elapsed().as_secs_f64()
+        );
+    }
+    Ok(())
+}
+
+fn preview_frame_config(prepared: &PreparedScene, frame_index: u32) -> Result<AnimationFrame> {
+    if let Some(animation) = &prepared.animation {
+        return animation
+            .sample(&prepared.config, frame_index)
+            .with_context(|| format!("could not sample preview frame {frame_index}"));
+    }
+    if frame_index != 0 {
+        bail!("static preview has only frame 0");
+    }
+    let camera_distance = (prepared.config.camera.target - prepared.config.camera.position)
+        .length_squared()
+        .sqrt();
+    Ok(AnimationFrame {
+        index: 0,
+        time_seconds: 0.0,
+        camera_distance,
+        config: prepared.config.clone(),
+    })
+}
+
+fn preview_frame_indices(
+    animation: Option<&AnimationConfig>,
+    frame: Option<u32>,
+    frames: &[u32],
+) -> Result<Vec<u32>> {
+    let frame_count = animation.map_or(1, |animation| animation.frame_count);
+    let requested = if let Some(frame) = frame {
+        vec![frame]
+    } else if !frames.is_empty() {
+        frames.to_vec()
+    } else if frame_count == 1 {
+        vec![0]
+    } else {
+        let last = frame_count - 1;
+        vec![0, last / 4, last / 2, last.saturating_mul(3) / 4, last]
+    };
+    let unique = requested.into_iter().collect::<BTreeSet<_>>();
+    if let Some(invalid) = unique.iter().find(|&&frame| frame >= frame_count) {
+        bail!(
+            "preview frame {invalid} is outside this scene's frame range 0..{}",
+            frame_count - 1
+        );
+    }
+    Ok(unique.into_iter().collect())
+}
+
+fn apply_preview_profile(
+    prepared: &mut PreparedScene,
+    profile: PreviewProfile,
+    width_override: Option<u32>,
+    height_override: Option<u32>,
+) -> Result<()> {
+    let source_width = prepared.config.render.width;
+    let source_height = prepared.config.render.height;
+    let maximum_width = match profile {
+        PreviewProfile::Composition => Some(320),
+        PreviewProfile::Lookdev => Some(480),
+        PreviewProfile::Proof => Some(810),
+        PreviewProfile::Final => None,
+    };
+    if let Some(maximum_width) = maximum_width
+        && source_width > maximum_width
+    {
+        prepared.config.render.width = maximum_width;
+        prepared.config.render.height =
+            scaled_dimension(source_height, source_width, maximum_width);
+    }
+    match (width_override, height_override) {
+        (Some(width), Some(height)) => {
+            prepared.config.render.width = width;
+            prepared.config.render.height = height;
+        }
+        (Some(width), None) => {
+            prepared.config.render.width = width;
+            prepared.config.render.height = scaled_dimension(source_height, source_width, width);
+        }
+        (None, Some(height)) => {
+            prepared.config.render.width = scaled_dimension(source_width, source_height, height);
+            prepared.config.render.height = height;
+        }
+        (None, None) => {}
+    }
+
+    match profile {
+        PreviewProfile::Composition => {
+            prepared.config.quality.samples_per_pixel = 1;
+            prepared.config.camera.aperture_radius = 0.0;
+            prepared.config.render.max_steps = prepared.config.render.max_steps.min(256);
+            prepared.config.quality.ambient_occlusion.max_steps = 0;
+            prepared.config.quality.soft_shadow.max_steps = 0;
+            prepared.config.quality.reflection.max_steps = 0;
+        }
+        PreviewProfile::Lookdev => {
+            prepared.config.quality.samples_per_pixel =
+                prepared.config.quality.samples_per_pixel.min(8);
+            prepared.config.camera.aperture_radius = 0.0;
+            prepared.config.quality.ambient_occlusion.max_steps =
+                prepared.config.quality.ambient_occlusion.max_steps.min(24);
+            prepared.config.quality.soft_shadow.max_steps =
+                prepared.config.quality.soft_shadow.max_steps.min(32);
+            prepared.config.quality.reflection.max_steps =
+                prepared.config.quality.reflection.max_steps.min(16);
+        }
+        PreviewProfile::Proof => {
+            prepared.config.quality.samples_per_pixel =
+                prepared.config.quality.samples_per_pixel.min(32);
+            prepared.config.quality.ambient_occlusion.max_steps =
+                prepared.config.quality.ambient_occlusion.max_steps.min(48);
+            prepared.config.quality.soft_shadow.max_steps =
+                prepared.config.quality.soft_shadow.max_steps.min(64);
+            prepared.config.quality.reflection.max_steps =
+                prepared.config.quality.reflection.max_steps.min(32);
+        }
+        PreviewProfile::Final => {}
+    }
+    prepared
+        .config
+        .validate()
+        .context("preview profile produced an invalid render configuration")?;
+    if let Some(animation) = &prepared.animation {
+        animation
+            .validate(&prepared.config)
+            .context("preview profile is incompatible with the animation")?;
+    }
+    Ok(())
+}
+
+fn scaled_dimension(value: u32, original: u32, resized: u32) -> u32 {
+    ((u64::from(value) * u64::from(resized) + u64::from(original) / 2) / u64::from(original)).max(1)
+        as u32
 }
 
 fn render_static(
@@ -553,12 +1011,26 @@ fn render_animation(
 }
 
 fn create_renderer(config: RenderConfig, request: &RenderRequest) -> Result<Renderer> {
+    create_renderer_with_options(
+        config,
+        request.allow_software,
+        request.adapter.clone(),
+        request.gpu_duty_cycle,
+    )
+}
+
+fn create_renderer_with_options(
+    config: RenderConfig,
+    allow_software: bool,
+    adapter: Option<String>,
+    gpu_duty_cycle: Option<f64>,
+) -> Result<Renderer> {
     pollster::block_on(Renderer::new_with_options(
         config,
         RendererOptions {
-            allow_software_adapter: request.allow_software,
-            adapter_name: request.adapter.clone(),
-            gpu_duty_cycle: gpu_duty_cycle_fraction(request.gpu_duty_cycle)?,
+            allow_software_adapter: allow_software,
+            adapter_name: adapter,
+            gpu_duty_cycle: gpu_duty_cycle_fraction(gpu_duty_cycle)?,
         },
     ))
     .context("could not initialize the offscreen renderer")
@@ -921,6 +1393,130 @@ mod tests {
         for invalid in [0.0, 0.99, 100.01, f64::NAN, f64::INFINITY] {
             assert!(gpu_duty_cycle_fraction(Some(invalid)).is_err());
         }
+    }
+
+    #[test]
+    fn preview_cli_accepts_profiles_frames_watch_and_regions() {
+        let cli = Cli::try_parse_from([
+            "fractal-render",
+            "preview",
+            "scene.yaml",
+            "--profile",
+            "proof",
+            "--frames",
+            "0,180,360",
+            "--region",
+            "0.25,0.2,0.5,0.6",
+            "--watch",
+        ])
+        .unwrap();
+        let Command::Preview {
+            profile,
+            frames,
+            region,
+            watch,
+            ..
+        } = cli.command
+        else {
+            panic!("preview subcommand must parse");
+        };
+        assert_eq!(profile, PreviewProfile::Proof);
+        assert_eq!(frames, vec![0, 180, 360]);
+        assert!(watch);
+        assert_eq!(
+            region.unwrap().to_render_region(1_620, 1_080),
+            RenderRegion {
+                x: 405,
+                y: 216,
+                width: 810,
+                height: 648,
+            }
+        );
+        assert!("0.8,0.0,0.3,1.0".parse::<NormalizedRegion>().is_err());
+    }
+
+    #[test]
+    fn preview_selects_five_representative_animation_frames() {
+        let animation = AnimationConfig {
+            fps: 30,
+            frame_count: 721,
+            path: AnimationPath::ExponentialDive(ExponentialDivePath {
+                overview_distance: Qf32::from_f32(1.0),
+                minimum_distance: Qf32::from_f32(0.1),
+                overview_duration: 0.0,
+                dive_duration: 24.0,
+            }),
+        };
+        assert_eq!(
+            preview_frame_indices(Some(&animation), None, &[]).unwrap(),
+            vec![0, 180, 360, 540, 720]
+        );
+        assert_eq!(
+            preview_frame_indices(Some(&animation), None, &[360, 0, 360]).unwrap(),
+            vec![0, 360]
+        );
+        assert!(preview_frame_indices(Some(&animation), Some(721), &[]).is_err());
+        assert!(preview_frame_indices(None, Some(1), &[]).is_err());
+    }
+
+    #[test]
+    fn preview_profiles_trade_quality_for_speed_without_changing_scene_source() {
+        let mut source = RenderConfig::default();
+        source.render.width = 1_620;
+        source.render.height = 1_080;
+        source.render.max_steps = 768;
+        source.camera.aperture_radius = 0.015;
+        source.quality.samples_per_pixel = 128;
+        source.quality.ambient_occlusion.max_steps = 96;
+        source.quality.soft_shadow.max_steps = 128;
+        source.quality.reflection.max_steps = 64;
+
+        let make_scene = || PreparedScene {
+            name: "preview-test".to_owned(),
+            config: source.clone(),
+            animation: None,
+            video: None,
+            default_output: PathBuf::new(),
+        };
+        let mut composition = make_scene();
+        apply_preview_profile(&mut composition, PreviewProfile::Composition, None, None).unwrap();
+        assert_eq!(
+            (
+                composition.config.render.width,
+                composition.config.render.height
+            ),
+            (320, 213)
+        );
+        assert_eq!(composition.config.quality.samples_per_pixel, 1);
+        assert_eq!(composition.config.render.max_steps, 256);
+        assert_eq!(composition.config.camera.aperture_radius, 0.0);
+
+        let mut lookdev = make_scene();
+        apply_preview_profile(&mut lookdev, PreviewProfile::Lookdev, None, None).unwrap();
+        assert_eq!(
+            (lookdev.config.render.width, lookdev.config.render.height),
+            (480, 320)
+        );
+        assert_eq!(lookdev.config.quality.samples_per_pixel, 8);
+        assert_eq!(lookdev.config.quality.ambient_occlusion.max_steps, 24);
+        assert_eq!(lookdev.config.quality.soft_shadow.max_steps, 32);
+        assert_eq!(lookdev.config.quality.reflection.max_steps, 16);
+
+        let mut proof = make_scene();
+        apply_preview_profile(&mut proof, PreviewProfile::Proof, None, None).unwrap();
+        assert_eq!(
+            (proof.config.render.width, proof.config.render.height),
+            (810, 540)
+        );
+        assert_eq!(proof.config.quality.samples_per_pixel, 32);
+        assert_eq!(proof.config.camera.aperture_radius, 0.015);
+
+        let mut final_preview = make_scene();
+        apply_preview_profile(&mut final_preview, PreviewProfile::Final, None, None).unwrap();
+        assert_eq!(final_preview.config.render.width, 1_620);
+        assert_eq!(final_preview.config.quality.samples_per_pixel, 128);
+        assert_eq!(source.render.width, 1_620);
+        assert_eq!(source.quality.samples_per_pixel, 128);
     }
 
     #[test]
