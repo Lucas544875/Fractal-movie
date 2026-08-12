@@ -1,6 +1,9 @@
 use std::{
+    any::Any,
     collections::HashMap,
     fs,
+    io::ErrorKind,
+    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -17,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     Artifact, EncodeRequest, PreviewRequest, PreviewResult, ProjectStore, RenderRequest,
     RenderResult,
-    artifact::save_png_atomic,
+    artifact::{cleanup_abandoned_temporary_files, save_png_atomic},
     encode::encode_sequence,
     preview::render_preview_with_progress,
     project::{unix_time_ms, write_json_atomic},
@@ -173,18 +176,14 @@ struct ExecutionContext {
 }
 
 impl Harness {
-    #[must_use]
-    pub fn new(store: ProjectStore) -> Self {
-        Self {
-            store,
-            budget: ResourceBudget::default(),
-            jobs: Arc::new(Mutex::new(HashMap::new())),
-            next_job: Arc::new(AtomicU64::new(1)),
-        }
+    pub fn new(store: ProjectStore) -> Result<Self> {
+        Self::try_with_budget(store, ResourceBudget::default())
     }
 
     pub fn try_with_budget(store: ProjectStore, budget: ResourceBudget) -> Result<Self> {
         budget.validate()?;
+        cleanup_abandoned_temporary_files(store.root())?;
+        recover_interrupted_jobs(&store)?;
         Ok(Self {
             store,
             budget,
@@ -470,14 +469,7 @@ impl Harness {
             .with_context(|| format!("could not read job manifest {}", path.display()))?;
         let mut manifest: JobManifest = serde_json::from_slice(&bytes)?;
         if !manifest.status.is_terminal() {
-            manifest.status = JobStatus::Interrupted;
-            manifest.updated_unix_ms = unix_time_ms();
-            manifest.error = Some(ToolError {
-                code: "job_interrupted".to_owned(),
-                message: "the harness process ended before this job reached a terminal state"
-                    .to_owned(),
-                causes: Vec::new(),
-            });
+            mark_interrupted(&mut manifest);
             write_json_atomic(&path, &manifest)?;
         }
         Ok(manifest)
@@ -578,9 +570,28 @@ impl Harness {
         request: serde_json::Value,
     ) -> Result<(Arc<JobControl>, JobManifest)> {
         self.store.project(project_id)?;
-        let sequence = self.next_job.fetch_add(1, Ordering::Relaxed);
-        let job_id = format!("job-{}-{sequence}", unix_time_ms());
-        let manifest_path = self.manifest_path(project_id, &job_id)?;
+        let runs_directory = self
+            .store
+            .root()
+            .join("projects")
+            .join(project_id)
+            .join("runs");
+        fs::create_dir_all(&runs_directory)?;
+        let (job_id, run_directory) = loop {
+            let sequence = self.next_job.fetch_add(1, Ordering::Relaxed);
+            let candidate = format!("job-{}-{sequence}", unix_time_ms());
+            let directory = self.store.run_directory(project_id, &candidate)?;
+            match fs::create_dir(&directory) {
+                Ok(()) => break (candidate, directory),
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("could not reserve job directory {}", directory.display())
+                    });
+                }
+            }
+        };
+        let manifest_path = run_directory.join("manifest.json");
         let now = unix_time_ms();
         let manifest = JobManifest {
             version: 1,
@@ -602,7 +613,10 @@ impl Harness {
             error: None,
             resource_budget: self.budget.clone(),
         };
-        write_json_atomic(&manifest_path, &manifest)?;
+        if let Err(error) = write_json_atomic(&manifest_path, &manifest) {
+            let _ = fs::remove_dir_all(&run_directory);
+            return Err(error).context("could not publish initial job manifest");
+        }
         let control = Arc::new(JobControl {
             kind,
             manifest: Mutex::new(manifest.clone()),
@@ -626,11 +640,20 @@ impl Harness {
                 control: Arc::clone(&control),
                 started: Instant::now(),
             };
-            let _ = control.update(|manifest| {
+            let started = control.update(|manifest| {
                 manifest.status = JobStatus::Running;
                 manifest.progress.message = "started".to_owned();
             });
-            let outcome = operation(&context);
+            let outcome = match started {
+                Ok(()) => match catch_unwind(AssertUnwindSafe(|| operation(&context))) {
+                    Ok(outcome) => outcome,
+                    Err(payload) => Err(anyhow!(
+                        "job operation panicked: {}",
+                        panic_payload_message(&payload)
+                    )),
+                },
+                Err(error) => Err(error.context("could not persist running job state")),
+            };
             let cancelled = control.cancel.load(Ordering::Acquire);
             let _ = control.update(|manifest| match outcome {
                 Ok((result, artifacts)) => {
@@ -763,13 +786,24 @@ impl Harness {
 
 impl JobControl {
     fn update(&self, update: impl FnOnce(&mut JobManifest)) -> Result<()> {
-        let snapshot = {
-            let mut manifest = self.manifest.lock().expect("job manifest poisoned");
-            update(&mut manifest);
-            manifest.updated_unix_ms = unix_time_ms();
-            manifest.clone()
-        };
-        write_json_atomic(&self.manifest_path, &snapshot)
+        // Keep mutation and publication under the same lock. Control requests
+        // and worker progress can arrive on different threads; publishing after
+        // releasing the lock would allow an older snapshot to overwrite a
+        // newer terminal state.
+        let mut manifest = self.manifest.lock().expect("job manifest poisoned");
+        update(&mut manifest);
+        manifest.updated_unix_ms = unix_time_ms();
+        let mut last_error = None;
+        for attempt in 0..3 {
+            match write_json_atomic(&self.manifest_path, &*manifest) {
+                Ok(()) => return Ok(()),
+                Err(error) => last_error = Some(error),
+            }
+            if attempt < 2 {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        Err(last_error.expect("manifest persistence attempted at least once"))
     }
 }
 
@@ -827,6 +861,8 @@ fn tool_error(error: &anyhow::Error, cancelled: bool) -> ToolError {
     let diagnostic = format!("{error:#}");
     let code = if cancelled {
         "job_cancelled"
+    } else if diagnostic.contains("job operation panicked") {
+        "job_panicked"
     } else if diagnostic.contains("GPU acceleration is unavailable") {
         "gpu_unavailable"
     } else if diagnostic.contains("could not execute ffmpeg") || diagnostic.contains("FFmpeg") {
@@ -848,6 +884,64 @@ fn tool_error(error: &anyhow::Error, cancelled: bool) -> ToolError {
         message,
         causes: error.chain().skip(1).map(ToString::to_string).collect(),
     }
+}
+
+fn panic_payload_message(payload: &Box<dyn Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_owned())
+}
+
+fn recover_interrupted_jobs(store: &ProjectStore) -> Result<usize> {
+    let projects = store.root().join("projects");
+    if !projects.exists() {
+        return Ok(0);
+    }
+    let mut recovered = 0;
+    for project in fs::read_dir(&projects)? {
+        let project = project?;
+        if !project.file_type()?.is_dir() {
+            continue;
+        }
+        let runs = project.path().join("runs");
+        if !runs.exists() {
+            continue;
+        }
+        for run in fs::read_dir(runs)? {
+            let run = run?;
+            if !run.file_type()?.is_dir() {
+                continue;
+            }
+            let path = run.path().join("manifest.json");
+            if !path.is_file() {
+                continue;
+            }
+            let bytes = fs::read(&path)
+                .with_context(|| format!("could not read job manifest {}", path.display()))?;
+            let mut manifest: JobManifest = serde_json::from_slice(&bytes)
+                .with_context(|| format!("job manifest {} is invalid", path.display()))?;
+            if manifest.status.is_terminal() {
+                continue;
+            }
+            mark_interrupted(&mut manifest);
+            write_json_atomic(&path, &manifest)?;
+            recovered += 1;
+        }
+    }
+    Ok(recovered)
+}
+
+fn mark_interrupted(manifest: &mut JobManifest) {
+    manifest.status = JobStatus::Interrupted;
+    manifest.updated_unix_ms = unix_time_ms();
+    manifest.progress.message = "interrupted".to_owned();
+    manifest.error = Some(ToolError {
+        code: "job_interrupted".to_owned(),
+        message: "the harness process ended before this job reached a terminal state".to_owned(),
+        causes: Vec::new(),
+    });
 }
 
 fn combine_contact_sheets(previews: &[(String, PreviewResult)], output: &Path) -> Result<()> {
@@ -874,13 +968,31 @@ fn combine_contact_sheets(previews: &[(String, PreviewResult)], output: &Path) -
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(1);
+
+    fn test_store(label: &str) -> (ProjectStore, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "fractal-jobs-{label}-{}-{}",
+            std::process::id(),
+            NEXT_TEST_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = ProjectStore::new(&root);
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../scenes/examples/alchemy-pseudo-kleinian-target-orbit.yaml");
+        store.create("alchemy", source).unwrap();
+        (store, root)
+    }
 
     #[test]
     fn terminal_statuses_are_explicit() {
         assert!(JobStatus::Completed.is_terminal());
         assert!(JobStatus::Failed.is_terminal());
         assert!(JobStatus::Cancelled.is_terminal());
+        assert!(JobStatus::Interrupted.is_terminal());
         assert!(!JobStatus::Running.is_terminal());
     }
 
@@ -891,5 +1003,159 @@ mod tests {
             ..ResourceBudget::default()
         };
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn operation_panic_is_persisted_as_a_failed_terminal_job() {
+        let (store, root) = test_store("panic");
+        let harness = Harness::new(store.clone()).unwrap();
+        let (control, created) = harness
+            .create_job(
+                "alchemy",
+                JobKind::Compare,
+                None,
+                None,
+                serde_json::json!({"test": "panic"}),
+            )
+            .unwrap();
+        harness.spawn(control, |_| -> Result<(serde_json::Value, Vec<Artifact>)> {
+            panic!("intentional worker failure");
+        });
+        let terminal = harness
+            .wait_for_job("alchemy", &created.id, Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(terminal.status, JobStatus::Failed);
+        assert_eq!(terminal.error.as_ref().unwrap().code, "job_panicked");
+        assert!(
+            terminal
+                .error
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("intentional worker failure")
+        );
+        drop(harness);
+
+        let restarted = Harness::new(store).unwrap();
+        let persisted = restarted.job_status("alchemy", &created.id).unwrap();
+        assert_eq!(persisted.status, JobStatus::Failed);
+        assert_eq!(persisted.error.unwrap().code, "job_panicked");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn asynchronous_job_can_be_inspected_paused_resumed_and_cancelled() {
+        let (store, root) = test_store("control");
+        let harness = Harness::new(store).unwrap();
+        let (control, created) = harness
+            .create_job(
+                "alchemy",
+                JobKind::Compare,
+                None,
+                None,
+                serde_json::json!({"test": "control lifecycle"}),
+            )
+            .unwrap();
+        harness.spawn(control, |context| {
+            for step in 0..100 {
+                context.checkpoint()?;
+                context.progress(step, 100, "working")?;
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok((serde_json::json!({"done": true}), Vec::new()))
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = harness.job_status("alchemy", &created.id).unwrap();
+            if status.status == JobStatus::Running && status.progress.completed > 0 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "job did not begin working");
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        harness.pause_job("alchemy", &created.id).unwrap();
+        let paused_progress = loop {
+            let status = harness.job_status("alchemy", &created.id).unwrap();
+            if status.status == JobStatus::Paused {
+                break status.progress.completed;
+            }
+            assert!(Instant::now() < deadline, "job did not pause");
+            thread::sleep(Duration::from_millis(5));
+        };
+        thread::sleep(Duration::from_millis(40));
+        let still_paused = harness.job_status("alchemy", &created.id).unwrap();
+        assert_eq!(still_paused.status, JobStatus::Paused);
+        assert_eq!(still_paused.progress.completed, paused_progress);
+
+        harness.resume_job("alchemy", &created.id).unwrap();
+        loop {
+            let status = harness.job_status("alchemy", &created.id).unwrap();
+            if status.progress.completed > paused_progress {
+                break;
+            }
+            assert!(Instant::now() < deadline, "job did not resume");
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        harness.cancel_job("alchemy", &created.id).unwrap();
+        let terminal = harness
+            .wait_for_job("alchemy", &created.id, Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(terminal.status, JobStatus::Cancelled);
+        assert_eq!(terminal.error.as_ref().unwrap().code, "job_cancelled");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_recovers_all_interrupted_job_kinds_and_abandoned_temporaries() {
+        let (store, root) = test_store("recovery");
+        let harness = Harness::new(store.clone()).unwrap();
+        let mut jobs = Vec::new();
+        for kind in [JobKind::Preview, JobKind::Render, JobKind::Encode] {
+            let (control, manifest) = harness
+                .create_job(
+                    "alchemy",
+                    kind,
+                    None,
+                    None,
+                    serde_json::json!({"test": format!("{kind:?}")}),
+                )
+                .unwrap();
+            control
+                .update(|manifest| {
+                    manifest.status = JobStatus::Running;
+                    manifest.progress.message = "publishing artifact".to_owned();
+                })
+                .unwrap();
+            jobs.push(manifest.id);
+        }
+        let abandoned = crate::artifact::temporary_file_path(
+            &root.join("projects/alchemy/runs/abandoned.mp4"),
+            true,
+        )
+        .unwrap();
+        fs::write(&abandoned, b"partial video").unwrap();
+        drop(harness);
+
+        let restarted = Harness::new(store).unwrap();
+        assert!(!abandoned.exists());
+        for job_id in jobs {
+            let manifest = restarted.job_status("alchemy", &job_id).unwrap();
+            assert_eq!(manifest.status, JobStatus::Interrupted);
+            assert_eq!(manifest.error.as_ref().unwrap().code, "job_interrupted");
+            let persisted: JobManifest = serde_json::from_slice(
+                &fs::read(
+                    root.join("projects/alchemy/runs")
+                        .join(&job_id)
+                        .join("manifest.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(persisted.status, JobStatus::Interrupted);
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 }

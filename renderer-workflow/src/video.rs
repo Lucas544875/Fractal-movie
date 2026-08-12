@@ -10,6 +10,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use fractal_renderer_core::VideoConfig;
 
+use crate::artifact::{TemporaryFileCleanup, temporary_file_path};
+
 /// A transport-independent FFmpeg image-sequence job shared by the CLI and
 /// agent workflow. Frame selection and project authorization stay in their
 /// respective adapters; process execution and atomic publication live here.
@@ -116,6 +118,7 @@ impl VideoEncodeJob {
         }
 
         let temporary = temporary_video_path(&self.output_path)?;
+        let mut temporary_cleanup = TemporaryFileCleanup::new(temporary.clone());
         let stderr = match &self.diagnostic_log {
             Some(path) => Stdio::from(
                 File::create(path)
@@ -133,7 +136,6 @@ impl VideoEncodeJob {
         let mut child = match child {
             Ok(child) => child,
             Err(error) => {
-                let _ = fs::remove_file(&temporary);
                 self.remove_diagnostic_log();
                 return Err(error)
                     .with_context(|| format!("could not execute {}", self.ffmpeg.display()));
@@ -145,7 +147,6 @@ impl VideoEncodeJob {
                 .context("could not inspect FFmpeg status")?
             {
                 if !status.success() {
-                    let _ = fs::remove_file(&temporary);
                     let diagnostic = self.diagnostic();
                     let message = if diagnostic.is_empty() {
                         format!(
@@ -162,13 +163,13 @@ impl VideoEncodeJob {
             if cancelled() {
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = fs::remove_file(&temporary);
                 self.remove_diagnostic_log();
                 bail!("encode cancelled while FFmpeg was running");
             }
             thread::sleep(Duration::from_millis(100));
         }
         publish_video(&temporary, &self.output_path, self.overwrite)?;
+        temporary_cleanup.disarm();
         self.remove_diagnostic_log();
         Ok(VideoEncodeSummary {
             output_path: self.output_path.clone(),
@@ -229,20 +230,11 @@ impl VideoEncodeJob {
 }
 
 fn temporary_video_path(output_path: &Path) -> Result<PathBuf> {
-    let stem = output_path
-        .file_stem()
-        .context("video output path must end in a file name")?
-        .to_string_lossy();
-    let extension = output_path
-        .extension()
-        .context("video output path must have a container extension")?
-        .to_string_lossy();
-    Ok(output_path.with_file_name(format!(".{stem}.{}.tmp.{extension}", std::process::id())))
+    temporary_file_path(output_path, true)
 }
 
 fn publish_video(temporary: &Path, output: &Path, overwrite: bool) -> Result<()> {
     if output.exists() && !overwrite {
-        let _ = fs::remove_file(temporary);
         bail!("video output {} appeared while encoding", output.display());
     }
     let mut moved = fs::rename(temporary, output);
@@ -252,7 +244,6 @@ fn publish_video(temporary: &Path, output: &Path, overwrite: bool) -> Result<()>
         moved = fs::rename(temporary, output);
     }
     if let Err(error) = moved {
-        let _ = fs::remove_file(temporary);
         return Err(error).context("could not move the completed video into place");
     }
     Ok(())
@@ -305,7 +296,7 @@ mod tests {
                 .file_name()
                 .unwrap()
                 .to_string_lossy()
-                .contains(".tmp.")
+                .contains(crate::artifact::TEMPORARY_FILE_MARKER)
         );
     }
 

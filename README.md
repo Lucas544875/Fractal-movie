@@ -145,7 +145,7 @@ cargo run --release -p fractal-renderer-harness -- \
   --root output/harness --max-gpu-duty-cycle 80
 ```
 
-Alchemyをprojectへ取り込み、軌道revisionを作成し、代表previewを比較して、80%制限のfinal renderとpartial/complete encodeへ進むtool-call例は[`docs/agent-harness.md`](docs/agent-harness.md)にあります。設計境界、必須機能、後から追加すると破壊的変更になる推奨機能の優先順位は[`docs/agent-harness-roadmap.md`](docs/agent-harness-roadmap.md)に固定しています。
+Alchemyをprojectへ取り込み、軌道revisionを作成し、代表previewを比較して、80%制限のfinal renderとpartial/complete encodeへ進むtool-call例は[`docs/agent-harness.md`](docs/agent-harness.md)にあります。P0は実プロセスJSONL契約、再起動復旧、panicのterminal化、atomic artifact公開を含めて完了しています。設計境界、検証コマンド、後から追加すると破壊的変更になる推奨機能の優先順位は[`docs/agent-harness-roadmap.md`](docs/agent-harness-roadmap.md)に固定しています。
 
 ## Mandelbulb を1フレーム出力
 

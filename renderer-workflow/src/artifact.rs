@@ -1,12 +1,16 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use anyhow::{Context, Result, bail};
 use image::RgbaImage;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+pub(crate) const TEMPORARY_FILE_MARKER: &str = ".fractal-tmp-";
+static NEXT_TEMPORARY_FILE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Artifact {
@@ -156,11 +160,8 @@ pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("could not create {}", parent.display()))?;
     }
-    let file_name = path
-        .file_name()
-        .context("atomic output path must end in a file name")?
-        .to_string_lossy();
-    let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+    let temporary = temporary_file_path(path, false)?;
+    let mut cleanup = TemporaryFileCleanup::new(temporary.clone());
     fs::write(&temporary, contents)
         .with_context(|| format!("could not write temporary file {}", temporary.display()))?;
     let mut moved = fs::rename(&temporary, path);
@@ -171,10 +172,94 @@ pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
         moved = fs::rename(&temporary, path);
     }
     if let Err(error) = moved {
-        let _ = fs::remove_file(&temporary);
         return Err(error).with_context(|| format!("could not publish {}", path.display()));
     }
+    cleanup.disarm();
     Ok(())
+}
+
+pub(crate) fn temporary_file_path(path: &Path, preserve_extension: bool) -> Result<PathBuf> {
+    let file_name = path
+        .file_name()
+        .context("temporary output path must end in a file name")?
+        .to_string_lossy();
+    let token = NEXT_TEMPORARY_FILE.fetch_add(1, Ordering::Relaxed);
+    if preserve_extension {
+        let stem = path
+            .file_stem()
+            .context("temporary output path must have a file stem")?
+            .to_string_lossy();
+        let extension = path
+            .extension()
+            .context("temporary output path must have an extension")?
+            .to_string_lossy();
+        Ok(path.with_file_name(format!(
+            ".{stem}{TEMPORARY_FILE_MARKER}{}-{token}.{extension}",
+            std::process::id()
+        )))
+    } else {
+        Ok(path.with_file_name(format!(
+            ".{file_name}{TEMPORARY_FILE_MARKER}{}-{token}",
+            std::process::id()
+        )))
+    }
+}
+
+pub(crate) fn cleanup_abandoned_temporary_files(root: &Path) -> Result<usize> {
+    if !root.exists() {
+        return Ok(0);
+    }
+    let mut removed = 0;
+    for entry in
+        fs::read_dir(root).with_context(|| format!("could not inspect {}", root.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            removed += cleanup_abandoned_temporary_files(&path)?;
+        } else if file_type.is_file()
+            && entry
+                .file_name()
+                .to_string_lossy()
+                .contains(TEMPORARY_FILE_MARKER)
+        {
+            fs::remove_file(&path).with_context(|| {
+                format!(
+                    "could not remove abandoned temporary file {}",
+                    path.display()
+                )
+            })?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+pub(crate) struct TemporaryFileCleanup {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TemporaryFileCleanup {
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TemporaryFileCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
 }
 
 pub(crate) fn save_png_atomic(path: &Path, image: &RgbaImage) -> Result<()> {
@@ -193,7 +278,17 @@ pub(crate) fn save_png_atomic(path: &Path, image: &RgbaImage) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::{sync::Arc, thread};
+
     use super::*;
+
+    fn temporary_directory(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "fractal-artifact-{label}-{}-{}",
+            std::process::id(),
+            NEXT_TEMPORARY_FILE.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
 
     #[test]
     fn image_metrics_detect_clipped_pixels_and_edges() {
@@ -208,5 +303,40 @@ mod tests {
         assert_eq!(metrics.clipped_shadow_ratio, 0.5);
         assert_eq!(metrics.clipped_highlight_ratio, 0.5);
         assert!(metrics.edge_density > 0.9);
+    }
+
+    #[test]
+    fn atomic_writes_replace_on_the_same_filesystem_without_leaking_temporaries() {
+        let directory = temporary_directory("atomic");
+        let path = Arc::new(directory.join("manifest.json"));
+        fs::create_dir_all(&directory).unwrap();
+        write_atomic(&path, b"initial").unwrap();
+        let mut writers = Vec::new();
+        for value in [b"alpha".as_slice(), b"beta", b"gamma", b"delta"] {
+            let path = Arc::clone(&path);
+            let value = value.to_vec();
+            writers.push(thread::spawn(move || write_atomic(&path, &value).unwrap()));
+        }
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let value = fs::read(&*path).unwrap();
+        assert!([b"alpha".as_slice(), b"beta", b"gamma", b"delta"].contains(&value.as_slice()));
+        assert_eq!(cleanup_abandoned_temporary_files(&directory).unwrap(), 0);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn startup_cleanup_removes_only_managed_temporary_files() {
+        let directory = temporary_directory("cleanup");
+        fs::create_dir_all(directory.join("nested")).unwrap();
+        let managed = temporary_file_path(&directory.join("nested/movie.mp4"), true).unwrap();
+        fs::write(&managed, b"partial").unwrap();
+        let unrelated = directory.join("nested/user.tmp");
+        fs::write(&unrelated, b"keep").unwrap();
+        assert_eq!(cleanup_abandoned_temporary_files(&directory).unwrap(), 1);
+        assert!(!managed.exists());
+        assert!(unrelated.exists());
+        fs::remove_dir_all(directory).unwrap();
     }
 }

@@ -33,6 +33,22 @@ the identical tool and arguments returns the persisted response without
 repeating the mutation or starting another job. Reusing it with different
 arguments is rejected.
 
+An autonomous design loop should use immutable revisions as its search space:
+
+1. read `capabilities.describe` and `scene.describe_parameters`;
+2. create multiple candidate revisions from the same current revision;
+3. reject unsafe routes with `route.inspect` before using the GPU;
+4. render the same representative frames for every viable candidate;
+5. compare contact sheets and metrics, then promote exactly one revision with
+   an optimistic `expected_current_revision` check;
+6. render only the promoted revision and encode from that render job; and
+7. retain the job and artifact IDs so every decision is reproducible.
+
+Image metrics are screening signals, not an aesthetic objective by themselves.
+Agents should reject clipping and broken continuity first, then inspect the
+contact sheet before using contrast, edge density, or mean luminance to choose
+between otherwise valid candidates.
+
 Use `capabilities.describe` to obtain all tool names and their JSON input
 schemas:
 
@@ -116,6 +132,10 @@ Restart it against its existing revision-bound frame directory:
 
 The sequence manifest contains the exact revision and scene hash. Resume is
 rejected if either differs, so frames from different revisions cannot mix.
+Startup recovery applies to preview, render, compare, and encode manifests
+before the server accepts requests. Harness-managed temporary files left by a
+process interruption are removed at startup; completed artifacts and source
+frames are preserved.
 
 Encode all frames after completion:
 
@@ -158,3 +178,22 @@ resource budget, progress, structured result, warnings, and terminal error.
 The current pause granularity is one completed frame. GPU duty-cycle pacing
 still operates within a frame, but cancellation does not discard a frame while
 its GPU submissions are in progress.
+
+## Verification
+
+The protocol contract test uses a real subprocess and verifies that stdout
+contains exactly one JSON response per input line, including malformed input,
+and that idempotency survives a restart:
+
+```bash
+cargo test -p fractal-renderer-harness --test jsonl_protocol
+```
+
+On a host with a GPU adapter and FFmpeg, run the complete autonomous Alchemy
+proof through the same JSONL executable boundary:
+
+```bash
+env WGPU_BACKEND=gl cargo test --release -p fractal-renderer-harness \
+  --test jsonl_protocol alchemy_autonomous_design_render_encode_over_jsonl \
+  -- --ignored --nocapture
+```

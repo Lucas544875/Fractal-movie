@@ -2,6 +2,7 @@ use std::{
     env, fs,
     io::{self, BufRead, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -14,6 +15,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 const PROTOCOL_VERSION: u32 = 1;
+const TEMPORARY_FILE_MARKER: &str = ".fractal-tmp-";
+static NEXT_IDEMPOTENCY_TEMPORARY: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Deserialize)]
 struct ToolRequest {
@@ -419,8 +422,24 @@ impl Server {
             response: response.clone(),
         };
         let bytes = serde_json::to_vec_pretty(&record)?;
-        let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-        fs::write(&temporary, bytes)?;
+        let file_name = path
+            .file_name()
+            .context("idempotency path must end in a file name")?
+            .to_string_lossy();
+        let token = NEXT_IDEMPOTENCY_TEMPORARY.fetch_add(1, Ordering::Relaxed);
+        let temporary = path.with_file_name(format!(
+            ".{file_name}{TEMPORARY_FILE_MARKER}{}-{token}",
+            std::process::id()
+        ));
+        if let Err(error) = fs::write(&temporary, bytes) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error).with_context(|| {
+                format!(
+                    "could not write temporary idempotency record {}",
+                    temporary.display()
+                )
+            });
+        }
         if path.exists() {
             fs::remove_file(&temporary)?;
             let cached = self
@@ -431,8 +450,12 @@ impl Server {
             }
             return Ok(());
         }
-        fs::rename(&temporary, &path)
-            .with_context(|| format!("could not publish idempotency record {}", path.display()))?;
+        if let Err(error) = fs::rename(&temporary, &path) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error).with_context(|| {
+                format!("could not publish idempotency record {}", path.display())
+            });
+        }
         Ok(())
     }
 
@@ -836,7 +859,7 @@ mod tests {
             NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
         ));
         let server = Server {
-            harness: Harness::new(ProjectStore::new(&root)),
+            harness: Harness::new(ProjectStore::new(&root)).unwrap(),
             workspace_root,
         };
         (server, root)

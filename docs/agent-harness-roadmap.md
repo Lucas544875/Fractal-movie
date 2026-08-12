@@ -21,11 +21,12 @@ services used by the harness.
 
 ## Implementation status
 
-The first harness slice is implemented in `renderer-workflow` and
-`renderer-harness`: public `SceneSpec`, immutable candidate revisions,
-transactional patch/promotion, idempotent JSON tools, DE target/route
-inspection, preview metrics/contact sheets, revision-bound render sequences,
-persisted controllable jobs, and independent complete/range/available encode.
+P0 is complete as of 2026-08-12. The first harness slice is implemented in
+`renderer-workflow` and `renderer-harness`: public `SceneSpec`, immutable
+candidate revisions, transactional patch/promotion, idempotent JSON tools, DE
+target/route inspection, preview metrics/contact sheets, revision-bound render
+sequences, persisted controllable jobs, and independent
+complete/range/available encode.
 
 The existing `fractal-render` command line remains compatible. Preview profile
 application, representative-frame selection, scene sampling, adapter policy,
@@ -76,16 +77,22 @@ format, or job-model migration.
 12. End-to-end Alchemy milestone test that does not require a GPU, plus ignored
     GPU/FFmpeg integration tests.
 
-### P0 hardening — current next work
+### P0 hardening — completed
 
-1. Add protocol-level subprocess tests that exercise the JSONL server over
-   stdin/stdout rather than calling its handler directly.
-2. Add persisted recovery tests covering process interruption during preview,
-   render, and encode publication.
-3. Make job manifest publication resilient to a panic in an operation thread,
-   so every accepted asynchronous job still reaches a persisted terminal state.
-4. Add artifact publication tests for same-filesystem atomic rename and
-   cleanup of abandoned temporary files.
+1. Protocol-level subprocess tests exercise the JSONL server over stdin/stdout,
+   including malformed input, exact response cardinality, and restart-safe
+   idempotency.
+2. Startup recovery immediately and persistently marks interrupted preview,
+   render, and encode jobs as terminal `interrupted` jobs.
+3. Operation-thread panics are contained and published as terminal `failed`
+   manifests with the structured `job_panicked` error code.
+4. Manifests, PNGs, idempotency records, and videos use uniquely named
+   same-directory temporary files. Publication uses same-filesystem rename,
+   RAII removes failed-operation temporaries, and startup removes abandoned
+   harness-managed temporaries without touching unrelated files.
+5. Run directories are exclusively reserved, preventing job-ID collisions
+   after a fast process restart. Manifest mutations and publication are
+   serialized so an older progress update cannot overwrite a terminal state.
 
 ### P0 architecture provisions for later work
 
@@ -166,3 +173,24 @@ P0 is complete only when:
 - preview and render artifacts can be traced back to an exact revision;
 - all unit/workspace tests and Clippy pass; and
 - the documented Alchemy tool-call sequence completes on a GPU host.
+
+## P0 completion evidence
+
+The following checks define the repeatable completion record:
+
+```bash
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --release -p fractal-renderer-workflow \
+  ffmpeg_failure_preserves_frames_and_an_existing_video -- --ignored
+env WGPU_BACKEND=gl cargo test --release -p fractal-renderer-harness \
+  --test jsonl_protocol alchemy_autonomous_design_render_encode_over_jsonl \
+  -- --ignored --nocapture
+```
+
+The GPU integration test drives the executable strictly through JSONL. It
+imports Alchemy, creates and validates a candidate revision, renders five
+representative preview frames, publishes a comparison, promotes the candidate,
+renders the complete five-frame proof sequence at an 80% duty-cycle request,
+and publishes an H.264 MP4 with FFmpeg. The test requires a GPU adapter and
+FFmpeg and is therefore ignored in the default CPU-only workspace suite.
