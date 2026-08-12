@@ -21,6 +21,11 @@ Rust、wgpu、WGSL で3次元フラクタルを描画する、ウィンドウ不
 - 解像度、ray steps、fractal iterations、NaN/Inf などの事前 validation
 - WGSL validation error を文脈付きエラーとして報告
 - GPU 名、解像度、フレーム時間、合計時間のログ
+- content-addressed scene revisionとtransactional patch/promotion
+- JSONL agent harness、tool schema discovery、idempotency key、structured error
+- persisted asynchronous preview/render/encode jobとresource budget
+- preview metrics/contact sheet、DE target候補、camera route clearance検査
+- scene hash付きframe sequence、complete/range/available partial encode
 
 Phase 6まで実装済みで、型付きDSLから生成したフラクタルにもoffline品質の光学・ライティング効果、PNG連番、FFmpeg動画encodeを適用できます。
 
@@ -130,6 +135,17 @@ cargo run --release -p fractal-renderer-cli -- preview \
   scenes/examples/alchemy-pseudo-kleinian-target-orbit.yaml \
   --profile final --frame 180 --region 0.25,0.25,0.5,0.5
 ```
+
+## Agent harness
+
+自律エージェント向けには、scene YAMLとCLIログを直接操作する代わりに、immutable revision、非同期job、artifact、画像metricsを扱う`fractal-harness`を利用できます。protocolはstdin/stdout上のnewline-delimited JSONで、`capabilities.describe`からtool schemaを取得できます。
+
+```bash
+cargo run --release -p fractal-renderer-harness -- \
+  --root output/harness --max-gpu-duty-cycle 80
+```
+
+Alchemyをprojectへ取り込み、軌道revisionを作成し、代表previewを比較して、80%制限のfinal renderとpartial/complete encodeへ進むtool-call例は[`docs/agent-harness.md`](docs/agent-harness.md)にあります。設計境界、必須機能、後から追加すると破壊的変更になる推奨機能の優先順位は[`docs/agent-harness-roadmap.md`](docs/agent-harness-roadmap.md)に固定しています。
 
 ## Mandelbulb を1フレーム出力
 
@@ -616,7 +632,14 @@ WGPU_BACKEND=gl cargo run --release -p fractal-renderer-cli -- render \
 │       ├── scene_file.rs        # versioned YAML schema / validation
 │       └── ...                  # config、wgpu、readback
 ├── renderer-cli/
-│   └── src/                      # CLI、PNG encoder、FFmpeg subprocess
+│   └── src/                      # 既存の人間向けCLI
+├── renderer-workflow/
+│   └── src/                      # revision、job、preview、render、encode、artifact
+├── renderer-harness/
+│   └── src/                      # LLM向けJSONL tool protocolとresource policy
+├── docs/
+│   ├── agent-harness.md          # tool-call運用手順
+│   └── agent-harness-roadmap.md  # 優先順位、移行順、完了条件
 ├── scenes/examples/             # version 1 のサンプル scene
 └── output/                       # 生成物（Git 管理外）
 ```

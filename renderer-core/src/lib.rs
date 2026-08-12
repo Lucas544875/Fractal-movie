@@ -32,6 +32,14 @@ pub use path::{
 };
 pub use precision::{Qf32, QfParseError, QfVec3};
 pub use renderer::{RenderRegion, RenderedImage, Renderer, RendererOptions, adapter_is_software};
-pub use scene_file::{CURRENT_SCENE_VERSION, LoadedScene, load_scene, parse_scene};
+pub use scene_file::{
+    CURRENT_SCENE_VERSION, LoadedScene, SceneAmbientOcclusion, SceneAnimation, SceneAnimationPath,
+    SceneCamera, SceneDslFractal, SceneDslMaterial, SceneDslPaletteStop, SceneExponentialDive,
+    SceneFractal, SceneLight, SceneMandelbox, SceneMandelbulb, SceneMultiTargetDive,
+    SceneOrbitTransform, ScenePostProcess, ScenePrecision, SceneQuality, SceneReflection,
+    SceneRender, SceneScalar, SceneSoftShadow, SceneSpec, SceneSurfaceFlyover, SceneTargetOrbit,
+    SceneTargetSearch, SceneToneMapping, SceneToneMappingOperator, SceneVideo, load_scene,
+    parse_scene, parse_scene_spec,
+};
 pub use video::{MAX_VIDEO_CRF, VideoConfig};
 pub use wgpu::{AdapterInfo, Backend, DeviceType};

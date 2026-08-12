@@ -26,7 +26,7 @@ pub struct LoadedScene {
 impl LoadedScene {
     /// Serializes the scene using the current schema version.
     pub fn to_yaml(&self) -> Result<String> {
-        let document = SceneDocument::from(self);
+        let document = SceneSpec::from(self);
         serde_yaml_ng::to_string(&document).context("could not serialize scene as YAML")
     }
 }
@@ -41,34 +41,56 @@ pub fn load_scene(path: impl AsRef<Path>) -> Result<LoadedScene> {
 
 /// Parses and validates a scene from a YAML string.
 pub fn parse_scene(yaml: &str) -> Result<LoadedScene> {
-    let document: SceneDocument =
+    let document: SceneSpec =
         serde_yaml_ng::from_str(yaml).context("YAML does not match the scene schema")?;
     document.try_into()
 }
 
+/// Parses the public transport representation and validates that it can be
+/// resolved into a renderable scene. Keeping the transport schema public lets
+/// workflow adapters patch JSON values without duplicating the YAML schema.
+pub fn parse_scene_spec(yaml: &str) -> Result<SceneSpec> {
+    let document: SceneSpec =
+        serde_yaml_ng::from_str(yaml).context("YAML does not match the scene schema")?;
+    LoadedScene::try_from(document.clone())?;
+    Ok(document)
+}
+
+impl SceneSpec {
+    /// Serializes the transport representation as canonical scene YAML.
+    pub fn to_yaml(&self) -> Result<String> {
+        serde_yaml_ng::to_string(self).context("could not serialize scene as YAML")
+    }
+
+    /// Resolves and validates automatic planning and renderer constraints.
+    pub fn resolve(self) -> Result<LoadedScene> {
+        self.try_into()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct SceneDocument {
-    version: u32,
-    name: String,
+pub struct SceneSpec {
+    pub version: u32,
+    pub name: String,
     #[serde(default)]
-    precision: ScenePrecision,
-    seed: u32,
-    camera: SceneCamera,
-    fractal: SceneFractal,
-    light: SceneLight,
-    render: SceneRender,
+    pub precision: ScenePrecision,
+    pub seed: u32,
+    pub camera: SceneCamera,
+    pub fractal: SceneFractal,
+    pub light: SceneLight,
+    pub render: SceneRender,
     #[serde(default)]
-    quality: SceneQuality,
+    pub quality: SceneQuality,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    animation: Option<SceneAnimation>,
+    pub animation: Option<SceneAnimation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    video: Option<SceneVideo>,
+    pub video: Option<SceneVideo>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
-enum ScenePrecision {
+pub enum ScenePrecision {
     #[default]
     F32,
     QuadFloat,
@@ -76,22 +98,22 @@ enum ScenePrecision {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct SceneCamera {
-    position: [SceneScalar; 3],
-    target: [SceneScalar; 3],
-    up: [f32; 3],
-    vertical_fov_degrees: f32,
+pub struct SceneCamera {
+    pub position: [SceneScalar; 3],
+    pub target: [SceneScalar; 3],
+    pub up: [f32; 3],
+    pub vertical_fov_degrees: f32,
     #[serde(default)]
-    aperture_radius: f32,
+    pub aperture_radius: f32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    focus_distance: Option<f32>,
+    pub focus_distance: Option<f32>,
 }
 
 /// Coordinate scalars accept convenient YAML numbers, exact decimal strings,
 /// or an exact four-limb expansion emitted by `LoadedScene::to_yaml`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(untagged)]
-enum SceneScalar {
+pub enum SceneScalar {
     Number(f64),
     Decimal(String),
     Expansion([f32; 4]),
@@ -99,7 +121,7 @@ enum SceneScalar {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", content = "parameters", rename_all = "kebab-case")]
-enum SceneFractal {
+pub enum SceneFractal {
     Mandelbulb(SceneMandelbulb),
     Mandelbox(SceneMandelbox),
     Dsl(SceneDslFractal),
@@ -107,42 +129,42 @@ enum SceneFractal {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct SceneMandelbulb {
-    power: f32,
-    iterations: u32,
-    bailout: f32,
+pub struct SceneMandelbulb {
+    pub power: f32,
+    pub iterations: u32,
+    pub bailout: f32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct SceneMandelbox {
-    scale: f32,
-    min_radius_squared: f32,
-    fixed_radius_squared: f32,
-    fold_limit: f32,
-    iterations: u32,
-    bound_radius: f64,
+pub struct SceneMandelbox {
+    pub scale: f32,
+    pub min_radius_squared: f32,
+    pub fixed_radius_squared: f32,
+    pub fold_limit: f32,
+    pub iterations: u32,
+    pub bound_radius: f64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct SceneDslFractal {
-    iterations: u32,
+pub struct SceneDslFractal {
+    pub iterations: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    orbit_period: Option<u32>,
+    pub orbit_period: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    color_iterations: Option<u32>,
+    pub color_iterations: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    bailout: Option<f32>,
-    normal_epsilon: f32,
-    orbit: Vec<SceneOrbitTransform>,
+    pub bailout: Option<f32>,
+    pub normal_epsilon: f32,
+    pub orbit: Vec<SceneOrbitTransform>,
     #[serde(default)]
-    material: SceneDslMaterial,
+    pub material: SceneDslMaterial,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "kebab-case", deny_unknown_fields)]
-enum SceneOrbitTransform {
+pub enum SceneOrbitTransform {
     AmazingSurfFold {
         start_iteration: u32,
         stop_iteration: u32,
@@ -186,33 +208,33 @@ enum SceneOrbitTransform {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
-struct SceneDslMaterial {
-    base_color: [f32; 3],
-    accent_color: [f32; 3],
-    specular_color: [f32; 3],
-    background_bottom: [f32; 3],
-    background_top: [f32; 3],
-    color_frequency: f32,
-    surface_palette: Vec<SceneDslPaletteStop>,
-    orbit_palette_weight: f32,
-    palette_offset: f32,
-    camera_palette_weight: f32,
-    normal_palette_weight: f32,
-    ambient_strength: f32,
-    diffuse_strength: f32,
-    specular_strength: f32,
-    shininess: f32,
-    metallic_specular_strength: f32,
-    metallic_shininess: f32,
-    rim_strength: f32,
-    fog_density: f32,
+pub struct SceneDslMaterial {
+    pub base_color: [f32; 3],
+    pub accent_color: [f32; 3],
+    pub specular_color: [f32; 3],
+    pub background_bottom: [f32; 3],
+    pub background_top: [f32; 3],
+    pub color_frequency: f32,
+    pub surface_palette: Vec<SceneDslPaletteStop>,
+    pub orbit_palette_weight: f32,
+    pub palette_offset: f32,
+    pub camera_palette_weight: f32,
+    pub normal_palette_weight: f32,
+    pub ambient_strength: f32,
+    pub diffuse_strength: f32,
+    pub specular_strength: f32,
+    pub shininess: f32,
+    pub metallic_specular_strength: f32,
+    pub metallic_shininess: f32,
+    pub rim_strength: f32,
+    pub fog_density: f32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct SceneDslPaletteStop {
-    position: f32,
-    color: [f32; 3],
+pub struct SceneDslPaletteStop {
+    pub position: f32,
+    pub color: [f32; 3],
 }
 
 impl Default for SceneDslMaterial {
@@ -223,31 +245,31 @@ impl Default for SceneDslMaterial {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct SceneLight {
-    direction: [f32; 3],
+pub struct SceneLight {
+    pub direction: [f32; 3],
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct SceneRender {
-    width: u32,
-    height: u32,
-    max_steps: u32,
-    max_distance: f32,
-    epsilon: f32,
-    step_safety: f32,
-    pixel_epsilon_multiplier: f32,
+pub struct SceneRender {
+    pub width: u32,
+    pub height: u32,
+    pub max_steps: u32,
+    pub max_distance: f32,
+    pub epsilon: f32,
+    pub step_safety: f32,
+    pub pixel_epsilon_multiplier: f32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
-struct SceneQuality {
-    samples_per_pixel: u32,
-    ambient_occlusion: SceneAmbientOcclusion,
-    soft_shadow: SceneSoftShadow,
-    reflection: SceneReflection,
-    tone_mapping: SceneToneMapping,
-    post_process: ScenePostProcess,
+pub struct SceneQuality {
+    pub samples_per_pixel: u32,
+    pub ambient_occlusion: SceneAmbientOcclusion,
+    pub soft_shadow: SceneSoftShadow,
+    pub reflection: SceneReflection,
+    pub tone_mapping: SceneToneMapping,
+    pub post_process: ScenePostProcess,
 }
 
 impl Default for SceneQuality {
@@ -258,10 +280,10 @@ impl Default for SceneQuality {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
-struct SceneAmbientOcclusion {
-    max_steps: u32,
-    radius: f32,
-    strength: f32,
+pub struct SceneAmbientOcclusion {
+    pub max_steps: u32,
+    pub radius: f32,
+    pub strength: f32,
 }
 
 impl Default for SceneAmbientOcclusion {
@@ -272,10 +294,10 @@ impl Default for SceneAmbientOcclusion {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
-struct SceneSoftShadow {
-    max_steps: u32,
-    angular_radius_degrees: f32,
-    max_distance: f32,
+pub struct SceneSoftShadow {
+    pub max_steps: u32,
+    pub angular_radius_degrees: f32,
+    pub max_distance: f32,
 }
 
 impl Default for SceneSoftShadow {
@@ -286,11 +308,11 @@ impl Default for SceneSoftShadow {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
-struct SceneReflection {
-    max_steps: u32,
-    max_distance: f32,
-    strength: f32,
-    roughness: f32,
+pub struct SceneReflection {
+    pub max_steps: u32,
+    pub max_distance: f32,
+    pub strength: f32,
+    pub roughness: f32,
 }
 
 impl Default for SceneReflection {
@@ -301,20 +323,20 @@ impl Default for SceneReflection {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
-struct SceneToneMapping {
-    enabled: bool,
-    operator: SceneToneMappingOperator,
-    exposure_stops: f32,
-    white_point: f32,
-    brightness: f32,
-    contrast: f32,
-    gamma: f32,
-    saturation: f32,
+pub struct SceneToneMapping {
+    pub enabled: bool,
+    pub operator: SceneToneMappingOperator,
+    pub exposure_stops: f32,
+    pub white_point: f32,
+    pub brightness: f32,
+    pub contrast: f32,
+    pub gamma: f32,
+    pub saturation: f32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
-enum SceneToneMappingOperator {
+pub enum SceneToneMappingOperator {
     #[default]
     ExtendedReinhard,
     Mandelbulber,
@@ -328,13 +350,13 @@ impl Default for SceneToneMapping {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
-struct ScenePostProcess {
-    enabled: bool,
-    exposure_stops: f32,
-    contrast: f32,
-    saturation: f32,
-    gamma: f32,
-    vignette_strength: f32,
+pub struct ScenePostProcess {
+    pub enabled: bool,
+    pub exposure_stops: f32,
+    pub contrast: f32,
+    pub saturation: f32,
+    pub gamma: f32,
+    pub vignette_strength: f32,
 }
 
 impl Default for ScenePostProcess {
@@ -345,15 +367,15 @@ impl Default for ScenePostProcess {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct SceneAnimation {
-    fps: u32,
-    frame_count: u32,
-    path: SceneAnimationPath,
+pub struct SceneAnimation {
+    pub fps: u32,
+    pub frame_count: u32,
+    pub path: SceneAnimationPath,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", content = "parameters", rename_all = "kebab-case")]
-enum SceneAnimationPath {
+pub enum SceneAnimationPath {
     ExponentialDive(SceneExponentialDive),
     TargetOrbit(SceneTargetOrbit),
     MultiTargetDive(SceneMultiTargetDive),
@@ -362,58 +384,58 @@ enum SceneAnimationPath {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct SceneExponentialDive {
-    overview_distance: SceneScalar,
-    minimum_distance: SceneScalar,
-    overview_duration: f64,
-    dive_duration: f64,
+pub struct SceneExponentialDive {
+    pub overview_distance: SceneScalar,
+    pub minimum_distance: SceneScalar,
+    pub overview_duration: f64,
+    pub dive_duration: f64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct SceneTargetOrbit {
-    radius: SceneScalar,
-    duration: f64,
-    revolutions: f64,
-    axis: [f64; 3],
-    cone_angle_degrees: f64,
+pub struct SceneTargetOrbit {
+    pub radius: SceneScalar,
+    pub duration: f64,
+    pub revolutions: f64,
+    pub axis: [f64; 3],
+    pub cone_angle_degrees: f64,
     #[serde(default)]
-    start_angle_degrees: f64,
+    pub start_angle_degrees: f64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct SceneMultiTargetDive {
-    overview_distance: SceneScalar,
-    minimum_distance: SceneScalar,
-    overview_duration: f64,
-    dive_duration: f64,
-    transition_duration: f64,
+pub struct SceneMultiTargetDive {
+    pub overview_distance: SceneScalar,
+    pub minimum_distance: SceneScalar,
+    pub overview_duration: f64,
+    pub dive_duration: f64,
+    pub transition_duration: f64,
     #[serde(default)]
-    search: SceneTargetSearch,
+    pub search: SceneTargetSearch,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct SceneSurfaceFlyover {
-    camera_height: f64,
-    travel_distance: f64,
-    duration: f64,
-    look_ahead: f64,
-    travel_direction: [f64; 3],
-    normal_epsilon: f64,
+pub struct SceneSurfaceFlyover {
+    pub camera_height: f64,
+    pub travel_distance: f64,
+    pub duration: f64,
+    pub look_ahead: f64,
+    pub travel_direction: [f64; 3],
+    pub normal_epsilon: f64,
     #[serde(default)]
-    search: SceneTargetSearch,
+    pub search: SceneTargetSearch,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
-struct SceneTargetSearch {
-    bound_radius: f64,
-    hit_epsilon: f64,
-    max_steps: u32,
-    attempts: u32,
-    aim_jitter: f64,
+pub struct SceneTargetSearch {
+    pub bound_radius: f64,
+    pub hit_epsilon: f64,
+    pub max_steps: u32,
+    pub attempts: u32,
+    pub aim_jitter: f64,
 }
 
 impl Default for SceneTargetSearch {
@@ -430,12 +452,12 @@ impl Default for SceneTargetSearch {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
-struct SceneVideo {
-    codec: String,
-    pixel_format: String,
-    crf: u8,
-    preset: String,
-    faststart: bool,
+pub struct SceneVideo {
+    pub codec: String,
+    pub pixel_format: String,
+    pub crf: u8,
+    pub preset: String,
+    pub faststart: bool,
 }
 
 impl Default for SceneVideo {
@@ -445,10 +467,10 @@ impl Default for SceneVideo {
     }
 }
 
-impl TryFrom<SceneDocument> for LoadedScene {
+impl TryFrom<SceneSpec> for LoadedScene {
     type Error = anyhow::Error;
 
-    fn try_from(document: SceneDocument) -> Result<Self> {
+    fn try_from(document: SceneSpec) -> Result<Self> {
         if document.version != CURRENT_SCENE_VERSION {
             bail!(
                 "unsupported scene version {}; this build supports version {}",
@@ -558,7 +580,7 @@ impl TryFrom<SceneDocument> for LoadedScene {
     }
 }
 
-impl From<&LoadedScene> for SceneDocument {
+impl From<&LoadedScene> for SceneSpec {
     fn from(scene: &LoadedScene) -> Self {
         let fractal = match &scene.config.fractal {
             FractalConfig::Mandelbulb(config) => SceneFractal::Mandelbulb(SceneMandelbulb {
