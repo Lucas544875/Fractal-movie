@@ -101,6 +101,11 @@ const KILL: (&str, &str, bool) = (
     "企画を破棄してロケハンへ戻る。使ったロケ地は再選択できなくなる",
     true,
 );
+const REOPEN: (&str, &str, bool) = (
+    "reopen",
+    "shotlist か look の工程へ戻って作り直す。いまの工程の revise を1回消費する",
+    true,
+);
 const REVIEW: (&str, &str, bool) = (
     "review submit",
     "批評役の判定 (pass / revise / kill) を登録する",
@@ -153,39 +158,41 @@ const fn guide(stage: Stage) -> StageGuide {
         Stage::Look => StageGuide {
             instruction: "look.yaml を書く。品質設定は書かない。効果は effects_requested で要求する。",
             commands: &[
-                ("look preview", "ルック確認画像と指標を作る", false),
+                ("look preview", "ルック確認画像と指標を作る", true),
                 REVIEW,
+                REOPEN,
                 KILL,
             ],
             write: &["look.yaml"],
-            read: &["reviews/"],
+            read: &["look/", "reviews/"],
         },
         Stage::Proof => StageGuide {
-            instruction: "プルーフを実行する。品質設定はハーネスが決める。予算を超えた場合は尺を縮めるかカットを差し替える。",
+            instruction: "プルーフを実行する。品質設定はハーネスが決める。ゲートを通らない場合は reopen で shotlist か look へ戻り、カットやルックを直す。",
             commands: &[
                 (
                     "proof",
                     "効果の有無比較、品質決定、時間見積もり、プルーフ動画、圧縮耐性",
-                    false,
+                    true,
                 ),
                 REVIEW,
+                REOPEN,
                 KILL,
             ],
-            write: &["shotlist.yaml", "look.yaml"],
+            write: &[],
             read: &["proof/", "reviews/"],
         },
         Stage::Production => StageGuide {
             instruction: "本番レンダリングを起動し、完了まで監視する。設計は変更できない。中断時は同じコマンドで再開する。",
             commands: &[
-                ("produce", "カット単位で本番フレームを描画する", false),
-                ("status", "進捗と残り時間の見積もりを返す", false),
+                ("produce", "カット単位で本番フレームを描画する", true),
+                ("status", "進捗と残り時間の見積もりを返す", true),
             ],
             write: &[],
             read: &["jobs/"],
         },
         Stage::Encode => StageGuide {
             instruction: "動画を合成し、QC を通す。",
-            commands: &[("encode", "MP4 の合成、QC、台帳への追記", false)],
+            commands: &[("encode", "MP4 の合成、QC、台帳への追記", true)],
             write: &[],
             read: &["final/"],
         },

@@ -49,6 +49,29 @@ shotlist:
   max_cut_seconds: 60.0
   min_cut_differences: 2
   min_clearance_ratio: 0.02
+look:
+  preview_width: 480
+  preview_samples_per_pixel: 8
+  preview_effect_steps: 24
+  max_hue_clusters: 3
+  max_clipped_high: 0.02
+  max_clipped_low: 0.6
+  occlusion_radius_ratio: 0.2
+  shadow_distance_ratio: 3.0
+  reflection_distance_ratio: 3.0
+  aperture_ratio: 0.01
+  occlusion_steps: 64
+  shadow_steps: 96
+  reflection_steps: 48
+proof:
+  region_fraction: 0.5
+  clip_width: 960
+  clip_seconds_per_cut: 1.0
+  delivery_kbps_1080p: 8000
+  min_delivery_ssim: 0.9
+  compare_every: 3
+encode:
+  master_crf: 16
 quality:
   reference_spp: 64
   ablation_spp: 16

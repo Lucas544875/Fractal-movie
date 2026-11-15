@@ -11,14 +11,17 @@ use fractal_renderer_harness::{
     animatic, brief,
     budget::Budget,
     describe::describe,
+    encode,
     gpu::{GpuOptions, SceneProbe, measure_legibility},
     import::{self, ImportOptions},
     ledger::Ledger,
-    next,
+    look, next,
+    produce::{self, ProduceOptions},
     production::{DEFAULT_LEDGER, DEFAULT_ROOT, Production},
+    proof,
     quality::{FrameLimits, decide},
     scout, shotlist,
-    stage::{ReviewOutcome, Verdict},
+    stage::{ReviewOutcome, Stage, Verdict},
     tuning::{DEFAULT_TUNING_FILE, Tuning},
 };
 use serde_json::{Value, json};
@@ -47,6 +50,9 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 }
+
+/// Environment variable that marks a process as the critic.
+const CRITIC_ROLE_VARIABLE: &str = "FRACTAL_HARNESS_ROLE";
 
 /// Tuning for commands that are not bound to a production.
 fn general_tuning(explicit: Option<&PathBuf>) -> Result<Tuning> {
@@ -149,6 +155,55 @@ enum Command {
         #[command(flatten)]
         gpu: GpuArgs,
     },
+
+    /// Apply look.yaml to every cut, render preview frames, and judge the
+    /// look against the brief.
+    Look {
+        #[command(subcommand)]
+        command: LookCommand,
+    },
+
+    /// Decide the final quality, estimate the render time against the
+    /// budget, and render a proof clip judged after delivery compression.
+    Proof {
+        id: String,
+
+        #[command(flatten)]
+        gpu: GpuArgs,
+    },
+
+    /// Go back to the shot list or the look to change it. Costs one
+    /// revision of the stage being left.
+    Reopen {
+        id: String,
+
+        #[arg(long, value_enum)]
+        stage: ReopenStage,
+
+        /// Why the earlier stage has to change.
+        #[arg(long)]
+        reason: String,
+    },
+
+    /// Render the final frames. Safe to interrupt; run it again to
+    /// continue.
+    Produce {
+        id: String,
+
+        /// Stop after this many frames in this run.
+        #[arg(long)]
+        max_frames: Option<u32>,
+
+        #[command(flatten)]
+        gpu: GpuArgs,
+    },
+
+    /// Report the progress of production rendering.
+    Status { id: String },
+
+    /// Cut the rendered frames into the final file, check it, and enter
+    /// the film into the ledger.
+    Encode { id: String },
 
     /// Record the critic's verdict on the current stage.
     Review {
@@ -261,6 +316,17 @@ enum ShotlistCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum LookCommand {
+    /// Judge the schema, hue-count, and clipping gates from look.yaml.
+    Preview {
+        id: String,
+
+        #[command(flatten)]
+        gpu: GpuArgs,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum ReviewCommand {
     /// Apply a verdict. Every measured gate of the stage must have passed.
     Submit {
@@ -273,6 +339,12 @@ enum ReviewCommand {
         #[arg(long)]
         notes: String,
     },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ReopenStage {
+    Shotlist,
+    Look,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -302,6 +374,13 @@ enum BriefCommand {
 enum LedgerCommand {
     /// List finished films with their axes.
     List,
+
+    /// Compose the keyframes of the most recent films into one image for
+    /// review.
+    Sheet {
+        /// PNG file to write.
+        path: PathBuf,
+    },
 
     /// Register a film made outside the harness from its scene file. Its
     /// axes are classified and its keyframes rendered for the novelty gate.
@@ -539,12 +618,103 @@ fn run(cli: Cli) -> Result<Value> {
                 serde_json::to_value(report).context("could not serialize report")?;
             Ok(value)
         }
+        Command::Look {
+            command: LookCommand::Preview { id, gpu },
+        } => {
+            let ledger = Ledger::load(&cli.ledger)?;
+            let production = Production::open(&cli.root, &id)?;
+            let mut state = production.load_state()?;
+            let mut budget = production.load_budget()?;
+            let report = look::preview(&production, &mut state, &mut budget, &gpu.options())?;
+            production.save_state(&state)?;
+            let mut value = next_report(&production, &ledger)?;
+            value["look"] = serde_json::to_value(report).context("could not serialize report")?;
+            Ok(value)
+        }
+        Command::Proof { id, gpu } => {
+            let ledger = Ledger::load(&cli.ledger)?;
+            let production = Production::open(&cli.root, &id)?;
+            let mut state = production.load_state()?;
+            let mut budget = production.load_budget()?;
+            let report = proof::run(&production, &mut state, &mut budget, &gpu.options())?;
+            production.save_state(&state)?;
+            let mut value = next_report(&production, &ledger)?;
+            value["proof"] = serde_json::to_value(report).context("could not serialize report")?;
+            Ok(value)
+        }
+        Command::Produce {
+            id,
+            max_frames,
+            gpu,
+        } => {
+            let ledger = Ledger::load(&cli.ledger)?;
+            let production = Production::open(&cli.root, &id)?;
+            let mut state = production.load_state()?;
+            let mut budget = production.load_budget()?;
+            let report = produce::run(
+                &production,
+                &mut state,
+                &mut budget,
+                &ProduceOptions {
+                    max_frames,
+                    gpu: gpu.options(),
+                },
+            )?;
+            production.save_state(&state)?;
+            let mut value = next_report(&production, &ledger)?;
+            value["produce"] =
+                serde_json::to_value(report).context("could not serialize report")?;
+            Ok(value)
+        }
+        Command::Status { id } => {
+            let production = Production::open(&cli.root, &id)?;
+            let status = produce::status(&production)?;
+            Ok(json!({ "ok": true, "stage": production.load_state()?.stage, "status": status }))
+        }
+        Command::Encode { id } => {
+            let mut ledger = Ledger::load(&cli.ledger)?;
+            let production = Production::open(&cli.root, &id)?;
+            let mut state = production.load_state()?;
+            let report = encode::run(
+                &production,
+                &mut state,
+                &production.load_budget()?,
+                &mut ledger,
+                &cli.ledger,
+            )?;
+            production.save_state(&state)?;
+            let mut value = next_report(&production, &ledger)?;
+            value["encode"] = serde_json::to_value(report).context("could not serialize report")?;
+            Ok(value)
+        }
+        Command::Reopen { id, stage, reason } => {
+            let ledger = Ledger::load(&cli.ledger)?;
+            let production = Production::open(&cli.root, &id)?;
+            let mut state = production.load_state()?;
+            let target = match stage {
+                ReopenStage::Shotlist => Stage::Shotlist,
+                ReopenStage::Look => Stage::Look,
+            };
+            let remaining = state.reopen(target, reason)?;
+            production.save_state(&state)?;
+            let mut value = next_report(&production, &ledger)?;
+            value["revisions_remaining"] = json!(remaining);
+            Ok(value)
+        }
         Command::Review {
             command: ReviewCommand::Submit { id, verdict, notes },
         } => {
             let ledger = Ledger::load(&cli.ledger)?;
             let production = Production::open(&cli.root, &id)?;
             let mut state = production.load_state()?;
+            // The verdict must come from the critic's own process. A director
+            // is only permitted to run this executable without an environment
+            // prefix, so it cannot grade its own work.
+            if std::env::var(CRITIC_ROLE_VARIABLE).as_deref() != Ok("critic") {
+                anyhow::bail!(
+                    "verdicts are submitted by the critic; run tools/film-critic.sh {id} instead"
+                );
+            }
             let stage = state.stage;
             let verdict = Verdict::from(verdict);
             let outcome = state.review(verdict, notes.clone())?;
@@ -598,6 +768,16 @@ fn run(cli: Cli) -> Result<Value> {
                 })
                 .collect();
             Ok(json!({ "ok": true, "films": films }))
+        }
+        Command::Ledger {
+            command: LedgerCommand::Sheet { path },
+        } => {
+            let ledger = Ledger::load(&cli.ledger)?;
+            let window = general_tuning(tuning_file.as_ref())?
+                .diversity
+                .axis_diff_window;
+            let films = ledger.write_sheet(&path, window)?;
+            Ok(json!({ "ok": true, "sheet": films.as_ref().map(|_| &path), "films": films }))
         }
         Command::Ledger {
             command:
@@ -687,7 +867,7 @@ fn measure(
         max_frame_seconds: budget.max_frame_seconds,
     };
 
-    let mut probe = SceneProbe::new(&scene, options)?;
+    let mut probe = SceneProbe::new(&scene, options, tuning.proof.region_fraction)?;
     let frames = probe.probe_frames();
     let requested = probe.requested();
     eprintln!(

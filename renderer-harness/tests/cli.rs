@@ -292,15 +292,11 @@ fn later_stage_commands_are_refused_while_scouting() {
     for arguments in [
         vec!["shotlist", "check", "film"],
         vec!["animatic", "film"],
-        vec![
-            "review",
-            "submit",
-            "film",
-            "--verdict",
-            "pass",
-            "--notes",
-            "looks fine",
-        ],
+        vec!["look", "preview", "film"],
+        vec!["proof", "film"],
+        vec!["produce", "film"],
+        vec!["encode", "film"],
+        vec!["reopen", "film", "--stage", "shotlist", "--reason", "recut"],
     ] {
         let (ok, value) = sandbox.run(&arguments);
         assert!(!ok, "{arguments:?} was accepted");
@@ -393,4 +389,46 @@ fn a_production_keeps_the_tuning_it_was_created_with() {
     let (ok, _) = sandbox.run(&["--tuning", file_argument, "init", "unusable"]);
     assert!(!ok);
     assert!(!sandbox.root().join("unusable").exists());
+}
+
+#[test]
+fn only_the_critic_role_may_submit_a_verdict() {
+    let sandbox = Sandbox::new("critic");
+    sandbox.run(&["init", "film"]);
+    let arguments = [
+        "review",
+        "submit",
+        "film",
+        "--verdict",
+        "pass",
+        "--notes",
+        "fine",
+    ];
+
+    let (ok, value) = sandbox.run(&arguments);
+    assert!(!ok);
+    assert!(
+        value["error"].as_str().unwrap().contains("film-critic.sh"),
+        "{value}"
+    );
+
+    // With the role, the request reaches the stage machine, which refuses
+    // it because scouting has no review.
+    let output = Command::new(env!("CARGO_BIN_EXE_fractal-harness"))
+        .env("FRACTAL_HARNESS_ROLE", "critic")
+        .arg("--root")
+        .arg(sandbox.root())
+        .arg("--ledger")
+        .arg(sandbox.ledger())
+        .args(arguments)
+        .output()
+        .unwrap();
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        value["error"]
+            .as_str()
+            .unwrap()
+            .contains("no critic review"),
+        "{value}"
+    );
 }

@@ -98,6 +98,62 @@ pub fn load_frame(path: &Path) -> Result<crate::metrics::Frame> {
     crate::metrics::Frame::from_rgba8(image.width(), image.height(), image.as_raw())
 }
 
+/// Halves an RGBA8 image by averaging 2x2 blocks. Odd trailing rows and
+/// columns are dropped.
+#[must_use]
+pub fn halve(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let (width, height) = (width as usize, height as usize);
+    let mut halved = Vec::with_capacity((width / 2) * (height / 2) * 4);
+    for y in 0..height / 2 {
+        for x in 0..width / 2 {
+            for channel in 0..4 {
+                let sum: u32 = [(0, 0), (1, 0), (0, 1), (1, 1)]
+                    .iter()
+                    .map(|(dx, dy)| {
+                        u32::from(rgba[((y * 2 + dy) * width + x * 2 + dx) * 4 + channel])
+                    })
+                    .sum();
+                halved.push(((sum + 2) / 4) as u8);
+            }
+        }
+    }
+    halved
+}
+
+/// Fits an RGBA8 image into a cell of another size without distorting it:
+/// scaled to fit by nearest-neighbour sampling and centred on black.
+#[must_use]
+pub fn fit_cell(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    cell_width: u32,
+    cell_height: u32,
+) -> Vec<u8> {
+    let (width, height) = (width as usize, height as usize);
+    let (cell_width, cell_height) = (cell_width as usize, cell_height as usize);
+    let mut cell = [0u8, 0, 0, 255].repeat(cell_width * cell_height);
+    if width == 0 || height == 0 {
+        return cell;
+    }
+    // The largest size with the source's aspect ratio that fits the cell.
+    let (fit_width, fit_height) = if width * cell_height > height * cell_width {
+        (cell_width, (height * cell_width / width).max(1))
+    } else {
+        ((width * cell_height / height).max(1), cell_height)
+    };
+    let (left, top) = ((cell_width - fit_width) / 2, (cell_height - fit_height) / 2);
+    for y in 0..fit_height {
+        let source_y = y * height / fit_height;
+        for x in 0..fit_width {
+            let source = (source_y * width + x * width / fit_width) * 4;
+            let target = ((top + y) * cell_width + left + x) * 4;
+            cell[target..target + 4].copy_from_slice(&rgba[source..source + 4]);
+        }
+    }
+    cell
+}
+
 /// Lays cells out row by row in a grid of `columns`.
 pub fn compose(
     cells: &[Cell<'_>],
@@ -282,6 +338,37 @@ mod tests {
         for digit in "0123456789-".chars() {
             assert!(glyph(digit).is_some());
         }
+    }
+
+    #[test]
+    fn halving_averages_blocks_and_drops_odd_edges() {
+        // 3x2 image: a 2x2 block of 0, 100, 200, 100 and an odd column.
+        let pixel = |value: u8| [value, value, value, 255];
+        let rgba: Vec<u8> = [0, 100, 9, 200, 100, 9]
+            .into_iter()
+            .flat_map(pixel)
+            .collect();
+        assert_eq!(halve(&rgba, 3, 2), vec![100, 100, 100, 255]);
+        assert!(halve(&rgba, 1, 1).is_empty());
+    }
+
+    #[test]
+    fn fitting_keeps_the_aspect_ratio_and_centres_the_image() {
+        // A 4x2 white image into a 4x4 cell: two black rows, the image, two
+        // black rows... here one above and one below.
+        let white = [255u8; 4 * 2 * 4];
+        let cell = fit_cell(&white, 4, 2, 4, 4);
+        let row = |y: usize| cell[y * 16];
+        assert_eq!([row(0), row(1), row(2), row(3)], [0, 255, 255, 0]);
+
+        // A tall image is pillarboxed instead.
+        let cell = fit_cell(&[255u8; 2 * 4 * 4], 2, 4, 4, 4);
+        assert_eq!([cell[0], cell[4], cell[8], cell[12]], [0, 255, 255, 0]);
+
+        // Same shape, different size: every cell pixel comes from the source.
+        let cell = fit_cell(&[200u8; 8 * 4 * 4], 8, 4, 4, 2);
+        assert!(cell.chunks_exact(4).all(|pixel| pixel[0] == 200));
+        assert_eq!(fit_cell(&[], 0, 0, 2, 2).len(), 16);
     }
 
     #[test]

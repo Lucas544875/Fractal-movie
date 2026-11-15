@@ -14,10 +14,6 @@ use crate::{
     quality::{Probe, Sample, Settings},
 };
 
-/// Side of the centred probe region, as a fraction of the frame. The centre
-/// usually holds the subject and so the most expensive pixels, which keeps
-/// the extrapolated frame time on the pessimistic side.
-const PROBE_REGION_FRACTION: f64 = 0.5;
 /// Samples used for legibility thumbnails; enough to remove aliasing.
 const THUMBNAIL_SPP: u32 = 4;
 
@@ -69,10 +65,17 @@ pub struct SceneProbe {
 }
 
 impl SceneProbe {
-    pub fn new(scene: &LoadedScene, options: &GpuOptions) -> Result<Self> {
+    /// `region_fraction` is the side of the centred probe region as a
+    /// fraction of the frame. The centre usually holds the subject and so
+    /// the most expensive pixels, which keeps the extrapolated frame time on
+    /// the pessimistic side.
+    pub fn new(scene: &LoadedScene, options: &GpuOptions, region_fraction: f64) -> Result<Self> {
+        if !region_fraction.is_finite() || !(0.05..=1.0).contains(&region_fraction) {
+            bail!("probe region fraction {region_fraction} must be in 0.05..=1");
+        }
         let (width, height) = (scene.config.render.width, scene.config.render.height);
-        let region_width = probe_extent(width);
-        let region_height = probe_extent(height);
+        let region_width = probe_extent(width, region_fraction);
+        let region_height = probe_extent(height, region_fraction);
         let region = RenderRegion {
             x: (width - region_width) / 2,
             y: (height - region_height) / 2,
@@ -240,10 +243,11 @@ pub fn key_frames(scene: &LoadedScene) -> Vec<u32> {
     frames
 }
 
-/// Half the extent, kept even so chroma-subsampled comparisons stay aligned.
-fn probe_extent(extent: u32) -> u32 {
-    let half = (f64::from(extent) * PROBE_REGION_FRACTION) as u32;
-    (half - half % 2).clamp(1, extent)
+/// A fraction of the extent, kept even so chroma-subsampled comparisons
+/// stay aligned.
+fn probe_extent(extent: u32, fraction: f64) -> u32 {
+    let side = (f64::from(extent) * fraction) as u32;
+    (side - side % 2).clamp(1, extent)
 }
 
 pub(crate) fn frame_config(
@@ -302,11 +306,13 @@ mod tests {
 
     #[test]
     fn probe_extent_is_even_and_inside_the_frame() {
-        assert_eq!(probe_extent(1920), 960);
-        assert_eq!(probe_extent(1080), 540);
-        assert_eq!(probe_extent(810), 404);
-        assert_eq!(probe_extent(1), 1);
-        assert_eq!(probe_extent(2), 1);
+        assert_eq!(probe_extent(1920, 0.5), 960);
+        assert_eq!(probe_extent(1920, 0.25), 480);
+        assert_eq!(probe_extent(1920, 1.0), 1920);
+        assert_eq!(probe_extent(1080, 0.5), 540);
+        assert_eq!(probe_extent(810, 0.5), 404);
+        assert_eq!(probe_extent(1, 0.5), 1);
+        assert_eq!(probe_extent(2, 0.5), 1);
     }
 
     #[test]

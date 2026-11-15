@@ -11,7 +11,7 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{budget::Budget, ledger::Ledger, mandate::Mandate, stage::State, tuning::Tuning};
 
-pub const DEFAULT_ROOT: &str = "output/productions";
+pub const DEFAULT_ROOT: &str = "productions";
 pub const DEFAULT_LEDGER: &str = "portfolio/ledger.jsonl";
 
 const MAX_ID_LENGTH: usize = 64;

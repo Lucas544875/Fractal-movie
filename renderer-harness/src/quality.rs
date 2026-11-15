@@ -343,6 +343,27 @@ pub fn decide(
     })
 }
 
+/// Measures the frame time of fixed settings, without deciding anything.
+/// Returns the estimate and the GPU seconds the measurement cost.
+pub fn measure(
+    probe: &mut dyn Probe,
+    frames: &[u32],
+    settings: &Settings,
+) -> Result<(Estimate, f64)> {
+    if frames.is_empty() {
+        bail!("a time measurement needs at least one probe frame");
+    }
+    let mut session = Session {
+        probe,
+        frames,
+        cache: Vec::new(),
+        gpu_seconds_spent: 0.0,
+        renders: 0,
+    };
+    let estimate = session.estimate(settings)?;
+    Ok((estimate, session.gpu_seconds_spent))
+}
+
 /// Step counts below `full` worth trying, cheapest first.
 fn reduced_steps(full: u32, min_steps: u32) -> Vec<u32> {
     let mut steps: Vec<u32> = [full / 4, full / 2]
@@ -813,6 +834,22 @@ mod tests {
         assert!(
             super::decide(&mut Synthetic::new(), &[0], &requested(), &GENEROUS, &empty).is_err()
         );
+    }
+
+    #[test]
+    fn measuring_renders_each_frame_once_and_decides_nothing() {
+        let mut probe = Synthetic::new();
+        let settings = Settings {
+            samples_per_pixel: 8,
+            ..requested()
+        };
+        let (estimate, gpu_seconds) = measure(&mut probe, &[0, 4], &settings).unwrap();
+        assert_eq!(probe.calls, 2);
+        // 8 spp with two effects at 64 steps: 0.01 * 8 * 3.
+        assert!((estimate.mean_frame_seconds - 0.24).abs() < 1.0e-9);
+        assert_eq!(estimate.frames.len(), 2);
+        assert!((gpu_seconds - 0.12).abs() < 1.0e-9);
+        assert!(measure(&mut probe, &[], &settings).is_err());
     }
 
     #[test]

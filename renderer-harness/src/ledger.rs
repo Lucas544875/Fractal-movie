@@ -168,6 +168,66 @@ impl Ledger {
     }
 }
 
+/// One film on a portfolio sheet.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SheetFilm {
+    /// Number the film's keyframes are labelled with on the sheet.
+    pub number: usize,
+    pub id: String,
+    pub title: String,
+}
+
+impl Ledger {
+    /// Composes the keyframes of the most recent films into one image, so a
+    /// reviewer can compare new work against the portfolio at a glance.
+    /// Labels read "film number-keyframe number". Returns the films shown,
+    /// newest first, or `None` when there is nothing to show.
+    pub fn write_sheet(&self, path: &Path, films: usize) -> Result<Option<Vec<SheetFilm>>> {
+        const CELL: (u32, u32) = (320, 180);
+        let mut shown = Vec::new();
+        let mut cells: Vec<(String, Vec<u8>)> = Vec::new();
+        for entry in self.recent(films) {
+            if entry.keyframes.is_empty() {
+                continue;
+            }
+            let number = shown.len() + 1;
+            for (index, keyframe) in entry.keyframes.iter().enumerate() {
+                let image = image::open(keyframe)
+                    .with_context(|| format!("could not decode keyframe {keyframe}"))?
+                    .into_rgba8();
+                cells.push((
+                    format!("{number}-{}", index + 1),
+                    crate::sheet::fit_cell(
+                        image.as_raw(),
+                        image.width(),
+                        image.height(),
+                        CELL.0,
+                        CELL.1,
+                    ),
+                ));
+            }
+            shown.push(SheetFilm {
+                number,
+                id: entry.id.clone(),
+                title: entry.title.clone(),
+            });
+        }
+        if cells.is_empty() {
+            return Ok(None);
+        }
+        let cells: Vec<crate::sheet::Cell<'_>> = cells
+            .iter()
+            .map(|(label, rgba)| crate::sheet::Cell { label, rgba })
+            .collect();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("could not create {}", parent.display()))?;
+        }
+        crate::sheet::compose(&cells, 6, CELL.0 as usize, CELL.1 as usize)?.save_png(path)?;
+        Ok(Some(shown))
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -231,6 +291,56 @@ pub(crate) mod tests {
         let reloaded = Ledger::load(&path).unwrap();
         assert_eq!(reloaded.entries(), ledger.entries());
         fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn the_portfolio_sheet_shows_recent_films_with_keyframes() {
+        let directory = temp_path("sheet");
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let keyframe = |name: &str, width: u32, height: u32| {
+            let path = directory.join(name);
+            crate::sheet::save_png(
+                &path,
+                width,
+                height,
+                &vec![128; (width * height * 4) as usize],
+            )
+            .unwrap();
+            path.to_string_lossy().into_owned()
+        };
+        let mut old = entry("old", FormulaFamily::Mandelbox, Motion::Dive);
+        old.keyframes = vec![keyframe("old.png", 320, 180)];
+        let none = entry("no-keyframes", FormulaFamily::Mandelbox, Motion::Dive);
+        let mut new = entry("new", FormulaFamily::JuliaBox, Motion::Orbit);
+        // A different aspect ratio must still fit a cell.
+        new.keyframes = vec![
+            keyframe("new-1.png", 320, 213),
+            keyframe("new-2.png", 320, 213),
+        ];
+        let ledger = Ledger::from_entries(vec![old, none, new]).unwrap();
+
+        let sheet = directory.join("out/portfolio.png");
+        let shown = ledger.write_sheet(&sheet, 5).unwrap().unwrap();
+        // Newest first; films without keyframes take no number.
+        assert_eq!(
+            shown
+                .iter()
+                .map(|film| (film.number, film.id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "new"), (2, "old")]
+        );
+        let image = image::open(&sheet).unwrap();
+        // Three cells of 320x180 in one row, with gutters.
+        assert_eq!(
+            (image.width(), image.height()),
+            (3 * 320 + 4 * 4, 180 + 2 * 4)
+        );
+
+        // Only the most recent film is shown when asked for one.
+        assert_eq!(ledger.write_sheet(&sheet, 1).unwrap().unwrap().len(), 1);
+        assert_eq!(Ledger::default().write_sheet(&sheet, 5).unwrap(), None);
+        fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]

@@ -22,6 +22,9 @@ pub struct Tuning {
     pub legibility: LegibilityLimits,
     pub classification: Classification,
     pub shotlist: ShotlistRules,
+    pub look: LookRules,
+    pub proof: ProofRules,
+    pub encode: EncodeRules,
     pub quality: QualityRules,
 }
 
@@ -226,6 +229,103 @@ impl Default for ShotlistRules {
     }
 }
 
+/// How a look is applied, previewed, and judged.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LookRules {
+    /// Width of look preview frames.
+    pub preview_width: u32,
+    pub preview_samples_per_pixel: u32,
+    /// Steps requested effects are previewed with.
+    pub preview_effect_steps: u32,
+    /// Most hue clusters a frame may show.
+    pub max_hue_clusters: u32,
+    /// Largest share of a frame that may be blown out or crushed.
+    pub max_clipped_high: f32,
+    pub max_clipped_low: f32,
+    /// Ambient-occlusion radius, in subject distances.
+    pub occlusion_radius_ratio: f64,
+    /// Reach of shadow and reflection rays, in subject distances.
+    pub shadow_distance_ratio: f64,
+    pub reflection_distance_ratio: f64,
+    /// Lens radius at full depth-of-field strength, in subject distances.
+    pub aperture_ratio: f64,
+    /// Steps a requested effect starts from before the quality decision
+    /// reduces them.
+    pub occlusion_steps: u32,
+    pub shadow_steps: u32,
+    pub reflection_steps: u32,
+}
+
+impl Default for LookRules {
+    fn default() -> Self {
+        Self {
+            preview_width: 480,
+            preview_samples_per_pixel: 8,
+            preview_effect_steps: 24,
+            max_hue_clusters: 3,
+            max_clipped_high: 0.02,
+            max_clipped_low: 0.6,
+            occlusion_radius_ratio: 0.2,
+            shadow_distance_ratio: 3.0,
+            reflection_distance_ratio: 3.0,
+            aperture_ratio: 0.01,
+            occlusion_steps: 64,
+            shadow_steps: 96,
+            reflection_steps: 48,
+        }
+    }
+}
+
+/// How the final quality is measured and a proof clip is made.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProofRules {
+    /// Side of the centred region rendered to measure quality and time, as
+    /// a fraction of the frame.
+    pub region_fraction: f64,
+    /// Width of the proof clip.
+    pub clip_width: u32,
+    /// Seconds of each cut, around its middle, shown in the proof clip.
+    pub clip_seconds_per_cut: f64,
+    /// Bitrate a delivery platform is assumed to give a 1920x1080 stream;
+    /// scaled by pixel count for other sizes.
+    pub delivery_kbps_1080p: u32,
+    /// Lowest structural similarity between the proof clip and its
+    /// delivery-bitrate encode.
+    pub min_delivery_ssim: f32,
+    /// Every n-th frame is compared after compression.
+    pub compare_every: u32,
+}
+
+impl Default for ProofRules {
+    fn default() -> Self {
+        Self {
+            region_fraction: 0.5,
+            clip_width: 960,
+            clip_seconds_per_cut: 1.0,
+            delivery_kbps_1080p: 8000,
+            min_delivery_ssim: 0.90,
+            compare_every: 3,
+        }
+    }
+}
+
+/// How the final file is encoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EncodeRules {
+    /// Constant rate factor of the master file; lower is better and larger.
+    /// The delivery platform transcodes from this file.
+    pub master_crf: u32,
+}
+
+impl Default for EncodeRules {
+    fn default() -> Self {
+        Self { master_crf: 16 }
+    }
+}
+
 /// How the render quality of a cut is decided.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -381,6 +481,62 @@ impl Tuning {
             bail!("legibility negative-space limits must be ordered within 0..=1");
         }
 
+        let look = &self.look;
+        let steps_limit = fractal_renderer_core::MAX_SECONDARY_RAY_STEPS;
+        if look.preview_width < 64
+            || look.preview_samples_per_pixel == 0
+            || look.preview_samples_per_pixel > fractal_renderer_core::MAX_SAMPLES_PER_PIXEL
+        {
+            bail!("look preview size and sample count are out of range");
+        }
+        if [
+            look.preview_effect_steps,
+            look.occlusion_steps,
+            look.shadow_steps,
+            look.reflection_steps,
+        ]
+        .iter()
+        .any(|steps| *steps == 0 || *steps > steps_limit)
+        {
+            bail!("look effect steps must be in 1..={steps_limit}");
+        }
+        for (name, value) in [
+            ("occlusion_radius_ratio", look.occlusion_radius_ratio),
+            ("shadow_distance_ratio", look.shadow_distance_ratio),
+            ("reflection_distance_ratio", look.reflection_distance_ratio),
+            ("aperture_ratio", look.aperture_ratio),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                bail!("look {name} must be positive");
+            }
+        }
+        for (name, value) in [
+            ("max_clipped_high", look.max_clipped_high),
+            ("max_clipped_low", look.max_clipped_low),
+        ] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                bail!("look {name} must be in 0..=1");
+            }
+        }
+
+        let proof = &self.proof;
+        if !proof.region_fraction.is_finite() || !(0.05..=1.0).contains(&proof.region_fraction) {
+            bail!("proof region_fraction must be in 0.05..=1");
+        }
+        if proof.clip_width < 64
+            || !proof.clip_seconds_per_cut.is_finite()
+            || proof.clip_seconds_per_cut <= 0.0
+            || proof.delivery_kbps_1080p == 0
+            || proof.compare_every == 0
+            || !(0.0..=1.0).contains(&proof.min_delivery_ssim)
+        {
+            bail!("proof clip settings are out of range");
+        }
+
+        if self.encode.master_crf > 51 {
+            bail!("encode master_crf must be in 0..=51");
+        }
+
         let quality = &self.quality;
         if quality.spp_ladder.is_empty()
             || quality.spp_ladder.windows(2).any(|pair| pair[0] >= pair[1])
@@ -467,6 +623,12 @@ mod tests {
             |tuning| tuning.classification.medium_cut_seconds = 20.0,
             |tuning| tuning.shotlist.min_cut_differences = 4,
             |tuning| tuning.shotlist.min_transition_cut_seconds = 0.5,
+            |tuning| tuning.look.preview_effect_steps = 0,
+            |tuning| tuning.look.aperture_ratio = 0.0,
+            |tuning| tuning.look.max_clipped_high = 2.0,
+            |tuning| tuning.proof.region_fraction = 0.0,
+            |tuning| tuning.proof.compare_every = 0,
+            |tuning| tuning.encode.master_crf = 60,
             |tuning| tuning.quality.spp_ladder = vec![8, 4],
             |tuning| tuning.quality.spp_ladder = Vec::new(),
             |tuning| tuning.quality.reference_spp = 32,

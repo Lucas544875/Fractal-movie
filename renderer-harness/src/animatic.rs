@@ -10,9 +10,9 @@ use serde::Serialize;
 
 use crate::{
     budget::Budget,
-    film::{Compositor, Encoding, FilmWriter},
+    film::{Compositor, Encoding, FilmWriter, Rate},
     gpu::{GpuOptions, apply_settings, frame_config},
-    metrics::{Frame, LEGIBILITY_WIDTH, Legibility, legibility},
+    metrics::{Frame, LEGIBILITY_WIDTH, Legibility, flicker, flicker_luma, legibility},
     production::Production,
     quality::Settings,
     sheet::{self, Cell},
@@ -109,7 +109,7 @@ pub fn run(
             width,
             height,
             fps: format.fps,
-            crf: 23,
+            rate: Rate::Crf(23),
             preset: "veryfast",
         },
     )?;
@@ -153,9 +153,7 @@ pub fn run(
             if index % measure_every == 0 || index == last {
                 measured.push(legibility(&frame));
             }
-            // Halving removes single-pixel aliasing that any 1 spp render
-            // has, leaving the instability a viewer would actually see.
-            let luma = frame.reduced(2).luma();
+            let luma = flicker_luma(&frame);
             if let [before, middle] = history.as_slice() {
                 flicker_sum += f64::from(flicker(before, middle, &luma));
                 flicker_count += 1;
@@ -236,18 +234,6 @@ pub fn run(
     Ok(report)
 }
 
-/// Mean absolute deviation of the middle frame from the average of its
-/// neighbours.
-fn flicker(before: &[f32], middle: &[f32], after: &[f32]) -> f32 {
-    let total: f32 = before
-        .iter()
-        .zip(middle)
-        .zip(after)
-        .map(|((before, middle), after)| (middle - (before + after) / 2.0).abs())
-        .sum();
-    total / middle.len().max(1) as f32
-}
-
 fn mean_legibility(measured: &[Legibility]) -> Legibility {
     let count = measured.len().max(1) as f32;
     let mean = |field: fn(&Legibility) -> f32| measured.iter().map(field).sum::<f32>() / count;
@@ -315,15 +301,6 @@ mod tests {
             clipped_low_ratio: 0.0,
             mean_luminance: 0.4,
         }
-    }
-
-    #[test]
-    fn flicker_ignores_steady_change_and_sees_instability() {
-        let ramp = |value: f32| vec![value; 16];
-        // A steady brightening is motion, not flicker.
-        assert!(flicker(&ramp(0.2), &ramp(0.3), &ramp(0.4)) < 1.0e-6);
-        // One frame jumping out of line is.
-        assert!((flicker(&ramp(0.2), &ramp(0.5), &ramp(0.2)) - 0.3).abs() < 1.0e-6);
     }
 
     #[test]

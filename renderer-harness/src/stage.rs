@@ -417,6 +417,43 @@ impl State {
         Ok(self.limits.kills - self.kills)
     }
 
+    /// Returns to an earlier design stage so its file can be changed, for
+    /// example when the proof shows that a cut has to go.
+    ///
+    /// Going back costs one revision of the stage being left, so a
+    /// production cannot circle between stages without limit. Scouting and
+    /// the brief are not reopened this way: abandoning those is a kill.
+    pub fn reopen(&mut self, target: Stage, reason: impl Into<String>) -> Result<u32> {
+        if !matches!(target, Stage::Shotlist | Stage::Look)
+            || !matches!(self.stage, Stage::Look | Stage::Proof)
+            || target >= self.stage
+        {
+            bail!(
+                "stage {} cannot be reopened from stage {}; only the shot list and the look can, from a later design stage",
+                target.as_str(),
+                self.stage.as_str()
+            );
+        }
+        let allowed = self.limits.revisions_per_stage;
+        let used = self.revisions.entry(self.stage).or_insert(0);
+        if *used >= allowed {
+            bail!(
+                "stage {} has used all {allowed} of its revisions",
+                self.stage.as_str()
+            );
+        }
+        *used += 1;
+        let remaining = allowed - *used;
+        self.history.push(Event::Reopened {
+            from: self.stage,
+            to: target,
+            reason: reason.into(),
+        });
+        self.stage = target;
+        self.gates.clear();
+        Ok(remaining)
+    }
+
     /// Decides what happens when a mandate assignment cannot be realised,
     /// and applies the part of that decision that concerns the stage.
     ///
@@ -823,6 +860,65 @@ mod tests {
         let restored: State =
             serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
         assert_eq!(restored.limits, strict);
+    }
+
+    #[test]
+    fn design_stages_can_be_reopened_at_the_cost_of_a_revision() {
+        let mut state = at(Stage::Proof);
+        pass_measured(&mut state);
+        let allowed = state.limits.revisions_per_stage;
+        assert_eq!(
+            state.reopen(Stage::Shotlist, "cut 4 shimmers").unwrap(),
+            allowed - 1
+        );
+        assert_eq!(state.stage, Stage::Shotlist);
+        assert!(state.gates.is_empty());
+        assert!(matches!(
+            state.history.last(),
+            Some(Event::Reopened {
+                from: Stage::Proof,
+                to: Stage::Shotlist,
+                ..
+            })
+        ));
+
+        // Each return from the proof spends one of its revisions.
+        for remaining in (0..allowed - 1).rev() {
+            while state.stage != Stage::Proof {
+                clear_stage(&mut state);
+            }
+            assert_eq!(state.reopen(Stage::Look, "regrade").unwrap(), remaining);
+        }
+        while state.stage != Stage::Proof {
+            clear_stage(&mut state);
+        }
+        let error = state.reopen(Stage::Look, "again").unwrap_err().to_string();
+        assert!(error.contains("used all"), "{error}");
+        assert_eq!(state.stage, Stage::Proof);
+    }
+
+    #[test]
+    fn only_earlier_design_stages_can_be_reopened() {
+        for (from, target) in [
+            (Stage::Shotlist, Stage::Shotlist),
+            (Stage::Shotlist, Stage::Look),
+            (Stage::Look, Stage::Brief),
+            (Stage::Proof, Stage::Scout),
+            (Stage::Proof, Stage::Proof),
+            (Stage::Production, Stage::Look),
+            (Stage::Encode, Stage::Shotlist),
+        ] {
+            let mut state = at(from);
+            assert!(
+                state.reopen(target, "no").is_err(),
+                "{from:?} -> {target:?}"
+            );
+            assert_eq!(state.stage, from);
+            assert!(state.revisions.is_empty());
+        }
+        let mut state = at(Stage::Look);
+        state.reopen(Stage::Shotlist, "recut").unwrap();
+        assert_eq!(state.stage, Stage::Shotlist);
     }
 
     #[test]

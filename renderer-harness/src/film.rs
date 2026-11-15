@@ -157,8 +157,17 @@ pub struct Encoding {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
-    pub crf: u32,
+    pub rate: Rate,
     pub preset: &'static str,
+}
+
+/// How the encoder trades size for quality.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rate {
+    /// Constant quality; lower is better.
+    Crf(u32),
+    /// A fixed average bitrate, as a delivery platform would transcode to.
+    Kbps(u32),
 }
 
 /// Streams raw frames into an FFmpeg process that writes an MP4.
@@ -194,12 +203,18 @@ impl FilmWriter {
                 "-pix_fmt",
                 "yuv420p",
             ])
-            .args([
-                "-preset",
-                encoding.preset,
-                "-crf",
-                &encoding.crf.to_string(),
-            ])
+            .args(["-preset", encoding.preset])
+            .args(match encoding.rate {
+                Rate::Crf(crf) => vec!["-crf".to_owned(), crf.to_string()],
+                Rate::Kbps(kbps) => vec![
+                    "-b:v".to_owned(),
+                    format!("{kbps}k"),
+                    "-maxrate".to_owned(),
+                    format!("{}k", kbps * 3 / 2),
+                    "-bufsize".to_owned(),
+                    format!("{}k", kbps * 2),
+                ],
+            })
             .args(["-g", &(encoding.fps / 2).max(1).to_string(), "-bf", "2"])
             .args(["-flags", "+cgop", "-movflags", "+faststart"])
             // Frames are sRGB; tag and convert to BT.709 limited range.
@@ -273,6 +288,53 @@ impl FilmWriter {
         let _ = std::fs::remove_file(&self.temporary);
         anyhow::anyhow!("ffmpeg stopped accepting frames: {}", message.trim())
     }
+}
+
+/// Decodes a video file and hands every frame, as tightly packed RGBA8, to
+/// `sink` together with its index. Returns the number of frames.
+pub fn decode_frames(
+    path: &Path,
+    width: u32,
+    height: u32,
+    mut sink: impl FnMut(usize, &[u8]) -> Result<()>,
+) -> Result<usize> {
+    use std::io::Read;
+    let mut child = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(path)
+        // Undo the encoder's BT.709 limited-range conversion.
+        .args([
+            "-vf",
+            "scale=in_range=tv:out_range=full:in_color_matrix=bt709",
+        ])
+        .args(["-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("could not start ffmpeg; is it installed and on PATH?")?;
+    let mut stdout = child.stdout.take().context("ffmpeg output is closed")?;
+    let mut frame = vec![0u8; width as usize * height as usize * 4];
+    let mut count = 0;
+    let outcome = loop {
+        match stdout.read_exact(&mut frame) {
+            Ok(()) => {
+                if let Err(error) = sink(count, &frame) {
+                    break Err(error);
+                }
+                count += 1;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break Ok(()),
+            Err(error) => break Err(error).context("could not read decoded frames"),
+        }
+    };
+    drop(stdout);
+    let status = child.wait().context("could not wait for ffmpeg")?;
+    outcome?;
+    if !status.success() || count == 0 {
+        bail!("ffmpeg could not decode {}", path.display());
+    }
+    Ok(count)
 }
 
 #[cfg(test)]
@@ -370,7 +432,7 @@ mod tests {
             width: 64,
             height: 36,
             fps: 30,
-            crf: 30,
+            rate: Rate::Crf(30),
             preset: "ultrafast",
         };
         let mut writer = FilmWriter::create(&path, &encoding).unwrap();
@@ -395,7 +457,56 @@ mod tests {
         assert_eq!(description.trim(), "yuv420p,bt709,12", "{description}");
         // No temporary file may be left next to the result.
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
-        std::fs::remove_dir_all(&directory).unwrap();
+
+        // The file decodes back to the frames that went in, within what
+        // lossy 4:2:0 coding preserves.
+        let mut reds = Vec::new();
+        let decoded = decode_frames(&path, 64, 36, |index, rgba| {
+            assert_eq!(rgba.len(), 64 * 36 * 4);
+            assert_eq!(index, reds.len());
+            reds.push(rgba[0]);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(decoded, 12);
+        for (index, red) in reds.iter().enumerate() {
+            let expected = index as i32 * 20;
+            assert!(
+                (i32::from(*red) - expected).abs() <= 12,
+                "frame {index}: {red}"
+            );
+        }
+        assert!(decode_frames(&directory.join("missing.mp4"), 64, 36, |_, _| Ok(())).is_err());
+
+        // A bitrate target produces a smaller file than near-lossless CRF.
+        let mut rng = crate::rng::Rng::new(1);
+        let noise: Vec<Vec<u8>> = (0..24)
+            .map(|_| {
+                (0..64 * 36)
+                    .flat_map(|_| {
+                        let value = rng.below(256) as u8;
+                        [value, value, value, 255]
+                    })
+                    .collect()
+            })
+            .collect();
+        let size_with = |rate: Rate, name: &str| {
+            let path = directory.join(name);
+            let mut writer = FilmWriter::create(
+                &path,
+                &Encoding {
+                    rate,
+                    ..encoding.clone()
+                },
+            )
+            .unwrap();
+            for frame in &noise {
+                writer.write_frame(frame).unwrap();
+            }
+            writer.finish().unwrap();
+            std::fs::metadata(&path).unwrap().len()
+        };
+        assert!(size_with(Rate::Kbps(40), "low.mp4") < size_with(Rate::Crf(4), "high.mp4") / 2);
 
         assert!(
             FilmWriter::create(
@@ -407,5 +518,6 @@ mod tests {
             )
             .is_err()
         );
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 }

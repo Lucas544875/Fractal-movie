@@ -279,6 +279,31 @@ fn hue_clusters(pixels: &[[f32; 3]]) -> u32 {
         .count() as u32
 }
 
+/// Width frames are reduced to before flicker is measured. Measuring at one
+/// size makes values comparable between the animatic and the proof, which
+/// render at different resolutions.
+pub const FLICKER_WIDTH: u32 = 160;
+
+/// Luminance of a frame at the size flicker is measured at.
+#[must_use]
+pub fn flicker_luma(frame: &Frame) -> Vec<f32> {
+    frame.fit_width(FLICKER_WIDTH).luma()
+}
+
+/// Frame-to-frame instability: the mean absolute deviation of the middle
+/// frame's luminance from the average of its neighbours. Smooth camera
+/// motion scores near zero; shimmering detail does not.
+#[must_use]
+pub fn flicker(before: &[f32], middle: &[f32], after: &[f32]) -> f32 {
+    let total: f32 = before
+        .iter()
+        .zip(middle)
+        .zip(after)
+        .map(|((before, middle), after)| (middle - (before + after) / 2.0).abs())
+        .sum();
+    total / middle.len().max(1) as f32
+}
+
 /// How far a rendered variant is from its reference.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct Difference {
@@ -491,6 +516,23 @@ pub(crate) mod tests {
         }));
         assert!((measured.clipped_high_ratio - 0.1).abs() < 1e-6);
         assert!((measured.clipped_low_ratio - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn flicker_ignores_steady_change_and_sees_instability() {
+        let ramp = |value: f32| vec![value; 16];
+        // A steady brightening is motion, not flicker.
+        assert!(flicker(&ramp(0.2), &ramp(0.3), &ramp(0.4)) < 1.0e-6);
+        // One frame jumping out of line is.
+        assert!((flicker(&ramp(0.2), &ramp(0.5), &ramp(0.2)) - 0.3).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn flicker_is_measured_at_one_size_whatever_the_source() {
+        let small = flicker_luma(&noise(320, 180, 1));
+        let large = flicker_luma(&noise(960, 540, 1));
+        assert_eq!(small.len(), 160 * 90);
+        assert_eq!(large.len(), 160 * 90);
     }
 
     #[test]
