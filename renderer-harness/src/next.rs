@@ -1,0 +1,404 @@
+//! The single entry point a director needs. `next` reports where the
+//! production stands and what may be done about it, so the stage order never
+//! has to live in a prompt.
+
+use serde::Serialize;
+
+use crate::{
+    axes::{Axes, AxisId},
+    budget::Budget,
+    ledger::{AXIS_DIFF_WINDOW, Ledger, MIN_DIFFERING_AXES},
+    mandate::Mandate,
+    stage::{MAX_KILLS, MAX_REVISIONS_PER_STAGE, Stage, State},
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GateStatus {
+    Pending,
+    Passed,
+    Failed,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct GateReport {
+    pub gate: &'static str,
+    pub status: GateStatus,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CommandReport {
+    pub command: &'static str,
+    pub purpose: &'static str,
+    /// False while the command belongs to a milestone that is not built yet.
+    pub implemented: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Limits {
+    pub revisions_used: u32,
+    pub revisions_allowed: u32,
+    pub kills_used: u32,
+    pub kills_allowed: u32,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct BudgetReport {
+    pub production_limit_gpu_seconds: f64,
+    pub design_limit_gpu_seconds: f64,
+    pub design_remaining_gpu_seconds: f64,
+    pub max_frame_seconds: f64,
+    pub max_gpu_duty_cycle: f64,
+}
+
+/// Axis values of a recent film. This is all a director learns about past
+/// work.
+#[derive(Clone, Debug, Serialize)]
+pub struct PastFilm {
+    pub id: String,
+    pub axes: Axes,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DiversityReport {
+    pub mandate: Mandate,
+    pub recent_films: Vec<PastFilm>,
+    pub rule: String,
+    pub axes: Vec<AxisId>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct NextReport {
+    pub production: String,
+    pub stage: Stage,
+    pub stage_code: &'static str,
+    pub complete: bool,
+    pub instruction: &'static str,
+    pub gates: Vec<GateReport>,
+    pub commands: Vec<CommandReport>,
+    /// Files the director writes during this stage.
+    pub write: Vec<&'static str>,
+    /// Harness outputs worth reading during this stage.
+    pub read: Vec<&'static str>,
+    pub limits: Limits,
+    pub compromised: bool,
+    pub banned_locations: Vec<String>,
+    pub budget: BudgetReport,
+    pub diversity: DiversityReport,
+}
+
+struct StageGuide {
+    instruction: &'static str,
+    commands: &'static [(&'static str, &'static str, bool)],
+    write: &'static [&'static str],
+    read: &'static [&'static str],
+}
+
+const KILL: (&str, &str, bool) = (
+    "kill",
+    "企画を破棄してロケハンへ戻る。使ったロケ地は再選択できなくなる",
+    true,
+);
+const REVIEW: (&str, &str, bool) = (
+    "review submit",
+    "批評役の判定 (pass / revise / kill) を登録する",
+    false,
+);
+
+const fn guide(stage: Stage) -> StageGuide {
+    match stage {
+        Stage::Scout => StageGuide {
+            instruction: "ロケハンを実行し、コンタクトシートの画像を見てロケ地を2〜5個選ぶ。形状の数値は書かない。",
+            commands: &[
+                (
+                    "scout run",
+                    "形状と視点をサンプリングし、選別を通った候補のコンタクトシートを作る。--around <loc> で既存候補の近傍を探す",
+                    true,
+                ),
+                (
+                    "scout select",
+                    "ロケ地を2〜5個選び、選択数とコスト上限のゲートを判定する",
+                    true,
+                ),
+            ],
+            write: &[],
+            read: &["scout/"],
+        },
+        Stage::Brief => StageGuide {
+            instruction: "brief.yaml を書く。主題を一文で述べ、指定制約と軸差分ルールを満たすこと。",
+            commands: &[
+                ("brief check", "スキーマ、指定制約、軸差分を検証する", false),
+                KILL,
+            ],
+            write: &["brief.yaml"],
+            read: &["scout/", "mandate.json"],
+        },
+        Stage::Shotlist => StageGuide {
+            instruction: "shotlist.yaml を書く。ロケ地と視点は ID で指定する。アニマティックを作り、批評役に渡す。",
+            commands: &[
+                (
+                    "shotlist check",
+                    "スキーマ、経路の安全性、作品内の重複禁止を検証する",
+                    false,
+                ),
+                (
+                    "animatic",
+                    "全尺の低解像度動画と読みやすさ指標を作る",
+                    false,
+                ),
+                REVIEW,
+                KILL,
+            ],
+            write: &["shotlist.yaml"],
+            read: &["animatic/", "reviews/"],
+        },
+        Stage::Look => StageGuide {
+            instruction: "look.yaml を書く。品質設定は書かない。効果は effects_requested で要求する。",
+            commands: &[
+                ("look preview", "ルック確認画像と指標を作る", false),
+                REVIEW,
+                KILL,
+            ],
+            write: &["look.yaml"],
+            read: &["reviews/"],
+        },
+        Stage::Proof => StageGuide {
+            instruction: "プルーフを実行する。品質設定はハーネスが決める。予算を超えた場合は尺を縮めるかカットを差し替える。",
+            commands: &[
+                (
+                    "proof",
+                    "効果の有無比較、品質決定、時間見積もり、プルーフ動画、圧縮耐性",
+                    false,
+                ),
+                REVIEW,
+                KILL,
+            ],
+            write: &["shotlist.yaml", "look.yaml"],
+            read: &["proof/", "reviews/"],
+        },
+        Stage::Production => StageGuide {
+            instruction: "本番レンダリングを起動し、完了まで監視する。設計は変更できない。中断時は同じコマンドで再開する。",
+            commands: &[
+                ("produce", "カット単位で本番フレームを描画する", false),
+                ("status", "進捗と残り時間の見積もりを返す", false),
+            ],
+            write: &[],
+            read: &["jobs/"],
+        },
+        Stage::Encode => StageGuide {
+            instruction: "動画を合成し、QC を通す。",
+            commands: &[("encode", "MP4 の合成、QC、台帳への追記", false)],
+            write: &[],
+            read: &["final/"],
+        },
+        Stage::Done => StageGuide {
+            instruction: "制作は完了している。成果物は final/ にある。",
+            commands: &[],
+            write: &[],
+            read: &["final/"],
+        },
+    }
+}
+
+/// Builds the report for the production's current stage.
+#[must_use]
+pub fn report(state: &State, mandate: &Mandate, budget: &Budget, ledger: &Ledger) -> NextReport {
+    let guide = guide(state.stage);
+
+    let gates = state
+        .stage
+        .gates()
+        .iter()
+        .map(|gate| match state.gates.get(*gate) {
+            None => GateReport {
+                gate,
+                status: GateStatus::Pending,
+                detail: String::new(),
+            },
+            Some(record) => GateReport {
+                gate,
+                status: if record.passed {
+                    GateStatus::Passed
+                } else {
+                    GateStatus::Failed
+                },
+                detail: record.detail.clone(),
+            },
+        })
+        .collect();
+
+    let commands = guide
+        .commands
+        .iter()
+        // A kill that would be refused is not offered.
+        .filter(|(command, ..)| *command != "kill" || state.kills < MAX_KILLS)
+        .map(|(command, purpose, implemented)| CommandReport {
+            command,
+            purpose,
+            implemented: *implemented,
+        })
+        .collect();
+
+    NextReport {
+        production: state.id.clone(),
+        stage: state.stage,
+        stage_code: state.stage.code(),
+        complete: state.stage == Stage::Done,
+        instruction: guide.instruction,
+        gates,
+        commands,
+        write: guide.write.to_vec(),
+        read: guide.read.to_vec(),
+        limits: Limits {
+            revisions_used: state.revisions.get(&state.stage).copied().unwrap_or(0),
+            revisions_allowed: MAX_REVISIONS_PER_STAGE,
+            kills_used: state.kills,
+            kills_allowed: MAX_KILLS,
+        },
+        compromised: state.compromised,
+        banned_locations: state.banned_locations.clone(),
+        budget: BudgetReport {
+            production_limit_gpu_seconds: budget.production_limit_seconds(),
+            design_limit_gpu_seconds: budget.design_limit_seconds(),
+            design_remaining_gpu_seconds: budget.design_remaining_seconds(),
+            max_frame_seconds: budget.max_frame_seconds,
+            max_gpu_duty_cycle: budget.max_gpu_duty_cycle,
+        },
+        diversity: DiversityReport {
+            mandate: mandate.clone(),
+            recent_films: ledger
+                .recent(AXIS_DIFF_WINDOW)
+                .map(|entry| PastFilm {
+                    id: entry.id.clone(),
+                    axes: entry.axes,
+                })
+                .collect(),
+            rule: format!(
+                "直近{AXIS_DIFF_WINDOW}作品のそれぞれと、6軸中{MIN_DIFFERING_AXES}軸以上が異なること"
+            ),
+            axes: AxisId::ALL.to_vec(),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        axes::{FormulaFamily, Motion},
+        ledger::tests::entry,
+        production::AUTHORED_FILES,
+        stage::{CRITIC_GATE, Verdict},
+    };
+
+    fn fixtures() -> (Mandate, Budget, Ledger) {
+        let ledger = Ledger::from_entries(vec![entry(
+            "earlier",
+            FormulaFamily::Mandelbox,
+            Motion::Dive,
+        )])
+        .unwrap();
+        (Mandate::draw(&ledger, 3), Budget::default(), ledger)
+    }
+
+    fn at(stage: Stage) -> State {
+        let mut state = State::new("film");
+        while state.stage != stage {
+            pass_measured(&mut state);
+            if state.stage.has_critic() {
+                state.review(Verdict::Pass, "").unwrap();
+            }
+            state.advance().unwrap();
+        }
+        state
+    }
+
+    fn pass_measured(state: &mut State) {
+        for gate in state.stage.gates() {
+            if *gate != CRITIC_GATE {
+                state.record_gate(gate, true, "ok").unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn every_stage_lists_its_gates_and_valid_files() {
+        let (mandate, budget, ledger) = fixtures();
+        for stage in Stage::ALL {
+            let report = report(&at(*stage), &mandate, &budget, &ledger);
+            let gates: Vec<_> = report.gates.iter().map(|gate| gate.gate).collect();
+            assert_eq!(gates, stage.gates());
+            assert!(
+                report
+                    .write
+                    .iter()
+                    .all(|file| AUTHORED_FILES.contains(file)),
+                "{stage:?} asks the director to write a harness-owned file"
+            );
+            assert_eq!(report.complete, *stage == Stage::Done);
+            assert!(!report.instruction.is_empty());
+            assert_eq!(report.commands.is_empty(), *stage == Stage::Done);
+        }
+    }
+
+    #[test]
+    fn review_and_kill_follow_the_stage_machine() {
+        let (mandate, budget, ledger) = fixtures();
+        for stage in Stage::ALL {
+            let report = report(&at(*stage), &mandate, &budget, &ledger);
+            let offers = |name: &str| report.commands.iter().any(|entry| entry.command == name);
+            assert_eq!(offers("review submit"), stage.has_critic(), "{stage:?}");
+            assert_eq!(offers("kill"), stage.can_kill(), "{stage:?}");
+        }
+    }
+
+    #[test]
+    fn gate_statuses_reflect_recorded_results() {
+        let (mandate, budget, ledger) = fixtures();
+        let mut state = State::new("film");
+        state
+            .record_gate("novelty", false, "too close to earlier")
+            .unwrap();
+        state.record_gate("cost-ceiling", true, "ok").unwrap();
+        let report = report(&state, &mandate, &budget, &ledger);
+        let status = |name: &str| {
+            report
+                .gates
+                .iter()
+                .find(|gate| gate.gate == name)
+                .map(|gate| (gate.status, gate.detail.as_str()))
+                .unwrap()
+        };
+        assert_eq!(status("locations-selected"), (GateStatus::Pending, ""));
+        assert_eq!(
+            status("novelty"),
+            (GateStatus::Failed, "too close to earlier")
+        );
+        assert_eq!(status("cost-ceiling"), (GateStatus::Passed, "ok"));
+    }
+
+    #[test]
+    fn exhausted_kills_are_not_offered() {
+        let (mandate, budget, ledger) = fixtures();
+        let mut state = at(Stage::Brief);
+        state.kills = MAX_KILLS;
+        let report = report(&state, &mandate, &budget, &ledger);
+        assert!(report.commands.iter().all(|entry| entry.command != "kill"));
+        assert_eq!(report.limits.kills_used, MAX_KILLS);
+    }
+
+    #[test]
+    fn past_films_expose_axes_only() {
+        let (mandate, budget, ledger) = fixtures();
+        let report = report(&State::new("film"), &mandate, &budget, &ledger);
+        let json = serde_json::to_value(&report).unwrap();
+        let film = &json["diversity"]["recent_films"][0];
+        let keys: Vec<_> = film.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(keys, ["axes", "id"]);
+        assert_eq!(
+            json["diversity"]["mandate"]["banned_families"][0],
+            "mandelbox"
+        );
+    }
+}

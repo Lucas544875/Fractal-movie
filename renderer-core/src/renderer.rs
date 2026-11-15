@@ -232,6 +232,7 @@ pub struct RenderedImage {
     width: u32,
     height: u32,
     pixels: Vec<u8>,
+    gpu_time: Duration,
 }
 
 /// Pixel-space portion of the configured camera viewport to render.
@@ -294,6 +295,14 @@ impl RenderedImage {
     pub fn pixels(&self) -> &[u8] {
         &self.pixels
     }
+
+    /// Wall time the GPU spent rendering this image. Duty-cycle pauses and
+    /// readback are excluded, so the value measures render cost rather than
+    /// how long the caller waited.
+    #[must_use]
+    pub const fn gpu_time(&self) -> Duration {
+        self.gpu_time
+    }
 }
 
 /// Reusable offscreen wgpu renderer.
@@ -304,6 +313,7 @@ pub struct Renderer {
     config: RenderConfig,
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    pipeline_layout: wgpu::PipelineLayout,
     render_pipeline: wgpu::RenderPipeline,
     target: wgpu::Texture,
     readback_buffer: wgpu::Buffer,
@@ -398,43 +408,7 @@ impl Renderer {
             immediate_size: 0,
         });
 
-        let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let shader_source = shader::fractal_source(&config.fractal, config.precision)
-            .context("could not generate the fractal WGSL module")?;
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("fractal-shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Owned(shader_source)),
-        });
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("raymarch-render-pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: TARGET_FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-        if let Some(error) = error_scope.pop().await {
-            return Err(anyhow!(
-                "WGSL shader or render pipeline validation failed: {error}"
-            ));
-        }
+        let render_pipeline = create_pipeline(&device, &pipeline_layout, &config).await?;
 
         let target = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("offscreen-render-target"),
@@ -465,12 +439,36 @@ impl Renderer {
             config,
             uniform_buffer,
             bind_group,
+            pipeline_layout,
             render_pipeline,
             target,
             readback_buffer,
             padded_bytes_per_row,
             gpu_duty_cycle: options.gpu_duty_cycle,
         })
+    }
+
+    /// Switches this renderer to another fractal shader while keeping the
+    /// GPU device, render target, and readback buffer.
+    ///
+    /// Surveying many formulas would otherwise open one device per formula,
+    /// which is slow and exhausts driver contexts on some backends. The
+    /// resolution and precision must match the renderer's allocations.
+    pub async fn replace_fractal(&mut self, config: RenderConfig) -> Result<()> {
+        config.validate().context("invalid render configuration")?;
+        if config.render.width != self.config.render.width
+            || config.render.height != self.config.render.height
+            || config.precision != self.config.precision
+        {
+            return Err(anyhow!(
+                "a replacement fractal must keep the renderer's resolution and precision"
+            ));
+        }
+        // The old pipeline stays in place if the new shader is rejected.
+        self.render_pipeline =
+            create_pipeline(&self.device, &self.pipeline_layout, &config).await?;
+        self.config = config;
+        Ok(())
     }
 
     #[must_use]
@@ -561,6 +559,7 @@ impl Renderer {
         } else {
             MAX_FRAGMENT_INVOCATIONS_PER_SUBMISSION
         };
+        let mut gpu_time = Duration::ZERO;
         for (strip_index, (strip_y, strip_height)) in
             render_strips_with_limit(region.width, region.height, fragment_limit)
                 .into_iter()
@@ -604,8 +603,10 @@ impl Renderer {
             self.device
                 .poll(wgpu::PollType::wait_indefinitely())
                 .context("failed while waiting for a GPU render strip")?;
+            let strip_time = gpu_work_started.elapsed();
+            gpu_time += strip_time;
             if let Some(duty_cycle) = self.gpu_duty_cycle {
-                thread::sleep(throttle_delay(gpu_work_started.elapsed(), duty_cycle));
+                thread::sleep(throttle_delay(strip_time, duty_cycle));
             }
         }
 
@@ -662,8 +663,55 @@ impl Renderer {
             width: region.width,
             height: region.height,
             pixels,
+            gpu_time,
         })
     }
+}
+
+/// Compiles the fractal shader of `config` into a render pipeline.
+async fn create_pipeline(
+    device: &wgpu::Device,
+    pipeline_layout: &wgpu::PipelineLayout,
+    config: &RenderConfig,
+) -> Result<wgpu::RenderPipeline> {
+    let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let shader_source = shader::fractal_source(&config.fractal, config.precision)
+        .context("could not generate the fractal WGSL module")?;
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("fractal-shader"),
+        source: wgpu::ShaderSource::Wgsl(Cow::Owned(shader_source)),
+    });
+    let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("raymarch-render-pipeline"),
+        layout: Some(pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: TARGET_FORMAT,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+    if let Some(error) = error_scope.pop().await {
+        return Err(anyhow!(
+            "WGSL shader or render pipeline validation failed: {error}"
+        ));
+    }
+    Ok(render_pipeline)
 }
 
 fn render_strips_with_limit(
