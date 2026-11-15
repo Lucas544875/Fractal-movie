@@ -77,7 +77,7 @@ cargo run -p fractal-renderer-cli -- render --allow-software
 
 ### GPUデューティ比の制限
 
-対話作業中にoffline renderがGPUを占有し続けないよう、`--gpu-duty-cycle`でこのrendererの平均GPU稼働時間を1〜100%に制限できます。たとえば40%では、各GPU stripに100 msかかった場合、その完了後に150 ms休止します。制限中はstripも短く分割されるため、ほかのGPU clientへ定期的に実行機会を返します。
+対話作業中にoffline renderがGPUを占有し続けないよう、`--gpu-duty-cycle`でこのrendererの平均GPU稼働時間を1〜100%に制限できます。たとえば40%では、各GPU stripに100 msかかった場合、その完了後に150 ms休止します。描画効率を維持するため、制限の有無にかかわらず同じ大きさのstripを使い、完了後の休止で平均稼働時間を調整します。重いシーンでは1回の描画が数秒続く場合があり、瞬間的なGPU使用率を指定値以下に抑えるものではありません。
 
 ```bash
 cargo run --release -p fractal-renderer-cli -- render \
@@ -317,6 +317,12 @@ animation:
 ```
 
 `radius`は正のcamera距離、`duration`は軌道を進み終える秒数です。`axis`は方向だけが使われ、自動的に正規化されます。`revolutions`は周回数で、負値にすると逆回転し、小数なら部分周回になります。`start_angle_degrees`の0度方向は、初期`camera.position - camera.target`を`axis`に垂直な平面へ射影して決まります。このため初期cameraを基準に開始位相を直感的に調整できます。cameraの`up`は軸を画面へ射影した方向へ毎frame更新され、周回中の不要なrollを抑えます。実行可能な例は`scenes/examples/mandelbulb-target-orbit.yaml`です。
+
+`end_radius`を指定すると周回しながらその距離へ接近・後退できます。
+`smooth_start_stop: true`では角度と距離に5次の補間を適用し、始点と終点の速度・加速度を0にします。
+どちらも省略すれば従来の一定距離・一定角速度です。制作例は
+[`scenes/production/ivory-vault.yaml`](scenes/production/ivory-vault.yaml)、制作記録と不足機能は
+[`docs/ivory-vault-production.md`](docs/ivory-vault-production.md)を参照してください。
 
 ## 自動経路探索
 

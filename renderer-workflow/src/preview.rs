@@ -387,6 +387,8 @@ mod tests {
                     axis: [0.0, 1.0, 0.0],
                     cone_angle_degrees: 90.0,
                     start_angle_degrees: 0.0,
+                    end_radius: None,
+                    smooth_start_stop: false,
                 },
             ),
         };

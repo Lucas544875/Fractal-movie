@@ -316,12 +316,16 @@ impl ExponentialDivePath {
 
 /// A constant-radius orbit that keeps the base camera target centered.
 ///
-/// Camera positions lie on the intersection of a sphere and a cone around
-/// `axis`. A 90-degree cone angle produces a great circle; other angles
-/// produce small circles whose camera-to-target sight lines sweep a cone.
+/// Camera directions sweep a cone around `axis`. At a fixed radius, a
+/// 90-degree cone angle produces a great circle and other angles produce
+/// small circles. An optional final radius adds a simultaneous dolly move.
 #[derive(Clone, Copy, Debug)]
 pub struct TargetOrbitPath {
     pub radius: Qf32,
+    /// Optional dolly distance at the end of the orbit.
+    pub end_radius: Option<Qf32>,
+    /// Quintic easing gives zero velocity and acceleration at both endpoints.
+    pub smooth_start_stop: bool,
     pub duration: f64,
     pub revolutions: f64,
     pub axis: [f64; 3],
@@ -340,6 +344,11 @@ impl TargetOrbitPath {
     pub fn validate(&self) -> Result<()> {
         if !self.radius.is_finite() || self.radius <= Qf32::ZERO {
             bail!("target orbit radius must be finite and greater than zero");
+        }
+        if let Some(radius) = self.end_radius
+            && (!radius.is_finite() || radius <= Qf32::ZERO)
+        {
+            bail!("target orbit end_radius must be finite and greater than zero");
         }
         if !self.duration.is_finite() || self.duration <= 0.0 {
             bail!("target orbit duration must be finite and greater than zero");
@@ -400,6 +409,14 @@ impl TargetOrbitPath {
         let basis_v = normalize(cross(axis, basis_u));
 
         let progress = (time_seconds / self.duration).clamp(0.0, 1.0);
+        let progress = if self.smooth_start_stop {
+            progress.powi(3) * (progress * (progress * 6.0 - 15.0) + 10.0)
+        } else {
+            progress
+        };
+        let radius = self.end_radius.map_or(self.radius, |end| {
+            self.radius + (end - self.radius) * Qf32::from_f64(progress)
+        });
         let completed_turns = (self.revolutions * progress).rem_euclid(1.0);
         let azimuth = self
             .start_angle_degrees
@@ -418,9 +435,9 @@ impl TargetOrbitPath {
         ));
 
         Ok(TargetOrbitSample {
-            position: target + QfVec3::from_f64(radial_direction) * self.radius,
+            position: target + QfVec3::from_f64(radial_direction) * radius,
             up: up.map(|component| component as f32),
-            camera_distance: self.radius,
+            camera_distance: radius,
         })
     }
 }
@@ -981,6 +998,8 @@ mod tests {
             axis: [0.0, 0.0, 1.0],
             cone_angle_degrees: 90.0,
             start_angle_degrees: 0.0,
+            end_radius: None,
+            smooth_start_stop: false,
         };
         let start = great_circle.sample(target, reference, 0.0).unwrap();
         let quarter = great_circle.sample(target, reference, 2.0).unwrap();
@@ -1011,6 +1030,49 @@ mod tests {
     }
 
     #[test]
+    fn dolly_orbit_reaches_endpoints_and_eases_motion() {
+        let target = QfVec3::from_f64([0.0; 3]);
+        let reference = QfVec3::from_f64([4.0, 0.0, 0.0]);
+        let path = TargetOrbitPath {
+            radius: Qf32::from_f64(4.0),
+            end_radius: Some(Qf32::from_f64(2.0)),
+            smooth_start_stop: true,
+            duration: 8.0,
+            revolutions: 0.25,
+            axis: [0.0, 0.0, 1.0],
+            cone_angle_degrees: 90.0,
+            start_angle_degrees: 0.0,
+        };
+        let start = path.sample(target, reference, 0.0).unwrap();
+        let middle = path.sample(target, reference, 4.0).unwrap();
+        let end = path.sample(target, reference, 8.0).unwrap();
+        assert_eq!(start.camera_distance, Qf32::from_f64(4.0));
+        assert_eq!(middle.camera_distance, Qf32::from_f64(3.0));
+        assert_eq!(end.camera_distance, Qf32::from_f64(2.0));
+        let p = end.position.to_f64();
+        assert!(p[0].abs() < 1.0e-12);
+        assert!((p[1] - 2.0).abs() < 1.0e-12);
+        assert_eq!(
+            path.sample(target, reference, -1.0).unwrap().position,
+            start.position
+        );
+        assert_eq!(
+            path.sample(target, reference, 9.0).unwrap().position,
+            end.position
+        );
+        for (a, b) in [(0.0, 0.008), (7.992, 8.0)] {
+            let displacement = path.sample(target, reference, b).unwrap().position
+                - path.sample(target, reference, a).unwrap().position;
+            assert!(length(displacement.to_f64()) < 1.0e-6);
+        }
+        let invalid = TargetOrbitPath {
+            end_radius: Some(Qf32::ZERO),
+            ..path
+        };
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
     fn target_orbit_rejects_degenerate_parameters() {
         let mut path = TargetOrbitPath {
             radius: Qf32::ONE,
@@ -1019,6 +1081,8 @@ mod tests {
             axis: [0.0, 0.0, 1.0],
             cone_angle_degrees: 45.0,
             start_angle_degrees: 0.0,
+            end_radius: None,
+            smooth_start_stop: false,
         };
         path.axis = [0.0; 3];
         assert!(path.validate().is_err());

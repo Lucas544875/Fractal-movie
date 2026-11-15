@@ -1,0 +1,4 @@
+bfc488478af84596c8a83f71698ee654773ad5f3dc4f4c072b0aa84f957458f5  target/release/fractal-render
+e41412a10e94fb906185afe5a9298ac3a8962174ce3003aad15b95e03fb43ec8  tools/render-azure-cloister.sh
+d56ee051a4d9391ebb79799627e4c15808d201d5385761ba26e36305f649676b  tools/check-azure-cloister.py
+d5cacae4c5bd235c6cb7637ef3018c76db2f345f83f7cb5e45363bf62568289f  scenes/production/azure-cloister.yaml

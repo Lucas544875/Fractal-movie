@@ -337,6 +337,22 @@ impl ProjectStore {
                 "Signed target-orbit turns over its duration",
             ),
             parameter(
+                "animation.path.parameters.end_radius",
+                "number|string|array|null",
+                Some(0.0),
+                None,
+                ChangeCost::Uniform,
+                "Optional final target-orbit radius for a dolly move; must be positive",
+            ),
+            parameter(
+                "animation.path.parameters.smooth_start_stop",
+                "boolean",
+                None,
+                None,
+                ChangeCost::Uniform,
+                "Ease orbit and dolly with zero endpoint velocity and acceleration",
+            ),
+            parameter(
                 "animation.path.parameters.axis",
                 "vec3",
                 None,

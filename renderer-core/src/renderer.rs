@@ -17,9 +17,6 @@ const BYTES_PER_PIXEL: u32 = 4;
 /// operating system's graphics watchdog. Fragment positions remain global
 /// because scissoring does not change the render target coordinate system.
 const MAX_FRAGMENT_INVOCATIONS_PER_SUBMISSION: u32 = 131_072;
-/// A duty-cycle cap needs shorter submissions so it can yield to other GPU
-/// clients regularly instead of alternating multi-second bursts and sleeps.
-const MAX_THROTTLED_FRAGMENT_INVOCATIONS_PER_SUBMISSION: u32 = 16_384;
 
 /// Controls which adapter may be used by [`Renderer`].
 #[derive(Clone, Debug, Default)]
@@ -556,15 +553,16 @@ impl Renderer {
         let view = self
             .target
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let fragment_limit = if self.gpu_duty_cycle.is_some_and(|limit| limit < 1.0) {
-            MAX_THROTTLED_FRAGMENT_INVOCATIONS_PER_SUBMISSION
-        } else {
-            MAX_FRAGMENT_INVOCATIONS_PER_SUBMISSION
-        };
-        for (strip_index, (strip_y, strip_height)) in
-            render_strips_with_limit(region.width, region.height, fragment_limit)
-                .into_iter()
-                .enumerate()
+        // Keep submission size independent of duty-cycle pacing. Narrow strips
+        // substantially reduce GPU throughput on expensive scenes; enforce the
+        // average duty cycle with the sleep after each bounded submission.
+        for (strip_index, (strip_y, strip_height)) in render_strips_with_limit(
+            region.width,
+            region.height,
+            MAX_FRAGMENT_INVOCATIONS_PER_SUBMISSION,
+        )
+        .into_iter()
+        .enumerate()
         {
             let mut encoder = self
                 .device
@@ -870,19 +868,28 @@ mod tests {
     }
 
     #[test]
-    fn throttled_rendering_uses_shorter_strips() {
-        let strips = render_strips_with_limit(
-            1_620,
-            1_080,
-            MAX_THROTTLED_FRAGMENT_INVOCATIONS_PER_SUBMISSION,
-        );
-        assert_eq!(strips.len(), 108);
-        assert_eq!(strips.first(), Some(&(0, 10)));
-        assert_eq!(strips.last(), Some(&(1_070, 10)));
+    fn full_hd_strips_cover_the_frame_without_excessive_submissions() {
+        let strips =
+            render_strips_with_limit(1_920, 1_080, MAX_FRAGMENT_INVOCATIONS_PER_SUBMISSION);
+        assert_eq!(strips.len(), 16);
+        assert_eq!(strips.first(), Some(&(0, 68)));
+        assert_eq!(strips.last(), Some(&(1_020, 60)));
+        let mut next_y = 0;
+        for (y, height) in strips {
+            assert_eq!(y, next_y);
+            assert!(height > 0);
+            assert!(1_920 * height <= MAX_FRAGMENT_INVOCATIONS_PER_SUBMISSION);
+            next_y += height;
+        }
+        assert_eq!(next_y, 1_080);
     }
 
     #[test]
     fn throttle_delay_enforces_the_requested_average_duty_cycle() {
+        assert_eq!(
+            throttle_delay(Duration::from_secs(4), 0.8),
+            Duration::from_secs(1)
+        );
         assert_eq!(
             throttle_delay(Duration::from_millis(100), 0.4),
             Duration::from_millis(150)

@@ -1,0 +1,101 @@
+# Ivory Vault — one continuous twelve-second orbit and dolly.
+# Hybrid geometry: Amazing Surf / Mandelbox Julia. Art direction, palette,
+# lighting, lens and camera path are authored for this production.
+# No camera-dependent palette; 96 native samples per pixel.
+camera:
+  aperture_radius: 0.0025
+  focus_distance: 0.77878
+  position: [1.552553453, 0.7731444559, 2.3163748925]
+  target: [1.9631059978, 1.3969453485, 2.0551372989]
+  up: [0.181809663772583, 0.27563729882240295, 0.9439117312431335]
+  vertical_fov_degrees: 20.0
+fractal:
+  kind: "dsl"
+  parameters:
+    bailout: 100.0
+    color_iterations: 240
+    iterations: 125
+    material:
+      accent_color: [0.88, 0.79, 0.61]
+      ambient_strength: 0.09
+      background_bottom: [0.012, 0.021, 0.027]
+      background_top: [0.04, 0.065, 0.08]
+      base_color: [0.52, 0.43, 0.3]
+      camera_palette_weight: 0.0
+      color_frequency: 2.0
+      diffuse_strength: 1.05
+      fog_density: 0.008
+      metallic_shininess: 36.0
+      metallic_specular_strength: 0.9
+      normal_palette_weight: 0.12
+      orbit_palette_weight: 1.0
+      palette_offset: 0.0
+      rim_strength: 0.1
+      shininess: 120.0
+      specular_color: [1.0, 0.9, 0.72]
+      specular_strength: 0.6
+      surface_palette: [{"position": 0.0, "color": [0.03, 0.04, 0.045]}, {"position": 0.16, "color": [0.08, 0.11, 0.12]}, {"position": 0.24, "color": [0.65, 0.34, 0.1]}, {"position": 0.32, "color": [0.85, 0.79, 0.65]}, {"position": 0.48, "color": [0.78, 0.73, 0.64]}, {"position": 0.55, "color": [0.14, 0.2, 0.22]}, {"position": 0.62, "color": [0.54, 0.63, 0.65]}, {"position": 0.7, "color": [0.9, 0.85, 0.74]}, {"position": 0.8, "color": [0.26, 0.17, 0.07]}, {"position": 0.89, "color": [0.65, 0.38, 0.12]}, {"position": 1.0, "color": [0.03, 0.04, 0.045]}]
+    normal_epsilon: 2.499999936844688e-06
+    orbit: [{"limits": [0.9850000143051147, 0.9850000143051147], "minimum_radius_squared": 0.0, "op": "amazing-surf-fold", "rotation_degrees": [0.0, 90.0, 0.0], "scale": 1.0, "start_iteration": 0, "stop_iteration": 20}, {"constant": [1.8079715967178345, 1.332750916481018, 1.9122450351715088], "fixed_radius_squared": 1.0, "fold_limit": 1.0, "min_radius_squared": 0.03999999910593033, "op": "mandelbox-julia-fold", "rotation_degrees": [-1.8112879991531372, 1.112360954284668, 7.0528411865234375], "scale": -1.149999976158142, "start_iteration": 20, "stop_iteration": 120}]
+    orbit_period: 120
+light:
+  direction: [0.027, -0.58, 0.81]
+name: "ivory-vault"
+precision: "f32"
+quality:
+  ambient_occlusion:
+    max_steps: 64
+    radius: 0.1
+    strength: 0.9
+  post_process:
+    enabled: true
+    contrast: 1.16
+    saturation: 0.8
+    gamma: 1.0
+    vignette_strength: 0.08
+    exposure_stops: -0.35
+  reflection:
+    max_distance: 1.399999976158142
+    max_steps: 0
+    roughness: 0.02500000037252903
+    strength: 0.0
+  samples_per_pixel: 96
+  soft_shadow:
+    angular_radius_degrees: 3.5
+    max_distance: 1.7999999523162842
+    max_steps: 96
+  tone_mapping:
+    enabled: true
+    operator: "extended-reinhard"
+    exposure_stops: 0.25
+    white_point: 4.0
+render:
+  epsilon: 2.0000000233721948e-07
+  height: 1080
+  max_distance: 9.866979598999023
+  max_steps: 768
+  pixel_epsilon_multiplier: 0.7200000286102295
+  step_safety: 0.7799999713897705
+  width: 1920
+seed: 20260811
+version: 1
+animation:
+  fps: 30
+  frame_count: 360
+  path:
+    kind: "target-orbit"
+    parameters:
+      radius: 0.7911548236
+      duration: 11.966666666666667
+      revolutions: 0.0833333333
+      axis: [0.181809663772583, 0.27563729882240295, 0.9439117312431335]
+      cone_angle_degrees: 90.0
+      start_angle_degrees: -6.0
+      end_radius: 0.57
+      smooth_start_stop: true
+video:
+  codec: "libx264"
+  pixel_format: "yuv420p"
+  crf: 14
+  preset: "slow"
+  faststart: true

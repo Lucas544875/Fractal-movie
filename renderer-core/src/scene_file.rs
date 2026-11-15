@@ -395,6 +395,10 @@ pub struct SceneExponentialDive {
 #[serde(deny_unknown_fields)]
 pub struct SceneTargetOrbit {
     pub radius: SceneScalar,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_radius: Option<SceneScalar>,
+    #[serde(default)]
+    pub smooth_start_stop: bool,
     pub duration: f64,
     pub revolutions: f64,
     pub axis: [f64; 3],
@@ -989,6 +993,12 @@ impl TryFrom<SceneAnimation> for AnimationConfig {
             }
             SceneAnimationPath::TargetOrbit(path) => AnimationPath::TargetOrbit(TargetOrbitPath {
                 radius: parse_scalar(path.radius).context("invalid radius")?,
+                end_radius: path
+                    .end_radius
+                    .map(parse_scalar)
+                    .transpose()
+                    .context("invalid end_radius")?,
+                smooth_start_stop: path.smooth_start_stop,
                 duration: path.duration,
                 revolutions: path.revolutions,
                 axis: path.axis,
@@ -1038,6 +1048,10 @@ impl From<&AnimationConfig> for SceneAnimation {
             }
             AnimationPath::TargetOrbit(path) => SceneAnimationPath::TargetOrbit(SceneTargetOrbit {
                 radius: SceneScalar::Expansion(path.radius.limbs()),
+                end_radius: path
+                    .end_radius
+                    .map(|radius| SceneScalar::Expansion(radius.limbs())),
+                smooth_start_stop: path.smooth_start_stop,
                 duration: path.duration,
                 revolutions: path.revolutions,
                 axis: path.axis,
@@ -1592,6 +1606,40 @@ mod tests {
             quarter.config.camera.position
         );
         assert_eq!(reparsed_quarter.config.camera.up, quarter.config.camera.up);
+    }
+
+    #[test]
+    fn dolly_orbit_scene_round_trips_and_preserves_motion() {
+        let yaml = MANDELBULB_TARGET_ORBIT.replace(
+            "radius: 4.2",
+            "radius: 4.2\n      end_radius: 2.8\n      smooth_start_stop: true",
+        );
+        let scene = parse_scene(&yaml).unwrap();
+        let reparsed = parse_scene(&scene.to_yaml().unwrap()).unwrap();
+        for index in [0, 90, 180, 360] {
+            let a = scene
+                .animation
+                .as_ref()
+                .unwrap()
+                .sample(&scene.config, index)
+                .unwrap();
+            let b = reparsed
+                .animation
+                .as_ref()
+                .unwrap()
+                .sample(&reparsed.config, index)
+                .unwrap();
+            assert_eq!(a.config.camera.position, b.config.camera.position);
+            assert_eq!(a.camera_distance, b.camera_distance);
+        }
+        let end = scene
+            .animation
+            .as_ref()
+            .unwrap()
+            .sample(&scene.config, 360)
+            .unwrap();
+        assert!((end.camera_distance.to_f64() - 2.8).abs() < 1.0e-12);
+        assert!(parse_scene(&yaml.replace("end_radius: 2.8", "end_radius: 0")).is_err());
     }
 
     #[test]
