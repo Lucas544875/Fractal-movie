@@ -6,11 +6,9 @@ use std::collections::BTreeMap;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::tuning::Limits;
+
 pub const STATE_VERSION: u32 = 1;
-/// Critic `revise` verdicts accepted per stage before the harness moves on.
-pub const MAX_REVISIONS_PER_STAGE: u32 = 3;
-/// Times a production may be sent back to scouting.
-pub const MAX_KILLS: u32 = 2;
 
 /// Gate decided by the critic's verdict rather than by a harness measurement.
 pub const CRITIC_GATE: &str = "critic";
@@ -155,10 +153,48 @@ pub enum ReviewOutcome {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "kebab-case")]
 pub enum Event {
-    Advanced { from: Stage, to: Stage },
-    Reviewed { stage: Stage, verdict: Verdict },
-    Killed { from: Stage, reason: String },
-    LimitReached { stage: Stage },
+    Advanced {
+        from: Stage,
+        to: Stage,
+        /// Gate results the stage was left with, kept for audit.
+        #[serde(default)]
+        gates: BTreeMap<String, GateRecord>,
+    },
+    Reviewed {
+        stage: Stage,
+        verdict: Verdict,
+    },
+    Killed {
+        from: Stage,
+        reason: String,
+    },
+    LimitReached {
+        stage: Stage,
+    },
+    /// The stage was reopened because its inputs became invalid.
+    Reopened {
+        from: Stage,
+        to: Stage,
+        reason: String,
+    },
+    /// A mandate assignment could not be realised.
+    Infeasible {
+        reason: String,
+        outcome: InfeasibleOutcome,
+    },
+}
+
+/// What the harness did about a mandate assignment that cannot be realised.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InfeasibleOutcome {
+    /// The assignment was replaced; the brief must be written again.
+    Redrawn,
+    /// Redraws were exhausted, so the concept was dropped.
+    Killed,
+    /// Redraws and kills were exhausted, so the assignment was waived and
+    /// the film marked as compromised.
+    Waived,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,15 +210,28 @@ pub struct State {
     pub kills: u32,
     /// Locations abandoned by a kill. They cannot be selected again.
     pub banned_locations: Vec<String>,
+    /// Mandate assignments replaced because they could not be realised.
+    #[serde(default)]
+    pub mandate_redraws: u32,
+    /// How often this production may go back, fixed when it was created.
+    #[serde(default)]
+    pub limits: Limits,
     /// Set when a revision or kill limit forced the harness to move on.
     pub compromised: bool,
     pub history: Vec<Event>,
 }
 
 impl State {
+    /// A new production with the default limits.
     #[must_use]
     pub fn new(id: impl Into<String>) -> Self {
+        Self::with_limits(id, Limits::default())
+    }
+
+    #[must_use]
+    pub fn with_limits(id: impl Into<String>, limits: Limits) -> Self {
         Self {
+            limits,
             version: STATE_VERSION,
             id: id.into(),
             stage: Stage::Scout,
@@ -190,6 +239,7 @@ impl State {
             revisions: BTreeMap::new(),
             kills: 0,
             banned_locations: Vec::new(),
+            mandate_redraws: 0,
             compromised: false,
             history: Vec::new(),
         }
@@ -276,10 +326,26 @@ impl State {
         self.history.push(Event::Advanced {
             from: self.stage,
             to: next,
+            gates: std::mem::take(&mut self.gates),
         });
         self.stage = next;
-        self.gates.clear();
         Ok(next)
+    }
+
+    /// Advances when every gate of the current stage has passed. Commands
+    /// that judge gates call this, so no separate "proceed" step exists for
+    /// an agent to forget or to attempt early.
+    pub fn advance_if_ready(&mut self) -> Result<Option<Stage>> {
+        if self.stage == Stage::Done || !self.unmet_gates().is_empty() {
+            return Ok(None);
+        }
+        self.advance().map(Some)
+    }
+
+    /// Forgets every gate result of the current stage, for commands that
+    /// re-judge the whole stage from changed inputs.
+    pub fn reset_gates(&mut self) {
+        self.gates.clear();
     }
 
     /// Applies a critic verdict to the current stage.
@@ -311,23 +377,23 @@ impl State {
             }
             Verdict::Revise => {
                 let used = self.revisions.entry(self.stage).or_insert(0);
-                if *used >= MAX_REVISIONS_PER_STAGE {
+                if *used >= self.limits.revisions_per_stage {
                     return self.accept_at_limit();
                 }
                 *used += 1;
-                let remaining = MAX_REVISIONS_PER_STAGE - *used;
+                let remaining = self.limits.revisions_per_stage - *used;
                 // Reworked artifacts must be measured again.
                 self.gates.clear();
                 self.set_gate(CRITIC_GATE, false, notes)?;
                 Ok(ReviewOutcome::Revise { remaining })
             }
             Verdict::Kill => {
-                if self.kills >= MAX_KILLS {
+                if self.kills >= self.limits.kills {
                     return self.accept_at_limit();
                 }
                 self.return_to_scout(notes, Vec::new());
                 Ok(ReviewOutcome::Killed {
-                    remaining: MAX_KILLS - self.kills,
+                    remaining: self.limits.kills - self.kills,
                 })
             }
         }
@@ -341,11 +407,50 @@ impl State {
                 self.stage.as_str()
             );
         }
-        if self.kills >= MAX_KILLS {
-            bail!("the production already used all {MAX_KILLS} kills");
+        if self.kills >= self.limits.kills {
+            bail!(
+                "the production already used all {} kills",
+                self.limits.kills
+            );
         }
         self.return_to_scout(reason.into(), locations);
-        Ok(MAX_KILLS - self.kills)
+        Ok(self.limits.kills - self.kills)
+    }
+
+    /// Decides what happens when a mandate assignment cannot be realised,
+    /// and applies the part of that decision that concerns the stage.
+    ///
+    /// A redraw sends the production back to the brief, because the brief
+    /// committed to the value that is being replaced. The caller updates the
+    /// mandate itself according to the returned outcome.
+    pub fn mandate_infeasible(
+        &mut self,
+        reason: impl Into<String>,
+        locations: Vec<String>,
+    ) -> InfeasibleOutcome {
+        let reason = reason.into();
+        let outcome = if self.mandate_redraws < self.limits.mandate_redraws {
+            self.mandate_redraws += 1;
+            if self.stage > Stage::Brief {
+                self.history.push(Event::Reopened {
+                    from: self.stage,
+                    to: Stage::Brief,
+                    reason: reason.clone(),
+                });
+                self.stage = Stage::Brief;
+            }
+            self.gates.clear();
+            InfeasibleOutcome::Redrawn
+        } else if self.kills < self.limits.kills && self.stage.can_kill() {
+            self.return_to_scout(reason.clone(), locations);
+            InfeasibleOutcome::Killed
+        } else {
+            self.compromised = true;
+            self.gates.clear();
+            InfeasibleOutcome::Waived
+        };
+        self.history.push(Event::Infeasible { reason, outcome });
+        outcome
     }
 
     /// Adds locations that the abandoned concept used to the ban list.
@@ -443,6 +548,30 @@ mod tests {
         state.record_gate("novelty", true, "ok").unwrap();
         assert_eq!(state.advance().unwrap(), Stage::Brief);
         assert!(state.gates.is_empty(), "gates must not carry over");
+        // The results that justified leaving the stage stay on record.
+        let Some(Event::Advanced { gates, .. }) = state.history.last() else {
+            panic!("advance must be recorded");
+        };
+        assert_eq!(gates["novelty"].detail, "ok");
+        assert_eq!(gates.len(), 3);
+    }
+
+    #[test]
+    fn advance_if_ready_waits_for_the_last_gate() {
+        let mut state = State::new("film");
+        state.record_gate("locations-selected", true, "").unwrap();
+        state.record_gate("novelty", true, "").unwrap();
+        assert_eq!(state.advance_if_ready().unwrap(), None);
+        assert_eq!(state.stage, Stage::Scout);
+
+        state.record_gate("cost-ceiling", true, "").unwrap();
+        assert_eq!(state.advance_if_ready().unwrap(), Some(Stage::Brief));
+        // The new stage has unjudged gates, so it does not cascade.
+        assert_eq!(state.advance_if_ready().unwrap(), None);
+
+        state.record_gate("schema", true, "").unwrap();
+        state.reset_gates();
+        assert_eq!(state.unmet_gates(), Stage::Brief.gates());
     }
 
     #[test]
@@ -497,7 +626,7 @@ mod tests {
     #[test]
     fn revision_limit_accepts_the_stage_as_compromised() {
         let mut state = at(Stage::Look);
-        for remaining in (0..MAX_REVISIONS_PER_STAGE).rev() {
+        for remaining in (0..Limits::default().revisions_per_stage).rev() {
             pass_measured(&mut state);
             assert_eq!(
                 state.review(Verdict::Revise, "").unwrap(),
@@ -524,7 +653,7 @@ mod tests {
         assert_eq!(
             state.review(Verdict::Revise, "").unwrap(),
             ReviewOutcome::Revise {
-                remaining: MAX_REVISIONS_PER_STAGE - 1
+                remaining: Limits::default().revisions_per_stage - 1
             }
         );
     }
@@ -550,7 +679,7 @@ mod tests {
     #[test]
     fn kill_limit_accepts_the_stage_as_compromised() {
         let mut state = State::new("film");
-        for _ in 0..MAX_KILLS {
+        for _ in 0..Limits::default().kills {
             while state.stage != Stage::Shotlist {
                 clear_stage(&mut state);
             }
@@ -597,6 +726,103 @@ mod tests {
         clear_stage(&mut state);
         assert!(state.kill("third", Vec::new()).is_err());
         assert_eq!(state.stage, Stage::Brief);
+    }
+
+    #[test]
+    fn infeasible_mandates_are_redrawn_then_killed_then_waived() {
+        let mut state = at(Stage::Shotlist);
+        pass_measured(&mut state);
+
+        // Redraws reopen the brief, which committed to the failed value.
+        for used in 1..=Limits::default().mandate_redraws {
+            assert_eq!(
+                state.mandate_infeasible("no flyover surface", vec!["loc-1".into()]),
+                InfeasibleOutcome::Redrawn
+            );
+            assert_eq!(state.stage, Stage::Brief);
+            assert_eq!(state.mandate_redraws, used);
+            assert!(state.gates.is_empty());
+            assert!(state.banned_locations.is_empty());
+        }
+
+        // With redraws exhausted the concept is dropped like a kill.
+        for used in 1..=Limits::default().kills {
+            assert_eq!(
+                state.mandate_infeasible("still none", vec![format!("loc-{used}")]),
+                InfeasibleOutcome::Killed
+            );
+            assert_eq!(state.stage, Stage::Scout);
+            assert_eq!(state.kills, used);
+            clear_stage(&mut state);
+        }
+        assert_eq!(state.banned_locations, vec!["loc-1", "loc-2"]);
+
+        // With kills exhausted too, the assignment is waived.
+        assert_eq!(state.stage, Stage::Brief);
+        assert_eq!(
+            state.mandate_infeasible("again", Vec::new()),
+            InfeasibleOutcome::Waived
+        );
+        assert_eq!(state.stage, Stage::Brief);
+        assert!(state.compromised);
+        assert!(matches!(
+            state.history.last(),
+            Some(Event::Infeasible {
+                outcome: InfeasibleOutcome::Waived,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn an_infeasible_family_during_scouting_is_never_a_kill() {
+        let mut state = State::new("film");
+        state.mandate_redraws = Limits::default().mandate_redraws;
+        // Scouting has no concept to drop, so the assignment is waived.
+        assert_eq!(
+            state.mandate_infeasible("no usable shape", Vec::new()),
+            InfeasibleOutcome::Waived
+        );
+        assert_eq!(state.stage, Stage::Scout);
+        assert_eq!(state.kills, 0);
+    }
+
+    #[test]
+    fn limits_come_from_the_production_not_from_constants() {
+        let strict = Limits {
+            revisions_per_stage: 1,
+            kills: 0,
+            mandate_redraws: 0,
+        };
+        let mut state = State::with_limits("film", strict);
+        while state.stage != Stage::Shotlist {
+            clear_stage(&mut state);
+        }
+
+        pass_measured(&mut state);
+        assert_eq!(
+            state.review(Verdict::Revise, "").unwrap(),
+            ReviewOutcome::Revise { remaining: 0 }
+        );
+        pass_measured(&mut state);
+        assert_eq!(
+            state.review(Verdict::Revise, "").unwrap(),
+            ReviewOutcome::LimitReached
+        );
+
+        // No kills and no redraws: an unrealisable mandate is waived at once.
+        let mut state = State::with_limits("film", strict);
+        clear_stage(&mut state);
+        assert!(state.kill("no", Vec::new()).is_err());
+        assert_eq!(
+            state.mandate_infeasible("none", Vec::new()),
+            InfeasibleOutcome::Waived
+        );
+
+        // The limits survive a save and load.
+        let restored: State =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(restored.limits, strict);
     }
 
     #[test]

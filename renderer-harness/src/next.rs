@@ -7,9 +7,10 @@ use serde::Serialize;
 use crate::{
     axes::{Axes, AxisId},
     budget::Budget,
-    ledger::{AXIS_DIFF_WINDOW, Ledger, MIN_DIFFERING_AXES},
+    ledger::Ledger,
     mandate::Mandate,
-    stage::{MAX_KILLS, MAX_REVISIONS_PER_STAGE, Stage, State},
+    stage::{Stage, State},
+    tuning::Tuning,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -103,7 +104,7 @@ const KILL: (&str, &str, bool) = (
 const REVIEW: (&str, &str, bool) = (
     "review submit",
     "批評役の判定 (pass / revise / kill) を登録する",
-    false,
+    true,
 );
 
 const fn guide(stage: Stage) -> StageGuide {
@@ -128,7 +129,7 @@ const fn guide(stage: Stage) -> StageGuide {
         Stage::Brief => StageGuide {
             instruction: "brief.yaml を書く。主題を一文で述べ、指定制約と軸差分ルールを満たすこと。",
             commands: &[
-                ("brief check", "スキーマ、指定制約、軸差分を検証する", false),
+                ("brief check", "スキーマ、指定制約、軸差分を検証する", true),
                 KILL,
             ],
             write: &["brief.yaml"],
@@ -140,13 +141,9 @@ const fn guide(stage: Stage) -> StageGuide {
                 (
                     "shotlist check",
                     "スキーマ、経路の安全性、作品内の重複禁止を検証する",
-                    false,
+                    true,
                 ),
-                (
-                    "animatic",
-                    "全尺の低解像度動画と読みやすさ指標を作る",
-                    false,
-                ),
+                ("animatic", "全尺の低解像度動画と読みやすさ指標を作る", true),
                 REVIEW,
                 KILL,
             ],
@@ -203,7 +200,13 @@ const fn guide(stage: Stage) -> StageGuide {
 
 /// Builds the report for the production's current stage.
 #[must_use]
-pub fn report(state: &State, mandate: &Mandate, budget: &Budget, ledger: &Ledger) -> NextReport {
+pub fn report(
+    state: &State,
+    mandate: &Mandate,
+    budget: &Budget,
+    ledger: &Ledger,
+    tuning: &Tuning,
+) -> NextReport {
     let guide = guide(state.stage);
 
     let gates = state
@@ -232,7 +235,7 @@ pub fn report(state: &State, mandate: &Mandate, budget: &Budget, ledger: &Ledger
         .commands
         .iter()
         // A kill that would be refused is not offered.
-        .filter(|(command, ..)| *command != "kill" || state.kills < MAX_KILLS)
+        .filter(|(command, ..)| *command != "kill" || state.kills < state.limits.kills)
         .map(|(command, purpose, implemented)| CommandReport {
             command,
             purpose,
@@ -252,9 +255,9 @@ pub fn report(state: &State, mandate: &Mandate, budget: &Budget, ledger: &Ledger
         read: guide.read.to_vec(),
         limits: Limits {
             revisions_used: state.revisions.get(&state.stage).copied().unwrap_or(0),
-            revisions_allowed: MAX_REVISIONS_PER_STAGE,
+            revisions_allowed: state.limits.revisions_per_stage,
             kills_used: state.kills,
-            kills_allowed: MAX_KILLS,
+            kills_allowed: state.limits.kills,
         },
         compromised: state.compromised,
         banned_locations: state.banned_locations.clone(),
@@ -268,14 +271,15 @@ pub fn report(state: &State, mandate: &Mandate, budget: &Budget, ledger: &Ledger
         diversity: DiversityReport {
             mandate: mandate.clone(),
             recent_films: ledger
-                .recent(AXIS_DIFF_WINDOW)
+                .recent(tuning.diversity.axis_diff_window)
                 .map(|entry| PastFilm {
                     id: entry.id.clone(),
                     axes: entry.axes,
                 })
                 .collect(),
             rule: format!(
-                "直近{AXIS_DIFF_WINDOW}作品のそれぞれと、6軸中{MIN_DIFFERING_AXES}軸以上が異なること"
+                "直近{}作品のそれぞれと、6軸中{}軸以上が異なること",
+                tuning.diversity.axis_diff_window, tuning.diversity.min_differing_axes
             ),
             axes: AxisId::ALL.to_vec(),
         },
@@ -299,7 +303,11 @@ mod tests {
             Motion::Dive,
         )])
         .unwrap();
-        (Mandate::draw(&ledger, 3), Budget::default(), ledger)
+        (
+            Mandate::draw(&ledger, 3, &Tuning::default().diversity),
+            Budget::default(),
+            ledger,
+        )
     }
 
     fn at(stage: Stage) -> State {
@@ -326,7 +334,7 @@ mod tests {
     fn every_stage_lists_its_gates_and_valid_files() {
         let (mandate, budget, ledger) = fixtures();
         for stage in Stage::ALL {
-            let report = report(&at(*stage), &mandate, &budget, &ledger);
+            let report = report(&at(*stage), &mandate, &budget, &ledger, &Tuning::default());
             let gates: Vec<_> = report.gates.iter().map(|gate| gate.gate).collect();
             assert_eq!(gates, stage.gates());
             assert!(
@@ -346,7 +354,7 @@ mod tests {
     fn review_and_kill_follow_the_stage_machine() {
         let (mandate, budget, ledger) = fixtures();
         for stage in Stage::ALL {
-            let report = report(&at(*stage), &mandate, &budget, &ledger);
+            let report = report(&at(*stage), &mandate, &budget, &ledger, &Tuning::default());
             let offers = |name: &str| report.commands.iter().any(|entry| entry.command == name);
             assert_eq!(offers("review submit"), stage.has_critic(), "{stage:?}");
             assert_eq!(offers("kill"), stage.can_kill(), "{stage:?}");
@@ -361,7 +369,7 @@ mod tests {
             .record_gate("novelty", false, "too close to earlier")
             .unwrap();
         state.record_gate("cost-ceiling", true, "ok").unwrap();
-        let report = report(&state, &mandate, &budget, &ledger);
+        let report = report(&state, &mandate, &budget, &ledger, &Tuning::default());
         let status = |name: &str| {
             report
                 .gates
@@ -382,16 +390,22 @@ mod tests {
     fn exhausted_kills_are_not_offered() {
         let (mandate, budget, ledger) = fixtures();
         let mut state = at(Stage::Brief);
-        state.kills = MAX_KILLS;
-        let report = report(&state, &mandate, &budget, &ledger);
+        state.kills = state.limits.kills;
+        let report = report(&state, &mandate, &budget, &ledger, &Tuning::default());
         assert!(report.commands.iter().all(|entry| entry.command != "kill"));
-        assert_eq!(report.limits.kills_used, MAX_KILLS);
+        assert_eq!(report.limits.kills_used, state.limits.kills);
     }
 
     #[test]
     fn past_films_expose_axes_only() {
         let (mandate, budget, ledger) = fixtures();
-        let report = report(&State::new("film"), &mandate, &budget, &ledger);
+        let report = report(
+            &State::new("film"),
+            &mandate,
+            &budget,
+            &ledger,
+            &Tuning::default(),
+        );
         let json = serde_json::to_value(&report).unwrap();
         let film = &json["diversity"]["recent_films"][0];
         let keys: Vec<_> = film.as_object().unwrap().keys().cloned().collect();

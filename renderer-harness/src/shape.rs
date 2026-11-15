@@ -11,6 +11,7 @@ use fractal_renderer_core::{
 use crate::{
     axes::{FormulaFamily, ScaleRegime},
     rng::Rng,
+    tuning::Scouting,
 };
 
 /// Radius from which survey rays are cast towards the origin.
@@ -34,9 +35,6 @@ const DIRECTION_CANDIDATES: usize = 24;
 /// Half-angle of the ray fan used to judge depth layering, in radians.
 const FAN_ANGLE: f64 = 0.22;
 
-const THUMBNAIL_FOV_DEGREES: f32 = 40.0;
-/// Fog optical depth at the subject: about 15% of the sky colour mixed in.
-const SUBJECT_FOG: f64 = 0.16;
 /// Upper bound the renderer accepts for fog density.
 const MAX_FOG_DENSITY: f64 = 100.0;
 
@@ -54,6 +52,14 @@ pub struct Survey {
     pub bounded: bool,
     /// Radius containing the surface, or the working radius when unbounded.
     pub radius: f64,
+}
+
+impl Survey {
+    /// Length scale camera clearances are measured against.
+    #[must_use]
+    pub fn working_radius(&self) -> f64 {
+        self.radius.min(UNBOUNDED_WORK_RADIUS)
+    }
 }
 
 /// A camera placement found for a shape.
@@ -108,6 +114,12 @@ enum Trace {
     Hit(f64),
     Miss,
     Invalid,
+}
+
+/// Distance from a point to the nearest surface of a fractal.
+#[must_use]
+pub fn clearance(fractal: &FractalConfig, point: [f64; 3]) -> f64 {
+    Estimator(fractal).distance(point)
 }
 
 /// Generates a random formula of the given family. The result always passes
@@ -376,7 +388,7 @@ pub fn discover(rng: &mut Rng, family: FormulaFamily) -> Option<Shape> {
 
 /// Finds camera placements across the scale regimes the shape supports.
 #[must_use]
-pub fn viewpoints(rng: &mut Rng, shape: &Shape) -> Vec<Viewpoint> {
+pub fn viewpoints(rng: &mut Rng, shape: &Shape, rules: &Scouting) -> Vec<Viewpoint> {
     // An unbounded shape has no outside to look at it from.
     let regimes: &[ScaleRegime] = if shape.survey.bounded {
         &[ScaleRegime::Overview, ScaleRegime::Mid, ScaleRegime::Deep]
@@ -386,15 +398,15 @@ pub fn viewpoints(rng: &mut Rng, shape: &Shape) -> Vec<Viewpoint> {
     regimes
         .iter()
         .filter_map(|regime| match regime {
-            ScaleRegime::Overview => Some(overview(rng, shape)),
-            regime => interior(rng, shape, *regime),
+            ScaleRegime::Overview => Some(overview(rng, shape, rules)),
+            regime => interior(rng, shape, *regime, rules),
         })
         .collect()
 }
 
-fn overview(rng: &mut Rng, shape: &Shape) -> Viewpoint {
+fn overview(rng: &mut Rng, shape: &Shape, rules: &Scouting) -> Viewpoint {
     let outward = rng.unit_vector();
-    let distance = shape.survey.radius * 2.6;
+    let distance = shape.survey.radius * rules.overview_distance_radii;
     let position = scale(outward, distance);
     Viewpoint {
         position,
@@ -407,13 +419,19 @@ fn overview(rng: &mut Rng, shape: &Shape) -> Viewpoint {
 
 /// Places a camera in free space with the clearance the regime calls for,
 /// then turns it towards the most layered view.
-fn interior(rng: &mut Rng, shape: &Shape, regime: ScaleRegime) -> Option<Viewpoint> {
+fn interior(
+    rng: &mut Rng,
+    shape: &Shape,
+    regime: ScaleRegime,
+    rules: &Scouting,
+) -> Option<Viewpoint> {
     let estimator = Estimator(&shape.fractal);
-    let unit = shape.survey.radius.min(UNBOUNDED_WORK_RADIUS);
-    let (low, high) = match regime {
-        ScaleRegime::Deep => (0.004 * unit, 0.03 * unit),
-        _ => (0.08 * unit, 0.4 * unit),
-    };
+    let unit = shape.survey.working_radius();
+    let [low, high] = match regime {
+        ScaleRegime::Deep => rules.deep_clearance,
+        _ => rules.mid_clearance,
+    }
+    .map(|relative| relative * unit);
     let reach = if shape.survey.bounded {
         shape.survey.radius * 1.1
     } else {
@@ -458,7 +476,12 @@ fn interior(rng: &mut Rng, shape: &Shape, regime: ScaleRegime) -> Option<Viewpoi
             .sqrt();
         // A subject a few clearances away fills the frame without clipping
         // into the lens; depth spread across the fan gives the eye layers.
-        let framing = 1.0 - ((centre / (6.0 * clearance)).ln().abs() / 6.0_f64.ln()).min(1.0);
+        let framing = 1.0
+            - ((centre / (rules.subject_distance_clearances * clearance))
+                .ln()
+                .abs()
+                / 6.0_f64.ln())
+            .min(1.0);
         let score = framing + 0.5 * layering.min(2.0);
         if best.is_none_or(|(best_score, ..)| score > best_score) {
             best = Some((score, direction, centre));
@@ -475,6 +498,13 @@ fn interior(rng: &mut Rng, shape: &Shape, regime: ScaleRegime) -> Option<Viewpoi
     })
 }
 
+/// Fog density that mixes a fixed share of sky into a subject at the given
+/// distance. Fog grows with the square of distance.
+#[must_use]
+pub fn subject_fog_density(subject_distance: f64, subject_fog: f64) -> f64 {
+    (subject_fog / (subject_distance * subject_distance)).min(MAX_FOG_DENSITY)
+}
+
 /// Builds the render configuration for a scouting thumbnail of a viewpoint.
 #[must_use]
 pub fn thumbnail_config(
@@ -483,6 +513,7 @@ pub fn thumbnail_config(
     width: u32,
     height: u32,
     seed: u32,
+    rules: &Scouting,
 ) -> RenderConfig {
     let direction = normalize(sub(viewpoint.target, viewpoint.position));
     let right = cross(direction, viewpoint.up);
@@ -498,8 +529,7 @@ pub fn thumbnail_config(
         // Fog grows with the square of distance. Tying it to the subject
         // distance separates depth layers at every scale without colour; a
         // fixed density would erase overviews and do nothing in close-ups.
-        dsl.material.fog_density =
-            (SUBJECT_FOG / (subject_distance * subject_distance)).min(MAX_FOG_DENSITY) as f32;
+        dsl.material.fog_density = subject_fog_density(subject_distance, rules.subject_fog) as f32;
     }
     let mut config = RenderConfig {
         fractal,
@@ -509,7 +539,7 @@ pub fn thumbnail_config(
     config.camera.position = QfVec3::from_f64(viewpoint.position);
     config.camera.target = QfVec3::from_f64(viewpoint.target);
     config.camera.up = viewpoint.up.map(|value| value as f32);
-    config.camera.vertical_fov_degrees = THUMBNAIL_FOV_DEGREES;
+    config.camera.vertical_fov_degrees = rules.field_of_view_degrees;
     config.camera.focus_distance = subject_distance.max(1.0e-6) as f32;
     config.light.direction = light.map(|value| value as f32);
     config.render = RenderSettings {
@@ -666,7 +696,7 @@ mod tests {
                 radius: 1.3,
             },
         };
-        let found = viewpoints(&mut rng, &shape);
+        let found = viewpoints(&mut rng, &shape, &Scouting::default());
         let overview = found
             .iter()
             .find(|viewpoint| viewpoint.scale_regime == ScaleRegime::Overview)
@@ -674,6 +704,34 @@ mod tests {
         assert!((length(overview.position) - 1.3 * 2.6).abs() < 1e-9);
         assert_eq!(overview.target, [0.0; 3]);
         assert!(overview.clearance > 1.0);
+    }
+
+    #[test]
+    fn framing_follows_the_scouting_rules() {
+        let shape = Shape {
+            family: FormulaFamily::Mandelbulb,
+            fractal: FractalConfig::Mandelbulb(MandelbulbConfig::default()),
+            survey: Survey {
+                bounded: true,
+                radius: 1.3,
+            },
+        };
+        let rules = Scouting {
+            overview_distance_radii: 1.8,
+            field_of_view_degrees: 55.0,
+            ..Scouting::default()
+        };
+        let overview = viewpoints(&mut Rng::new(5), &shape, &rules)
+            .into_iter()
+            .find(|viewpoint| viewpoint.scale_regime == ScaleRegime::Overview)
+            .unwrap();
+        assert!((length(overview.position) - 1.3 * 1.8).abs() < 1e-9);
+        let config = thumbnail_config(&shape, &overview, 320, 180, 1, &rules);
+        assert_eq!(config.camera.vertical_fov_degrees, 55.0);
+
+        // Fog follows the requested optical depth at the subject.
+        assert!((subject_fog_density(2.0, 0.16) - 0.04).abs() < 1e-12);
+        assert!((subject_fog_density(2.0, 0.32) - 0.08).abs() < 1e-12);
     }
 
     #[test]
@@ -686,7 +744,7 @@ mod tests {
             };
             let estimator = Estimator(&shape.fractal);
             let unit = shape.survey.radius.min(UNBOUNDED_WORK_RADIUS);
-            for viewpoint in viewpoints(&mut rng, &shape) {
+            for viewpoint in viewpoints(&mut rng, &shape, &Scouting::default()) {
                 let direction = normalize(sub(viewpoint.target, viewpoint.position));
                 // The camera frame must be orthonormal for the renderer.
                 assert!(
@@ -703,10 +761,11 @@ mod tests {
                     continue;
                 }
                 let clearance = estimator.distance(viewpoint.position);
-                let (low, high) = match viewpoint.scale_regime {
-                    ScaleRegime::Deep => (0.004 * unit, 0.03 * unit),
-                    _ => (0.08 * unit, 0.4 * unit),
-                };
+                let [low, high] = match viewpoint.scale_regime {
+                    ScaleRegime::Deep => Scouting::default().deep_clearance,
+                    _ => Scouting::default().mid_clearance,
+                }
+                .map(|relative| relative * unit);
                 assert!((low..=high).contains(&clearance), "{viewpoint:?}");
                 assert!(length(sub(viewpoint.target, viewpoint.position)) > clearance * 0.5);
                 checked += 1;
@@ -730,7 +789,7 @@ mod tests {
             },
         };
         assert!(
-            viewpoints(&mut rng, &shape)
+            viewpoints(&mut rng, &shape, &Scouting::default())
                 .iter()
                 .all(|viewpoint| viewpoint.scale_regime != ScaleRegime::Overview)
         );
@@ -743,8 +802,9 @@ mod tests {
             let Some(shape) = (0..40).find_map(|_| discover(&mut rng, *family)) else {
                 continue;
             };
-            for viewpoint in viewpoints(&mut rng, &shape) {
-                let config = thumbnail_config(&shape, &viewpoint, 320, 180, 1);
+            for viewpoint in viewpoints(&mut rng, &shape, &Scouting::default()) {
+                let config =
+                    thumbnail_config(&shape, &viewpoint, 320, 180, 1, &Scouting::default());
                 config
                     .validate()
                     .unwrap_or_else(|error| panic!("{family:?} {viewpoint:?}: {error:#}"));

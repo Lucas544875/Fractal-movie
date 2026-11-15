@@ -10,14 +10,11 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::axes::{Axes, AxisId, FormulaFamily};
-
-/// Number of most recent films whose formula family may not be reused.
-pub const FAMILY_BAN_WINDOW: usize = 3;
-/// Number of most recent films a new film is compared against.
-pub const AXIS_DIFF_WINDOW: usize = 5;
-/// Minimum number of differing axes against each compared film.
-pub const MIN_DIFFERING_AXES: usize = 3;
+use crate::{
+    axes::{Axes, AxisId, FormulaFamily},
+    novelty::Descriptor,
+    tuning::Diversity,
+};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -27,13 +24,15 @@ pub struct LedgerEntry {
     pub date: String,
     pub title: String,
     pub axes: Axes,
-    /// Image descriptor of the film's keyframes, used by the novelty gate.
+    /// One image descriptor per keyframe, used by the novelty gate.
     #[serde(default)]
-    pub descriptor: Vec<f32>,
+    pub descriptors: Vec<Descriptor>,
     #[serde(default)]
     pub keyframes: Vec<String>,
     pub duration_seconds: f64,
-    pub gpu_minutes: f64,
+    /// GPU minutes the film took; unknown for films imported after the fact.
+    #[serde(default)]
+    pub gpu_minutes: Option<f64>,
     #[serde(default)]
     pub compromised: bool,
 }
@@ -124,14 +123,24 @@ impl Ledger {
 
     /// Families used by the most recent films, which a new film may not reuse.
     #[must_use]
-    pub fn banned_families(&self) -> Vec<FormulaFamily> {
+    pub fn banned_families(&self, window: usize) -> Vec<FormulaFamily> {
         let mut banned = Vec::new();
-        for entry in self.recent(FAMILY_BAN_WINDOW) {
+        for entry in self.recent(window) {
             if !banned.contains(&entry.axes.formula_family) {
                 banned.push(entry.axes.formula_family);
             }
         }
         banned
+    }
+
+    /// Keyframe descriptors of every film, with the film they belong to.
+    pub fn descriptors(&self) -> impl Iterator<Item = (&str, &Descriptor)> {
+        self.entries.iter().flat_map(|entry| {
+            entry
+                .descriptors
+                .iter()
+                .map(|descriptor| (entry.id.as_str(), descriptor))
+        })
     }
 
     /// How many films in the whole ledger used `value` on `axis`.
@@ -145,14 +154,14 @@ impl Ledger {
 
     /// Recent films from which `axes` does not differ on enough axes.
     #[must_use]
-    pub fn axis_diff_violations(&self, axes: &Axes) -> Vec<AxisDiffViolation> {
-        self.recent(AXIS_DIFF_WINDOW)
+    pub fn axis_diff_violations(&self, axes: &Axes, rules: &Diversity) -> Vec<AxisDiffViolation> {
+        self.recent(rules.axis_diff_window)
             .filter_map(|entry| {
                 let differing = axes.differing(&entry.axes);
-                (differing.len() < MIN_DIFFERING_AXES).then(|| AxisDiffViolation {
+                (differing.len() < rules.min_differing_axes).then(|| AxisDiffViolation {
                     film: entry.id.clone(),
                     differing,
-                    required: MIN_DIFFERING_AXES,
+                    required: rules.min_differing_axes,
                 })
             })
             .collect()
@@ -180,10 +189,10 @@ pub(crate) mod tests {
                 light: Light::Raking,
                 pacing: Pacing::Slow,
             },
-            descriptor: Vec::new(),
+            descriptors: Vec::new(),
             keyframes: Vec::new(),
             duration_seconds: 10.0,
-            gpu_minutes: 99.0,
+            gpu_minutes: Some(99.0),
             compromised: false,
         }
     }
@@ -199,7 +208,7 @@ pub(crate) mod tests {
     fn missing_file_is_an_empty_ledger() {
         let ledger = Ledger::load(Path::new("/nonexistent/ledger.jsonl")).unwrap();
         assert!(ledger.entries().is_empty());
-        assert!(ledger.banned_families().is_empty());
+        assert!(ledger.banned_families(3).is_empty());
     }
 
     #[test]
@@ -243,11 +252,51 @@ pub(crate) mod tests {
         ])
         .unwrap();
         assert_eq!(
-            ledger.banned_families(),
+            ledger.banned_families(3),
             vec![FormulaFamily::AmazingSurf, FormulaFamily::Mandelbox]
         );
         assert_eq!(ledger.usage(AxisId::Motion, "orbit"), 2);
         assert_eq!(ledger.usage(AxisId::Motion, "flyover"), 0);
+    }
+
+    #[test]
+    fn windows_and_thresholds_follow_the_rules_given() {
+        let ledger = Ledger::from_entries(vec![
+            entry("a", FormulaFamily::Mandelbulb, Motion::Dive),
+            entry("b", FormulaFamily::Mandelbox, Motion::Orbit),
+        ])
+        .unwrap();
+        assert_eq!(ledger.banned_families(1), vec![FormulaFamily::Mandelbox]);
+        assert!(ledger.banned_families(0).is_empty());
+
+        // Differs from "b" in family and motion, from "a" in family only.
+        let proposal = entry("new", FormulaFamily::JuliaBox, Motion::Dive).axes;
+        let lenient = Diversity {
+            min_differing_axes: 1,
+            ..Diversity::default()
+        };
+        assert!(ledger.axis_diff_violations(&proposal, &lenient).is_empty());
+        let recent_only = Diversity {
+            axis_diff_window: 1,
+            min_differing_axes: 2,
+            ..Diversity::default()
+        };
+        assert!(
+            ledger
+                .axis_diff_violations(&proposal, &recent_only)
+                .is_empty()
+        );
+        let both = Diversity {
+            axis_diff_window: 2,
+            min_differing_axes: 2,
+            ..Diversity::default()
+        };
+        let violations = ledger.axis_diff_violations(&proposal, &both);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(
+            (violations[0].film.as_str(), violations[0].required),
+            ("a", 2)
+        );
     }
 
     #[test]
@@ -259,7 +308,7 @@ pub(crate) mod tests {
         .unwrap();
 
         let mut proposal = entry("new", FormulaFamily::Mandelbulb, Motion::Flyover).axes;
-        let violations = ledger.axis_diff_violations(&proposal);
+        let violations = ledger.axis_diff_violations(&proposal, &Diversity::default());
         assert_eq!(violations.len(), 2);
         assert_eq!(violations[0].film, "recent");
         assert_eq!(
@@ -268,6 +317,10 @@ pub(crate) mod tests {
         );
 
         proposal.light = Light::Backlit;
-        assert!(ledger.axis_diff_violations(&proposal).is_empty());
+        assert!(
+            ledger
+                .axis_diff_violations(&proposal, &Diversity::default())
+                .is_empty()
+        );
     }
 }

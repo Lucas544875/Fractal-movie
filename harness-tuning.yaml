@@ -1,0 +1,69 @@
+diversity:
+  family_ban_window: 3
+  axis_diff_window: 5
+  min_differing_axes: 3
+  assigned_axes: 2
+  min_structure_distance: 0.1
+limits:
+  revisions_per_stage: 3
+  kills: 2
+  mandate_redraws: 2
+scouting:
+  default_shapes: 60
+  min_selected: 2
+  max_selected: 5
+  overview_distance_radii: 2.6
+  mid_clearance:
+  - 0.08
+  - 0.4
+  deep_clearance:
+  - 0.004
+  - 0.03
+  subject_distance_clearances: 6.0
+  field_of_view_degrees: 40.0
+  subject_fog: 0.16
+  estimate_samples_per_pixel: 8.0
+  cost_ceiling_share: 0.5
+  refine_amount: 0.12
+legibility:
+  min_negative_space: 0.1
+  max_negative_space: 0.85
+  max_high_frequency: 0.35
+  min_mean_luminance: 0.03
+  max_flicker: 0.02
+classification:
+  deep_clearance: 0.05
+  overview_radii: 1.5
+  frontal_cosine: 0.75
+  backlit_cosine: -0.2
+  top_cosine: 0.6
+  slow_cut_seconds: 12.0
+  medium_cut_seconds: 7.0
+  min_coloured_share: 0.25
+  low_key_luminance: 0.25
+  high_key_luminance: 0.55
+shotlist:
+  transition_seconds: 0.5
+  min_transition_cut_seconds: 2.0
+  min_cut_seconds: 1.0
+  max_cut_seconds: 60.0
+  min_cut_differences: 2
+  min_clearance_ratio: 0.02
+quality:
+  reference_spp: 64
+  ablation_spp: 16
+  spp_ladder:
+  - 4
+  - 8
+  - 16
+  - 32
+  min_spp: 2
+  min_effect_steps: 4
+  epsilon_ladder:
+  - 1.5
+  - 2.0
+  - 3.0
+  effect_min_difference: 0.02
+  step_max_difference: 0.01
+  spp_max_difference: 0.02
+  epsilon_max_difference: 0.02

@@ -90,6 +90,14 @@ pub fn save_png(path: &Path, width: u32, height: u32, rgba: &[u8]) -> Result<()>
     std::fs::rename(&temporary, path).with_context(|| format!("could not write {}", path.display()))
 }
 
+/// Decodes an image file into a frame for measurement.
+pub fn load_frame(path: &Path) -> Result<crate::metrics::Frame> {
+    let image = image::open(path)
+        .with_context(|| format!("could not decode {}", path.display()))?
+        .into_rgba8();
+    crate::metrics::Frame::from_rgba8(image.width(), image.height(), image.as_raw())
+}
+
 /// Lays cells out row by row in a grid of `columns`.
 pub fn compose(
     cells: &[Cell<'_>],

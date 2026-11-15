@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::{Serialize, de::DeserializeOwned};
 
-use crate::{budget::Budget, ledger::Ledger, mandate::Mandate, stage::State};
+use crate::{budget::Budget, ledger::Ledger, mandate::Mandate, stage::State, tuning::Tuning};
 
 pub const DEFAULT_ROOT: &str = "output/productions";
 pub const DEFAULT_LEDGER: &str = "portfolio/ledger.jsonl";
@@ -30,7 +30,7 @@ pub struct Production {
 }
 
 impl Production {
-    /// Creates the directory of a new production and draws its constraints.
+    /// Creates a production with the default tuning.
     pub fn create(
         root: &Path,
         id: &str,
@@ -38,8 +38,22 @@ impl Production {
         seed: u64,
         budget: Budget,
     ) -> Result<Self> {
+        Self::create_with_tuning(root, id, ledger, seed, budget, &Tuning::default())
+    }
+
+    /// Creates the directory of a new production, draws its constraints,
+    /// and fixes the tuning it will be judged by.
+    pub fn create_with_tuning(
+        root: &Path,
+        id: &str,
+        ledger: &Ledger,
+        seed: u64,
+        budget: Budget,
+        tuning: &Tuning,
+    ) -> Result<Self> {
         validate_id(id)?;
         budget.validate()?;
+        tuning.validate()?;
         if ledger.entries().iter().any(|entry| entry.id == id) {
             bail!("production id {id:?} is already used by a finished film in the ledger");
         }
@@ -63,9 +77,10 @@ impl Production {
             id: id.to_owned(),
             directory,
         };
-        production.save_mandate(&Mandate::draw(ledger, seed))?;
+        write_json(&production.path("tuning.json"), tuning)?;
+        production.save_mandate(&Mandate::draw(ledger, seed, &tuning.diversity))?;
         production.save_budget(&budget)?;
-        production.save_state(&State::new(id))?;
+        production.save_state(&State::with_limits(id, tuning.limits))?;
         Ok(production)
     }
 
@@ -118,11 +133,18 @@ impl Production {
         write_json(&self.path("state.json"), state)
     }
 
+    /// The tuning this production was created with.
+    pub fn load_tuning(&self) -> Result<Tuning> {
+        let tuning: Tuning = read_json(&self.path("tuning.json"))?;
+        tuning.validate()?;
+        Ok(tuning)
+    }
+
     pub fn load_mandate(&self) -> Result<Mandate> {
         read_json(&self.path("mandate.json"))
     }
 
-    fn save_mandate(&self, mandate: &Mandate) -> Result<()> {
+    pub fn save_mandate(&self, mandate: &Mandate) -> Result<()> {
         write_json(&self.path("mandate.json"), mandate)
     }
 
@@ -224,7 +246,11 @@ mod tests {
         assert_eq!(state.stage, Stage::Scout);
         assert_eq!(production.load_budget().unwrap(), Budget::default());
         let mandate = production.load_mandate().unwrap();
-        assert_eq!(mandate, Mandate::draw(&ledger, 5));
+        assert_eq!(
+            mandate,
+            Mandate::draw(&ledger, 5, &Tuning::default().diversity)
+        );
+        assert_eq!(production.load_tuning().unwrap(), Tuning::default());
         assert_eq!(mandate.banned_families, vec![FormulaFamily::Mandelbox]);
 
         fs::remove_dir_all(&root).unwrap();

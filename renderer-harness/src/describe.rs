@@ -6,10 +6,9 @@ use serde_json::{Value, json};
 use crate::{
     axes::{AxisId, PaletteKey},
     budget::Budget,
-    ledger::{AXIS_DIFF_WINDOW, FAMILY_BAN_WINDOW, MIN_DIFFERING_AXES},
-    mandate::ASSIGNED_AXES,
     production::AUTHORED_FILES,
-    stage::{MAX_KILLS, MAX_REVISIONS_PER_STAGE, Stage},
+    stage::Stage,
+    tuning::Tuning,
 };
 
 /// Roles a cut can play within a film.
@@ -25,7 +24,7 @@ pub const PATH_KINDS: [&str; 4] = [
 ];
 
 #[must_use]
-pub fn describe() -> Value {
+pub fn describe(tuning: &Tuning) -> Value {
     let axes: Vec<Value> = AxisId::ALL
         .iter()
         .map(|axis| json!({ "axis": axis, "values": axis.domain() }))
@@ -48,20 +47,11 @@ pub fn describe() -> Value {
         "authored_files": AUTHORED_FILES,
         "axes": axes,
         "palette_keys": palette_keys,
-        "diversity": {
-            "family_ban_window": FAMILY_BAN_WINDOW,
-            "assigned_axes": ASSIGNED_AXES,
-            "axis_diff_window": AXIS_DIFF_WINDOW,
-            "min_differing_axes": MIN_DIFFERING_AXES,
-        },
+        "tuning": tuning,
         "cut_roles": CUT_ROLES,
         "transitions": TRANSITIONS,
         "path_kinds": PATH_KINDS,
         "stages": stages,
-        "limits": {
-            "revisions_per_stage": MAX_REVISIONS_PER_STAGE,
-            "kills": MAX_KILLS,
-        },
         "default_budget": Budget::default(),
     })
 }
@@ -72,7 +62,8 @@ mod tests {
 
     #[test]
     fn lists_every_axis_and_stage() {
-        let description = describe();
+        let description = describe(&Tuning::default());
+        assert_eq!(description["tuning"]["limits"]["kills"], 2);
         assert_eq!(
             description["axes"].as_array().unwrap().len(),
             AxisId::ALL.len()

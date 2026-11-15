@@ -6,31 +6,10 @@
 use anyhow::{Result, bail};
 use serde::Serialize;
 
-use crate::metrics::{Frame, difference};
-
-/// Sample count of the converged reference the sampling ladder is judged
-/// against.
-pub const REFERENCE_SPP: u32 = 64;
-/// Sample count used while comparing effects. Variants share it, so their
-/// sampling noise is correlated and cancels out of the comparison.
-pub const ABLATION_SPP: u32 = 16;
-/// Candidate final sample counts, cheapest first.
-pub const SPP_LADDER: [u32; 4] = [4, 8, 16, 32];
-/// Lowest sample count budget fitting may fall back to.
-pub const MIN_SPP: u32 = 2;
-/// Fewest steps a secondary ray effect is tried with.
-pub const MIN_EFFECT_STEPS: u32 = 4;
-/// Multiples of the look's hit precision that are tried, in order.
-pub const EPSILON_LADDER: [f32; 3] = [1.5, 2.0, 3.0];
-
-/// An effect whose removal changes the image by less than this is dropped.
-pub const EFFECT_MIN_DIFFERENCE: f32 = 0.02;
-/// Reducing an effect's steps may change the image by at most this.
-pub const STEP_MAX_DIFFERENCE: f32 = 0.01;
-/// A sample count is accepted when it is this close to the reference.
-pub const SPP_MAX_DIFFERENCE: f32 = 0.02;
-/// Coarser hit precision is accepted while the image stays this close.
-pub const EPSILON_MAX_DIFFERENCE: f32 = 0.02;
+use crate::{
+    metrics::{Frame, difference},
+    tuning::QualityRules,
+};
 
 /// Differences are judged on frames reduced by this factor, so single-pixel
 /// noise that neither a viewer nor a codec preserves does not drive quality.
@@ -217,10 +196,14 @@ pub fn decide(
     frames: &[u32],
     requested: &Settings,
     limits: &FrameLimits,
+    rules: &QualityRules,
 ) -> Result<Decision> {
     if frames.is_empty() {
         bail!("quality decision needs at least one probe frame");
     }
+    let Some(top_spp) = rules.spp_ladder.last().copied() else {
+        bail!("quality decision needs a sample ladder");
+    };
     let mut session = Session {
         probe,
         frames,
@@ -229,7 +212,7 @@ pub fn decide(
         renders: 0,
     };
 
-    let mut current = requested.with_spp(ABLATION_SPP);
+    let mut current = requested.with_spp(rules.ablation_spp);
     let mut effects = Vec::new();
     for effect in Effect::ALL {
         if !requested.enabled(effect) {
@@ -237,7 +220,7 @@ pub fn decide(
         }
         let requested_steps = requested.steps(effect);
         let visible_difference = session.difference(&current, &current.without(effect))?;
-        if visible_difference < EFFECT_MIN_DIFFERENCE {
+        if visible_difference < rules.effect_min_difference {
             current = current.without(effect);
             effects.push(EffectDecision {
                 effect,
@@ -249,9 +232,9 @@ pub fn decide(
             continue;
         }
         if let Some(full_steps) = requested_steps {
-            for steps in reduced_steps(full_steps) {
+            for steps in reduced_steps(full_steps, rules.min_effect_steps) {
                 let candidate = current.with_steps(effect, steps);
-                if session.difference(&current, &candidate)? < STEP_MAX_DIFFERENCE {
+                if session.difference(&current, &candidate)? < rules.step_max_difference {
                     current = candidate;
                     break;
                 }
@@ -266,12 +249,12 @@ pub fn decide(
         });
     }
 
-    let reference = current.with_spp(REFERENCE_SPP);
+    let reference = current.with_spp(rules.reference_spp);
     let mut sample_trials = Vec::new();
-    let mut chosen_spp = SPP_LADDER[SPP_LADDER.len() - 1];
-    for spp in SPP_LADDER {
+    let mut chosen_spp = top_spp;
+    for spp in rules.spp_ladder.iter().copied() {
         let difference = session.difference(&reference, &current.with_spp(spp))?;
-        let accepted = difference < SPP_MAX_DIFFERENCE;
+        let accepted = difference < rules.spp_max_difference;
         sample_trials.push(Trial {
             value: spp,
             difference,
@@ -288,11 +271,11 @@ pub fn decide(
     let mut epsilon_trials = Vec::new();
     if requested.pixel_epsilon_multiplier > 0.0 {
         let base = current;
-        for factor in EPSILON_LADDER {
+        for factor in rules.epsilon_ladder.iter().copied() {
             let mut candidate = base;
             candidate.pixel_epsilon_multiplier = requested.pixel_epsilon_multiplier * factor;
             let difference = session.difference(&base, &candidate)?;
-            let accepted = difference < EPSILON_MAX_DIFFERENCE;
+            let accepted = difference < rules.epsilon_max_difference;
             epsilon_trials.push(Trial {
                 value: candidate.pixel_epsilon_multiplier,
                 difference,
@@ -316,8 +299,8 @@ pub fn decide(
             .iter_mut()
             .filter(|decision| decision.kept)
             .min_by(|a, b| a.visible_difference.total_cmp(&b.visible_difference));
-        let halved = (current.samples_per_pixel > MIN_SPP)
-            .then(|| (current.samples_per_pixel / 2).max(MIN_SPP));
+        let halved = (current.samples_per_pixel > rules.min_spp)
+            .then(|| (current.samples_per_pixel / 2).max(rules.min_spp));
         let halving_difference = halved.map(|to| {
             sample_trials
                 .iter()
@@ -361,10 +344,10 @@ pub fn decide(
 }
 
 /// Step counts below `full` worth trying, cheapest first.
-fn reduced_steps(full: u32) -> Vec<u32> {
+fn reduced_steps(full: u32, min_steps: u32) -> Vec<u32> {
     let mut steps: Vec<u32> = [full / 4, full / 2]
         .into_iter()
-        .map(|value| value.max(MIN_EFFECT_STEPS))
+        .map(|value| value.max(min_steps))
         .filter(|value| *value < full)
         .collect();
     steps.dedup();
@@ -432,6 +415,20 @@ impl Session<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Decides with the default rules.
+    fn decide(
+        probe: &mut dyn Probe,
+        frames: &[u32],
+        requested: &Settings,
+        limits: &FrameLimits,
+    ) -> Result<Decision> {
+        super::decide(probe, frames, requested, limits, &QualityRules::default())
+    }
+
+    fn reduced_steps(full: u32) -> Vec<u32> {
+        super::reduced_steps(full, QualityRules::default().min_effect_steps)
+    }
     use crate::{metrics::tests::frame, rng::Rng};
 
     const SIZE: usize = 96;
@@ -551,7 +548,9 @@ mod tests {
 
         let ambient_occlusion = effect(&decision, Effect::AmbientOcclusion);
         assert!(ambient_occlusion.kept);
-        assert!(ambient_occlusion.visible_difference >= EFFECT_MIN_DIFFERENCE);
+        assert!(
+            ambient_occlusion.visible_difference >= QualityRules::default().effect_min_difference
+        );
         let soft_shadow = effect(&decision, Effect::SoftShadow);
         assert!(!soft_shadow.kept);
         assert_eq!(soft_shadow.steps, None);
@@ -596,14 +595,20 @@ mod tests {
     fn sampling_stops_at_the_first_level_matching_the_reference() {
         let mut clean = Synthetic::new();
         let decision = decide(&mut clean, &[0], &requested(), &GENEROUS).unwrap();
-        assert_eq!(decision.settings.samples_per_pixel, SPP_LADDER[0]);
+        assert_eq!(
+            decision.settings.samples_per_pixel,
+            QualityRules::default().spp_ladder[0]
+        );
         assert_eq!(decision.sample_trials.len(), 1);
 
         let mut noisy = Synthetic::new();
         noisy.noise = 0.5;
         let decision = decide(&mut noisy, &[0], &requested(), &GENEROUS).unwrap();
         let chosen = decision.settings.samples_per_pixel;
-        assert!(chosen > SPP_LADDER[0], "noise must demand more samples");
+        assert!(
+            chosen > QualityRules::default().spp_ladder[0],
+            "noise must demand more samples"
+        );
         let (rejected, accepted) = decision
             .sample_trials
             .split_at(decision.sample_trials.len() - 1);
@@ -632,7 +637,10 @@ mod tests {
         let mut insensitive = Synthetic::new();
         let decision = decide(&mut insensitive, &[0], &requested(), &GENEROUS).unwrap();
         assert_eq!(decision.settings.pixel_epsilon_multiplier, 3.0);
-        assert_eq!(decision.epsilon_trials.len(), EPSILON_LADDER.len());
+        assert_eq!(
+            decision.epsilon_trials.len(),
+            QualityRules::default().epsilon_ladder.len()
+        );
 
         let mut sensitive = Synthetic::new();
         sensitive.epsilon_sensitivity = 0.2;
@@ -726,7 +734,10 @@ mod tests {
         };
         let decision = decide(&mut Synthetic::new(), &[0, 1], &requested(), &limits).unwrap();
         assert!(!decision.fits_budget);
-        assert_eq!(decision.settings.samples_per_pixel, MIN_SPP);
+        assert_eq!(
+            decision.settings.samples_per_pixel,
+            QualityRules::default().min_spp
+        );
         assert!(decision.estimate.mean_frame_seconds > limits.mean_frame_seconds);
     }
 
@@ -758,6 +769,50 @@ mod tests {
         again.ambient_occlusion = 0.15;
         decide(&mut again, &frames, &requested(), &GENEROUS).unwrap();
         assert_eq!(again.calls, probe.calls);
+    }
+
+    #[test]
+    fn ladders_and_thresholds_follow_the_rules_given() {
+        let mut noisy = Synthetic::new();
+        noisy.noise = 0.5;
+        let default_spp = decide(&mut noisy, &[0], &requested(), &GENEROUS)
+            .unwrap()
+            .settings
+            .samples_per_pixel;
+
+        // A looser tolerance accepts the first rung of a custom ladder.
+        let rules = QualityRules {
+            spp_ladder: vec![3, 6, 12],
+            spp_max_difference: 0.9,
+            reference_spp: 24,
+            epsilon_ladder: vec![2.5],
+            ..QualityRules::default()
+        };
+        let mut noisy = Synthetic::new();
+        noisy.noise = 0.5;
+        let decision = super::decide(&mut noisy, &[0], &requested(), &GENEROUS, &rules).unwrap();
+        assert_eq!(decision.settings.samples_per_pixel, 3);
+        assert!(default_spp > 3);
+        assert_eq!(decision.settings.pixel_epsilon_multiplier, 2.5);
+        assert_eq!(decision.epsilon_trials.len(), 1);
+
+        // A stricter visibility bar drops an effect the default keeps.
+        let mut probe = Synthetic::new();
+        probe.ambient_occlusion = 0.15;
+        let rules = QualityRules {
+            effect_min_difference: 0.9,
+            ..QualityRules::default()
+        };
+        let decision = super::decide(&mut probe, &[0], &requested(), &GENEROUS, &rules).unwrap();
+        assert!(!effect(&decision, Effect::AmbientOcclusion).kept);
+
+        let empty = QualityRules {
+            spp_ladder: Vec::new(),
+            ..QualityRules::default()
+        };
+        assert!(
+            super::decide(&mut Synthetic::new(), &[0], &requested(), &GENEROUS, &empty).is_err()
+        );
     }
 
     #[test]

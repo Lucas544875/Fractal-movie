@@ -18,8 +18,31 @@ pub struct Budget {
     pub max_gpu_duty_cycle: f64,
     /// Film length assumed until the shot list fixes the real duration.
     pub planned_duration_seconds: f64,
+    /// Permitted length and cut count of the film.
+    #[serde(default)]
+    pub film: FilmLimits,
     #[serde(default)]
     pub spent: Spent,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FilmLimits {
+    pub min_duration_seconds: f64,
+    pub max_duration_seconds: f64,
+    pub min_cuts: usize,
+    pub max_cuts: usize,
+}
+
+impl Default for FilmLimits {
+    fn default() -> Self {
+        Self {
+            min_duration_seconds: 45.0,
+            max_duration_seconds: 90.0,
+            min_cuts: 4,
+            max_cuts: 8,
+        }
+    }
 }
 
 /// GPU busy time consumed so far.
@@ -38,6 +61,7 @@ impl Default for Budget {
             max_frame_seconds: 12.0,
             max_gpu_duty_cycle: 80.0,
             planned_duration_seconds: 60.0,
+            film: FilmLimits::default(),
             spent: Spent::default(),
         }
     }
@@ -65,6 +89,17 @@ impl Budget {
         if !self.max_gpu_duty_cycle.is_finite() || !(1.0..=100.0).contains(&self.max_gpu_duty_cycle)
         {
             bail!("budget max_gpu_duty_cycle must be in 1..=100");
+        }
+        let film = &self.film;
+        if !film.min_duration_seconds.is_finite()
+            || !film.max_duration_seconds.is_finite()
+            || film.min_duration_seconds <= 0.0
+            || film.max_duration_seconds < film.min_duration_seconds
+        {
+            bail!("budget film duration limits must be positive and ordered");
+        }
+        if film.min_cuts == 0 || film.max_cuts < film.min_cuts {
+            bail!("budget film cut limits must be positive and ordered");
         }
         for (name, value) in [
             ("design_gpu_seconds", self.spent.design_gpu_seconds),
@@ -134,6 +169,8 @@ mod tests {
             |budget| budget.max_gpu_duty_cycle = 0.0,
             |budget| budget.planned_duration_seconds = -1.0,
             |budget| budget.spent.design_gpu_seconds = -1.0,
+            |budget| budget.film.max_duration_seconds = 10.0,
+            |budget| budget.film.min_cuts = 0,
         ] {
             let mut budget = Budget::default();
             mutate(&mut budget);

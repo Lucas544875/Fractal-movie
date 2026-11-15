@@ -4,7 +4,8 @@
 
 use anyhow::{Context, Result, bail};
 use fractal_renderer_core::{
-    AnimationConfig, LoadedScene, RenderConfig, RenderRegion, Renderer, RendererOptions,
+    AnimationConfig, LoadedScene, RenderConfig, RenderRegion, RenderedImage, Renderer,
+    RendererOptions,
 };
 use serde::Serialize;
 
@@ -146,13 +147,21 @@ impl Probe for SceneProbe {
     }
 }
 
-/// Measures legibility of whole frames at thumbnail size. Returns the
-/// measurements and the GPU seconds they cost.
-pub fn measure_legibility(
+/// A whole frame rendered at thumbnail size with the scene's own look.
+pub struct Thumbnail {
+    pub frame_index: u32,
+    pub image: RenderedImage,
+    /// Per-frame configuration the thumbnail was rendered with.
+    pub config: RenderConfig,
+}
+
+/// Renders whole frames at thumbnail size. Returns the thumbnails and the
+/// GPU seconds they cost.
+pub fn render_thumbnails(
     scene: &LoadedScene,
     frames: &[u32],
     options: &GpuOptions,
-) -> Result<(Vec<FrameLegibility>, f64)> {
+) -> Result<(Vec<Thumbnail>, f64)> {
     let mut base = scene.config.clone();
     let (width, height) = (base.render.width, base.render.height);
     if width > LEGIBILITY_WIDTH {
@@ -163,9 +172,9 @@ pub fn measure_legibility(
             / u64::from(width))
         .max(1) as u32;
     }
-    // Composition and palette decide legibility; secondary effects only
-    // modulate them and are not worth their cost at this size.
-    let thumbnail = Settings {
+    // Composition and palette decide how a frame reads; secondary effects
+    // only modulate them and are not worth their cost at this size.
+    let settings = Settings {
         samples_per_pixel: THUMBNAIL_SPP,
         ambient_occlusion_steps: 0,
         soft_shadow_steps: 0,
@@ -176,24 +185,59 @@ pub fn measure_legibility(
     let renderer = options.renderer(base.clone())?;
 
     let mut gpu_seconds = 0.0;
-    let mut measured = Vec::with_capacity(frames.len());
+    let mut thumbnails = Vec::with_capacity(frames.len());
     for frame in frames {
         let (mut config, time_seconds) = frame_config(&base, scene.animation.as_ref(), *frame)?;
-        apply_settings(&mut config, &thumbnail);
+        apply_settings(&mut config, &settings);
         let image = renderer
             .render_frame_with_config(&config, *frame, time_seconds)
             .with_context(|| format!("could not render thumbnail of frame {frame}"))?;
         gpu_seconds += image.gpu_time().as_secs_f64();
-        measured.push(FrameLegibility {
-            frame: *frame,
-            legibility: legibility(&Frame::from_rgba8(
-                image.width(),
-                image.height(),
-                image.pixels(),
-            )?),
+        thumbnails.push(Thumbnail {
+            frame_index: *frame,
+            image,
+            config,
         });
     }
+    Ok((thumbnails, gpu_seconds))
+}
+
+impl Thumbnail {
+    pub fn frame(&self) -> Result<Frame> {
+        Frame::from_rgba8(self.image.width(), self.image.height(), self.image.pixels())
+    }
+}
+
+/// Measures legibility of whole frames at thumbnail size. Returns the
+/// measurements and the GPU seconds they cost.
+pub fn measure_legibility(
+    scene: &LoadedScene,
+    frames: &[u32],
+    options: &GpuOptions,
+) -> Result<(Vec<FrameLegibility>, f64)> {
+    let (thumbnails, gpu_seconds) = render_thumbnails(scene, frames, options)?;
+    let measured = thumbnails
+        .iter()
+        .map(|thumbnail| {
+            Ok(FrameLegibility {
+                frame: thumbnail.frame_index,
+                legibility: legibility(&thumbnail.frame()?),
+            })
+        })
+        .collect::<Result<_>>()?;
     Ok((measured, gpu_seconds))
+}
+
+/// First, middle, and last frame of a scene.
+#[must_use]
+pub fn key_frames(scene: &LoadedScene) -> Vec<u32> {
+    let last = scene
+        .animation
+        .as_ref()
+        .map_or(0, |animation| animation.frame_count - 1);
+    let mut frames = vec![0, last / 2, last];
+    frames.dedup();
+    frames
 }
 
 /// Half the extent, kept even so chroma-subsampled comparisons stay aligned.
@@ -202,7 +246,7 @@ fn probe_extent(extent: u32) -> u32 {
     (half - half % 2).clamp(1, extent)
 }
 
-fn frame_config(
+pub(crate) fn frame_config(
     base: &RenderConfig,
     animation: Option<&AnimationConfig>,
     frame_index: u32,
@@ -219,7 +263,7 @@ fn frame_config(
     }
 }
 
-fn apply_settings(config: &mut RenderConfig, settings: &Settings) {
+pub(crate) fn apply_settings(config: &mut RenderConfig, settings: &Settings) {
     config.quality.samples_per_pixel = settings.samples_per_pixel;
     config.quality.ambient_occlusion.max_steps = settings.ambient_occlusion_steps;
     config.quality.soft_shadow.max_steps = settings.soft_shadow_steps;

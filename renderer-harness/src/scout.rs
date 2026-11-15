@@ -14,44 +14,31 @@ use fractal_renderer_core::{LoadedScene, Renderer, load_scene};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    axes::{FormulaFamily, ScaleRegime, classify_family},
+    axes::{AxisId, FormulaFamily, ScaleRegime, classify_family},
     budget::Budget,
     gpu::GpuOptions,
-    mandate::Mandate,
+    ledger::Ledger,
+    mandate::{InfeasibleReport, Mandate, resolve_infeasible},
     metrics::{Frame, Legibility, legibility},
+    novelty,
     production::Production,
     rng::Rng,
-    shape::{self, Shape},
+    shape::{self, Shape, Survey},
     sheet::{self, Cell},
     stage::{Stage, State},
+    tuning::LegibilityLimits,
 };
 
 pub const THUMBNAIL_WIDTH: u32 = 320;
 pub const THUMBNAIL_HEIGHT: u32 = 180;
-pub const DEFAULT_SHAPES: usize = 60;
-pub const MIN_SELECTED: usize = 2;
-pub const MAX_SELECTED: usize = 5;
 
 const SHEET_COLUMNS: usize = 6;
 const SHEET_ROWS: usize = 4;
 /// Formulas tried per wanted shape before a round gives up.
 const ATTEMPTS_PER_SHAPE: usize = 8;
-/// Relative parameter change used by `--around`.
-const REFINE_AMOUNT: f64 = 0.12;
 
 /// Final frame the cost estimate extrapolates to.
 const FINAL_PIXELS: f64 = 1920.0 * 1080.0;
-/// Samples per pixel assumed for the estimate; a typical outcome of the
-/// quality decision.
-const ESTIMATE_SPP: f64 = 8.0;
-
-// Screening thresholds. Provisional until calibrated against finished films.
-/// Below this share of flat area a frame is wall-to-wall detail.
-const MIN_NEGATIVE_SPACE: f32 = 0.10;
-/// Above this share there is no subject to look at.
-const MAX_NEGATIVE_SPACE: f32 = 0.85;
-const MAX_HIGH_FREQUENCY: f32 = 0.35;
-const MIN_MEAN_LUMINANCE: f32 = 0.03;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -84,12 +71,22 @@ pub struct ViewRecord {
 pub struct LocationRecord {
     pub family: FormulaFamily,
     pub bounded: bool,
+    /// Radius containing the surface, or the working radius when unbounded.
+    pub radius: f64,
     pub round: u32,
     pub viewpoints: Vec<ViewRecord>,
 }
 
 impl LocationRecord {
-    fn usable_viewpoints(&self) -> impl Iterator<Item = &ViewRecord> {
+    #[must_use]
+    pub const fn survey(&self) -> Survey {
+        Survey {
+            bounded: self.bounded,
+            radius: self.radius,
+        }
+    }
+
+    pub(crate) fn usable_viewpoints(&self) -> impl Iterator<Item = &ViewRecord> {
         self.viewpoints
             .iter()
             .filter(|view| view.rejection.is_none())
@@ -136,13 +133,18 @@ fn index_path(production: &Production) -> PathBuf {
 
 /// Scene file of one viewpoint. Formulas live with the harness-owned compiled
 /// files, away from the sheets an agent reads.
-fn viewpoint_scene_path(production: &Production, location: &str, viewpoint: &str) -> PathBuf {
+pub(crate) fn viewpoint_scene_path(
+    production: &Production,
+    location: &str,
+    viewpoint: &str,
+) -> PathBuf {
     production.path(&format!("compiled/locations/{location}/{viewpoint}.yaml"))
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct RunOptions {
-    pub shapes: usize,
+    /// Shapes to render; the tuning's default when absent.
+    pub shapes: Option<usize>,
     /// Sample variations of this location instead of new formulas.
     pub around: Option<String>,
     pub gpu: GpuOptions,
@@ -172,18 +174,24 @@ pub struct RunReport {
     pub candidates: Vec<Candidate>,
     pub gpu_seconds: f64,
     pub design_remaining_gpu_seconds: f64,
+    /// Set when the mandated formula family yielded nothing usable and the
+    /// mandate was changed; scout again under the new mandate.
+    pub infeasible: Option<InfeasibleReport>,
 }
 
 /// Runs one scouting round and returns the candidates worth looking at.
 pub fn run(
     production: &Production,
-    state: &State,
-    mandate: &Mandate,
+    state: &mut State,
+    mandate: &mut Mandate,
+    ledger: &Ledger,
     budget: &mut Budget,
     options: &RunOptions,
 ) -> Result<RunReport> {
     require_scout_stage(state)?;
-    if options.shapes == 0 {
+    let tuning = production.load_tuning()?;
+    let shapes_wanted = options.shapes.unwrap_or(tuning.scouting.default_shapes);
+    if shapes_wanted == 0 {
         bail!("a scouting round needs at least one shape");
     }
     if budget.design_remaining_seconds() <= 0.0 {
@@ -211,18 +219,19 @@ pub fn run(
             &index,
             state,
             location,
-            options.shapes,
+            shapes_wanted,
+            tuning.scouting.refine_amount,
             &mut rng,
         )?,
-        None => discover_shapes(mandate, options.shapes, &mut rng)?,
+        None => discover_shapes(mandate, shapes_wanted, &mut rng)?,
     };
 
     let round_directory = format!("scout/round-{round:02}");
     fs::create_dir_all(production.path(&format!("{round_directory}/thumbs")))
         .context("could not create the round directory")?;
-    let cost_ceiling = budget.max_frame_seconds / 2.0;
-    let scale_to_final =
-        FINAL_PIXELS / f64::from(THUMBNAIL_WIDTH * THUMBNAIL_HEIGHT) * ESTIMATE_SPP;
+    let cost_ceiling = budget.max_frame_seconds * tuning.scouting.cost_ceiling_share;
+    let scale_to_final = FINAL_PIXELS / f64::from(THUMBNAIL_WIDTH * THUMBNAIL_HEIGHT)
+        * tuning.scouting.estimate_samples_per_pixel;
 
     let mut gpu_seconds = 0.0;
     let mut viewpoints_rendered = 0;
@@ -233,7 +242,7 @@ pub fn run(
     // One GPU device serves the whole round; only the shader is swapped.
     let mut renderer: Option<Renderer> = None;
     for shape in &shapes {
-        let viewpoints = shape::viewpoints(&mut rng, shape);
+        let viewpoints = shape::viewpoints(&mut rng, shape, &tuning.scouting);
         if viewpoints.is_empty() {
             continue;
         }
@@ -243,7 +252,14 @@ pub fn run(
         let configs: Vec<_> = viewpoints
             .iter()
             .map(|viewpoint| {
-                shape::thumbnail_config(shape, viewpoint, THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT, seed)
+                shape::thumbnail_config(
+                    shape,
+                    viewpoint,
+                    THUMBNAIL_WIDTH,
+                    THUMBNAIL_HEIGHT,
+                    seed,
+                    &tuning.scouting,
+                )
             })
             .collect();
         let mut records = Vec::with_capacity(viewpoints.len());
@@ -277,7 +293,12 @@ pub fn run(
                 image.pixels(),
             )?);
             let estimated_frame_seconds = image.gpu_time().as_secs_f64() * scale_to_final;
-            let rejection = screen(&measured, estimated_frame_seconds, cost_ceiling);
+            let rejection = screen(
+                &measured,
+                estimated_frame_seconds,
+                cost_ceiling,
+                &tuning.legibility,
+            );
             if let Some(reason) = rejection {
                 *rejected.entry(reason).or_default() += 1;
             }
@@ -323,11 +344,33 @@ pub fn run(
             LocationRecord {
                 family: shape.family,
                 bounded: shape.survey.bounded,
+                radius: shape.survey.radius,
                 round,
                 viewpoints: records,
             },
         );
     }
+
+    // A whole round without a single candidate from a mandated family means
+    // the assignment cannot be met; exploring further would only repeat it.
+    let infeasible = if shown.is_empty() && options.around.is_none() {
+        let report = resolve_infeasible(
+            state,
+            mandate,
+            ledger,
+            AxisId::FormulaFamily,
+            format!(
+                "{formulas_tried} formulas of the mandated family produced no usable candidate"
+            ),
+            Vec::new(),
+        );
+        if report.is_some() {
+            production.save_mandate(mandate)?;
+        }
+        report
+    } else {
+        None
+    };
 
     let mut sheets = Vec::new();
     for (page, chunk) in shown.chunks_mut(SHEET_COLUMNS * SHEET_ROWS).enumerate() {
@@ -379,19 +422,25 @@ pub fn run(
         candidates: shown.into_iter().map(|(candidate, _)| candidate).collect(),
         gpu_seconds,
         design_remaining_gpu_seconds: budget.design_remaining_seconds(),
+        infeasible,
     })
 }
 
 /// Decides whether a thumbnail is worth an agent's attention.
-fn screen(measured: &Legibility, estimated_seconds: f64, cost_ceiling: f64) -> Option<Rejection> {
+fn screen(
+    measured: &Legibility,
+    estimated_seconds: f64,
+    cost_ceiling: f64,
+    limits: &LegibilityLimits,
+) -> Option<Rejection> {
     if estimated_seconds > cost_ceiling {
         Some(Rejection::Cost)
-    } else if measured.mean_luminance < MIN_MEAN_LUMINANCE {
+    } else if measured.mean_luminance < limits.min_mean_luminance {
         Some(Rejection::Dark)
-    } else if measured.negative_space_ratio > MAX_NEGATIVE_SPACE {
+    } else if measured.negative_space_ratio > limits.max_negative_space {
         Some(Rejection::Empty)
-    } else if measured.negative_space_ratio < MIN_NEGATIVE_SPACE
-        || measured.high_frequency_ratio > MAX_HIGH_FREQUENCY
+    } else if measured.negative_space_ratio < limits.min_negative_space
+        || measured.high_frequency_ratio > limits.max_high_frequency
     {
         Some(Rejection::Cluttered)
     } else {
@@ -414,9 +463,6 @@ fn discover_shapes(mandate: &Mandate, wanted: usize, rng: &mut Rng) -> Result<(V
             shapes.push(shape);
         }
     }
-    if shapes.is_empty() {
-        bail!("no usable shape was found in {tried} formulas");
-    }
     Ok((shapes, tried))
 }
 
@@ -426,6 +472,7 @@ fn refine_shapes(
     state: &State,
     location: &str,
     wanted: usize,
+    amount: f64,
     rng: &mut Rng,
 ) -> Result<(Vec<Shape>, usize)> {
     let record = index
@@ -449,7 +496,7 @@ fn refine_shapes(
     let mut tried = 0;
     while shapes.len() < wanted && tried < wanted * ATTEMPTS_PER_SHAPE {
         tried += 1;
-        let fractal = shape::mutate(rng, &scene.config.fractal, REFINE_AMOUNT);
+        let fractal = shape::mutate(rng, &scene.config.fractal, amount);
         if let Some(survey) = shape::survey(rng, &fractal) {
             shapes.push(Shape {
                 family: classify_family(&fractal),
@@ -464,7 +511,7 @@ fn refine_shapes(
     Ok((shapes, tried))
 }
 
-fn save_viewpoint_scene(
+pub(crate) fn save_viewpoint_scene(
     production: &Production,
     location: &str,
     viewpoint: &str,
@@ -509,17 +556,20 @@ pub fn select(
     production: &Production,
     state: &mut State,
     budget: &Budget,
+    ledger: &Ledger,
     locations: &[String],
 ) -> Result<Vec<SelectedLocation>> {
     require_scout_stage(state)?;
-    if !(MIN_SELECTED..=MAX_SELECTED).contains(&locations.len()) {
+    let tuning = production.load_tuning()?;
+    let (fewest, most) = (tuning.scouting.min_selected, tuning.scouting.max_selected);
+    if !(fewest..=most).contains(&locations.len()) {
         bail!(
-            "select {MIN_SELECTED} to {MAX_SELECTED} locations, not {}",
+            "select {fewest} to {most} locations, not {}",
             locations.len()
         );
     }
     let mut index = Index::load(production)?;
-    let cost_ceiling = budget.max_frame_seconds / 2.0;
+    let cost_ceiling = budget.max_frame_seconds * tuning.scouting.cost_ceiling_share;
 
     let mut selected = Vec::with_capacity(locations.len());
     for (position, location) in locations.iter().enumerate() {
@@ -569,7 +619,59 @@ pub fn select(
             "slowest usable viewpoint is estimated at {slowest:.2} s per frame; ceiling {cost_ceiling:.2} s"
         ),
     )?;
+
+    let (novel, detail) = judge_novelty(
+        production,
+        &index,
+        ledger,
+        &selected,
+        tuning.diversity.min_structure_distance,
+    )?;
+    state.record_gate("novelty", novel, detail)?;
+    state.advance_if_ready()?;
     Ok(selected)
+}
+
+/// Compares every usable thumbnail of the selection with the keyframes of
+/// finished films.
+fn judge_novelty(
+    production: &Production,
+    index: &Index,
+    ledger: &Ledger,
+    selected: &[SelectedLocation],
+    min_distance: f32,
+) -> Result<(bool, String)> {
+    if ledger.descriptors().next().is_none() {
+        return Ok((
+            true,
+            "the ledger holds no keyframes to compare with".to_owned(),
+        ));
+    }
+    // Closest pair over the whole selection: (distance, view, film).
+    let mut closest: Option<(f32, String, &str)> = None;
+    for location in selected {
+        let round = index.locations[&location.location].round;
+        for view in &location.viewpoints {
+            let name = format!("{}-{}", location.location, view.viewpoint);
+            let descriptor = novelty::describe(&sheet::load_frame(
+                &production.path(&format!("scout/round-{round:02}/thumbs/{name}.png")),
+            )?);
+            for (film, reference) in ledger.descriptors() {
+                let distance = novelty::structure_distance(&descriptor, reference);
+                if closest.as_ref().is_none_or(|(best, ..)| distance < *best) {
+                    closest = Some((distance, name.clone(), film));
+                }
+            }
+        }
+    }
+    let (distance, view, film) = closest.context("the selection has no usable viewpoint")?;
+    Ok((
+        distance >= min_distance,
+        format!(
+            "closest match: {view} is at distance {distance:.3} from a keyframe of {film}; minimum {:.3}",
+            min_distance
+        ),
+    ))
 }
 
 fn require_scout_stage(state: &State) -> Result<()> {
@@ -583,9 +685,9 @@ fn require_scout_stage(state: &State) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use crate::ledger::Ledger;
+    use crate::{axes::Motion, ledger::tests::entry, metrics::tests::frame};
 
     fn measured(negative_space: f32, high_frequency: f32, luminance: f32) -> Legibility {
         Legibility {
@@ -620,10 +722,11 @@ mod tests {
         (production, root)
     }
 
-    fn seed_index(production: &Production) {
+    pub(crate) fn seed_index(production: &Production) {
         let location = |views: Vec<ViewRecord>| LocationRecord {
             family: FormulaFamily::JuliaBox,
             bounded: true,
+            radius: 2.0,
             round: 1,
             viewpoints: views,
         };
@@ -656,34 +759,82 @@ mod tests {
         index.save(production).unwrap();
     }
 
-    fn ids(values: &[&str]) -> Vec<String> {
+    pub(crate) fn ids(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
     }
 
     #[test]
     fn screening_names_the_reason_for_rejection() {
         let ceiling = 6.0;
-        assert_eq!(screen(&measured(0.4, 0.1, 0.3), 1.0, ceiling), None);
         assert_eq!(
-            screen(&measured(0.4, 0.1, 0.3), 6.5, ceiling),
+            screen(
+                &measured(0.4, 0.1, 0.3),
+                1.0,
+                ceiling,
+                &LegibilityLimits::default()
+            ),
+            None
+        );
+        assert_eq!(
+            screen(
+                &measured(0.4, 0.1, 0.3),
+                6.5,
+                ceiling,
+                &LegibilityLimits::default()
+            ),
             Some(Rejection::Cost)
         );
         assert_eq!(
-            screen(&measured(0.4, 0.1, 0.01), 1.0, ceiling),
+            screen(
+                &measured(0.4, 0.1, 0.01),
+                1.0,
+                ceiling,
+                &LegibilityLimits::default()
+            ),
             Some(Rejection::Dark)
         );
         assert_eq!(
-            screen(&measured(0.95, 0.1, 0.3), 1.0, ceiling),
+            screen(
+                &measured(0.95, 0.1, 0.3),
+                1.0,
+                ceiling,
+                &LegibilityLimits::default()
+            ),
             Some(Rejection::Empty)
         );
         assert_eq!(
-            screen(&measured(0.02, 0.1, 0.3), 1.0, ceiling),
+            screen(
+                &measured(0.02, 0.1, 0.3),
+                1.0,
+                ceiling,
+                &LegibilityLimits::default()
+            ),
             Some(Rejection::Cluttered)
         );
         assert_eq!(
-            screen(&measured(0.4, 0.5, 0.3), 1.0, ceiling),
+            screen(
+                &measured(0.4, 0.5, 0.3),
+                1.0,
+                ceiling,
+                &LegibilityLimits::default()
+            ),
             Some(Rejection::Cluttered)
         );
+    }
+
+    #[test]
+    fn screening_follows_the_limits_given() {
+        let busy = measured(0.05, 0.4, 0.3);
+        assert_eq!(
+            screen(&busy, 1.0, 6.0, &LegibilityLimits::default()),
+            Some(Rejection::Cluttered)
+        );
+        let tolerant = LegibilityLimits {
+            min_negative_space: 0.0,
+            max_high_frequency: 0.5,
+            ..LegibilityLimits::default()
+        };
+        assert_eq!(screen(&busy, 1.0, 6.0, &tolerant), None);
     }
 
     #[test]
@@ -692,6 +843,7 @@ mod tests {
             seed: 1,
             banned_families: vec![FormulaFamily::Mandelbox, FormulaFamily::AmazingSurf],
             assigned: Vec::new(),
+            retired: Vec::new(),
         };
         let (shapes, tried) = discover_shapes(&mandate, 20, &mut Rng::new(1)).unwrap();
         assert_eq!(shapes.len(), 20);
@@ -713,20 +865,104 @@ mod tests {
             &production,
             &mut state,
             &Budget::default(),
+            &Ledger::default(),
             &ids(&["loc-0001", "loc-0003"]),
         )
         .unwrap();
         // The cluttered viewpoint of loc-0001 is not offered for use.
         assert_eq!(selected[0].viewpoints.len(), 1);
         assert_eq!(selected[0].viewpoints[0].viewpoint, "vp-2");
-        assert!(state.gates["locations-selected"].passed);
-        assert!(state.gates["cost-ceiling"].passed);
-        // Novelty is judged against the ledger, not by selection alone.
-        assert_eq!(state.unmet_gates(), vec!["novelty"]);
+        // With an empty ledger every gate passes and the stage advances.
+        assert_eq!(state.stage, Stage::Brief);
+        assert!(state.gates.is_empty());
         assert_eq!(
             Index::load(&production).unwrap().selected,
             ids(&["loc-0001", "loc-0003"])
         );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Writes the thumbnail a seeded viewpoint refers to.
+    fn write_thumbnail(production: &Production, name: &str, image: &Frame) {
+        let directory = production.path("scout/round-01/thumbs");
+        fs::create_dir_all(&directory).unwrap();
+        let rgba: Vec<u8> = image
+            .pixels()
+            .iter()
+            .flat_map(|pixel| {
+                let byte = |value: f32| (value * 255.0).round() as u8;
+                [byte(pixel[0]), byte(pixel[1]), byte(pixel[2]), 255]
+            })
+            .collect();
+        sheet::save_png(
+            &directory.join(format!("{name}.png")),
+            image.width() as u32,
+            image.height() as u32,
+            &rgba,
+        )
+        .unwrap();
+    }
+
+    fn stripes(vertical: bool) -> Frame {
+        frame(320, 180, |x, y| {
+            let coordinate = if vertical { x } else { y };
+            [if (coordinate / 16) % 2 == 0 { 0.2 } else { 0.8 }; 3]
+        })
+    }
+
+    #[test]
+    fn a_view_resembling_a_finished_film_fails_novelty() {
+        let (production, root) = production("novelty");
+        seed_index(&production);
+        write_thumbnail(&production, "loc-0000-vp-1", &stripes(true));
+        write_thumbnail(&production, "loc-0003-vp-1", &stripes(false));
+
+        let mut finished = entry("earlier", FormulaFamily::Mandelbox, Motion::Dive);
+        finished.descriptors = vec![novelty::describe(&stripes(false))];
+        let ledger = Ledger::from_entries(vec![finished]).unwrap();
+
+        let mut state = production.load_state().unwrap();
+        select(
+            &production,
+            &mut state,
+            &Budget::default(),
+            &ledger,
+            &ids(&["loc-0000", "loc-0003"]),
+        )
+        .unwrap();
+        assert_eq!(state.stage, Stage::Scout);
+        assert_eq!(state.unmet_gates(), vec!["novelty"]);
+        let detail = &state.gates["novelty"].detail;
+        assert!(
+            detail.contains("loc-0003-vp-1") && detail.contains("earlier"),
+            "{detail}"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn views_unlike_finished_films_pass_novelty() {
+        let (production, root) = production("novel");
+        seed_index(&production);
+        write_thumbnail(&production, "loc-0000-vp-1", &stripes(true));
+        write_thumbnail(&production, "loc-0003-vp-1", &stripes(true));
+
+        let mut finished = entry("earlier", FormulaFamily::Mandelbox, Motion::Dive);
+        finished.descriptors = vec![novelty::describe(&stripes(false))];
+        let ledger = Ledger::from_entries(vec![finished]).unwrap();
+
+        let mut state = production.load_state().unwrap();
+        select(
+            &production,
+            &mut state,
+            &Budget::default(),
+            &ledger,
+            &ids(&["loc-0000", "loc-0003"]),
+        )
+        .unwrap();
+        assert_eq!(state.stage, Stage::Brief);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -739,9 +975,15 @@ mod tests {
         state.ban_locations(["loc-0003".to_owned()]);
         let budget = Budget::default();
         let mut attempt = |values: &[&str]| {
-            select(&production, &mut state, &budget, &ids(values))
-                .unwrap_err()
-                .to_string()
+            select(
+                &production,
+                &mut state,
+                &budget,
+                &Ledger::default(),
+                &ids(values),
+            )
+            .unwrap_err()
+            .to_string()
         };
 
         assert!(attempt(&["loc-0000"]).contains("2 to 5"));
@@ -767,6 +1009,7 @@ mod tests {
             &production,
             &mut state,
             &budget,
+            &Ledger::default(),
             &ids(&["loc-0000", "loc-0001"]),
         )
         .unwrap();
@@ -786,6 +1029,7 @@ mod tests {
             &production,
             &mut state,
             &Budget::default(),
+            &Ledger::default(),
             &ids(&["loc-0000", "loc-0001"]),
         )
         .unwrap_err();

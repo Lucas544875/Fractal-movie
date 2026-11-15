@@ -86,7 +86,9 @@ impl Frame {
         &self.pixels
     }
 
-    fn luma(&self) -> Vec<f32> {
+    /// Rec. 709 luminance of every pixel, in row order.
+    #[must_use]
+    pub fn luma(&self) -> Vec<f32> {
         self.pixels
             .iter()
             .map(|pixel| LUMA[0] * pixel[0] + LUMA[1] * pixel[1] + LUMA[2] * pixel[2])

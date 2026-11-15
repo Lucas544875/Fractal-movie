@@ -5,18 +5,27 @@
 //! constraints, and the render budget. Agents only author the brief, the shot
 //! list, and the look.
 
+pub mod animatic;
 pub mod axes;
+pub mod brief;
 pub mod budget;
+pub mod classify;
+pub mod cut;
 pub mod describe;
+pub mod film;
 pub mod gpu;
+pub mod import;
 pub mod ledger;
 pub mod mandate;
 pub mod metrics;
 pub mod next;
+pub mod novelty;
 pub mod production;
 pub mod quality;
 pub mod rng;
 pub mod scout;
 pub mod shape;
 pub mod sheet;
+pub mod shotlist;
 pub mod stage;
+pub mod tuning;

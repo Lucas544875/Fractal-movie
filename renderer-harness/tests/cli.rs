@@ -229,3 +229,168 @@ fn scouting_rejects_bad_requests_before_touching_the_gpu() {
     );
     assert_eq!(next["budget"]["design_remaining_gpu_seconds"], 1800.0);
 }
+
+#[test]
+fn brief_check_is_refused_before_locations_are_selected() {
+    let sandbox = Sandbox::new("brief");
+    sandbox.run(&["init", "film"]);
+    let (ok, value) = sandbox.run(&["brief", "check", "film"]);
+    assert!(!ok);
+    assert!(value["error"].as_str().unwrap().contains("stage scout"));
+}
+
+#[test]
+fn ledger_list_reports_films_and_their_axes() {
+    let sandbox = Sandbox::new("ledger");
+    let (ok, empty) = sandbox.run(&["ledger", "list"]);
+    assert!(ok);
+    assert_eq!(empty["films"], serde_json::json!([]));
+
+    write_ledger(&sandbox.ledger());
+    let (_, value) = sandbox.run(&["ledger", "list"]);
+    assert_eq!(value["films"].as_array().unwrap().len(), 2);
+    assert_eq!(value["films"][0]["id"], "ivory-vault");
+    assert_eq!(value["films"][0]["axes"]["formula_family"], "amazing-surf");
+    assert_eq!(value["films"][0]["gpu_minutes"], 99.0);
+
+    // A film without an animation cannot be imported, and nothing is written.
+    let before = fs::read_to_string(sandbox.ledger()).unwrap();
+    let scene = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../scenes/examples/mandelbulb.yaml"
+    );
+    let (ok, value) = sandbox.run(&[
+        "ledger",
+        "import",
+        scene,
+        "--id",
+        "still",
+        "--title",
+        "Still",
+        "--date",
+        "2026-11-15",
+    ]);
+    assert!(!ok);
+    assert!(value["error"].as_str().unwrap().contains("no animation"));
+    assert_eq!(fs::read_to_string(sandbox.ledger()).unwrap(), before);
+}
+
+#[test]
+fn later_stage_commands_are_refused_while_scouting() {
+    let sandbox = Sandbox::new("stages");
+    sandbox.run(&[
+        "init",
+        "film",
+        "--film-seconds",
+        "10",
+        "30",
+        "--film-cuts",
+        "2",
+        "4",
+    ]);
+
+    for arguments in [
+        vec!["shotlist", "check", "film"],
+        vec!["animatic", "film"],
+        vec![
+            "review",
+            "submit",
+            "film",
+            "--verdict",
+            "pass",
+            "--notes",
+            "looks fine",
+        ],
+    ] {
+        let (ok, value) = sandbox.run(&arguments);
+        assert!(!ok, "{arguments:?} was accepted");
+        let error = value["error"].as_str().unwrap();
+        assert!(error.contains("scout"), "{arguments:?}: {error}");
+    }
+
+    // Nothing was recorded and the custom film limits were stored.
+    assert_eq!(
+        fs::read_dir(sandbox.root().join("film/reviews"))
+            .unwrap()
+            .count(),
+        0
+    );
+    let budget: Value =
+        serde_json::from_str(&fs::read_to_string(sandbox.root().join("film/budget.json")).unwrap())
+            .unwrap();
+    assert_eq!(budget["film"]["max_duration_seconds"], 30.0);
+    assert_eq!(budget["film"]["min_cuts"], 2);
+
+    let (ok, value) = sandbox.run(&["init", "bad", "--film-seconds", "30", "10"]);
+    assert!(!ok);
+    assert!(value["error"].as_str().unwrap().contains("duration limits"));
+}
+
+#[test]
+fn a_production_keeps_the_tuning_it_was_created_with() {
+    let sandbox = Sandbox::new("tuning");
+    let file = sandbox.directory.join("tuning.yaml");
+    let file_argument = file.to_str().unwrap();
+
+    // Exporting writes the defaults and never overwrites.
+    let (ok, value) = sandbox.run(&["tuning", "write", file_argument]);
+    assert!(ok, "{value}");
+    let exported = fs::read_to_string(&file).unwrap();
+    assert!(
+        exported.contains("overview_distance_radii: 2.6"),
+        "{exported}"
+    );
+    let (ok, value) = sandbox.run(&["tuning", "write", file_argument]);
+    assert!(!ok);
+    assert!(value["error"].as_str().unwrap().contains("already exists"));
+
+    fs::write(
+        &file,
+        "scouting:\n  min_selected: 3\n  max_selected: 4\nlimits:\n  kills: 1\n",
+    )
+    .unwrap();
+    let (ok, shown) = sandbox.run(&["--tuning", file_argument, "tuning", "show"]);
+    assert!(ok);
+    assert_eq!(shown["tuning"]["scouting"]["min_selected"], 3);
+    assert_eq!(shown["tuning"]["scouting"]["default_shapes"], 60);
+
+    let (ok, value) = sandbox.run(&["--tuning", file_argument, "init", "film"]);
+    assert!(ok, "{value}");
+    assert_eq!(value["limits"]["kills_allowed"], 1);
+
+    // Later commands use the snapshot, whatever the file says by then.
+    fs::write(&file, "scouting:\n  min_selected: 2\n").unwrap();
+    let (ok, value) = sandbox.run(&[
+        "--tuning",
+        file_argument,
+        "scout",
+        "select",
+        "film",
+        "loc-0001",
+        "loc-0002",
+    ]);
+    assert!(!ok);
+    assert!(
+        value["error"]
+            .as_str()
+            .unwrap()
+            .contains("select 3 to 4 locations"),
+        "{value}"
+    );
+    let (_, next) = sandbox.run(&["next", "film"]);
+    assert_eq!(next["limits"]["kills_allowed"], 1);
+
+    // Misspelt or unusable tuning stops `init` before anything is created.
+    fs::write(&file, "scouting:\n  min_select: 3\n").unwrap();
+    let (ok, value) = sandbox.run(&["--tuning", file_argument, "init", "typo"]);
+    assert!(!ok);
+    assert!(
+        value["error"].as_str().unwrap().contains("tuning"),
+        "{value}"
+    );
+    assert!(!sandbox.root().join("typo").exists());
+    fs::write(&file, "quality:\n  spp_ladder: [8, 4]\n").unwrap();
+    let (ok, _) = sandbox.run(&["--tuning", file_argument, "init", "unusable"]);
+    assert!(!ok);
+    assert!(!sandbox.root().join("unusable").exists());
+}
