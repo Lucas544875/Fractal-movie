@@ -159,7 +159,11 @@ pub struct Candidate {
     pub family: FormulaFamily,
     pub scale_regime: ScaleRegime,
     pub sheet: String,
+    // Measurements stay in scout/index.json. Repeating them for every
+    // candidate here would only crowd what an agent has to read.
+    #[serde(skip)]
     pub legibility: Legibility,
+    #[serde(skip)]
     pub estimated_frame_seconds: f64,
 }
 

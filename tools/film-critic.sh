@@ -27,7 +27,9 @@ shotlist)
 2. 縮小されたこの大きさでも、主題と背景が区別できるか。
 3. 過去作品のキーフレームと比べて「角度違い・寄り違い」に見えないか。
 4. カット同士が、スケール、動き、構図のいずれかで明確に違うか。
-5. 始点・中間・終点の変化から見て、動きが速すぎたり、止まって見えたりしないか。'
+5. 始点・中間・終点の変化から見て、動きが速すぎたり、止まって見えたりしないか。
+
+この工程の画像は、形と動きだけを見るために中立の灰色で描かれている。色と光は次の工程で判定するので、色がないこと、逆光や配色が確認できないことは不合格の理由にしない。'
     ;;
 look)
     materials=("$production/look/sheet.png" "$production/look/report.json")
@@ -118,6 +120,7 @@ response=$(claude -p "$prompt" \
     --tools "Read" \
     --permission-mode dontAsk \
     --max-turns 40 \
+    ${FILM_CRITIC_MODEL:+--model "$FILM_CRITIC_MODEL"} \
     --output-format json)
 
 # The critic answers with one JSON object; anything else is not a verdict.

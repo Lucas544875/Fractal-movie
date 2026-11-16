@@ -731,9 +731,20 @@ fn run(cli: Cli) -> Result<Value> {
                 "outcome": outcome,
             });
             let directory = production.path("reviews");
+            // Verdicts are numbered after the highest number present, so a
+            // record is never overwritten whatever else the directory holds.
             let number = std::fs::read_dir(&directory)
                 .with_context(|| format!("could not read {}", directory.display()))?
-                .count()
+                .filter_map(|entry| entry.ok())
+                .filter_map(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_str()?;
+                    name.ends_with(".json")
+                        .then(|| name.split('-').next()?.parse::<u32>().ok())
+                        .flatten()
+                })
+                .max()
+                .unwrap_or(0)
                 + 1;
             std::fs::write(
                 directory.join(format!("{number:03}-{}.json", stage.as_str())),

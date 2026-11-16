@@ -6,6 +6,9 @@
 # usage: tools/make-film.sh <production-id> [init options...]
 #   e.g. tools/make-film.sh amber-shelf --seed 7
 #
+# FILM_DIRECTOR_MODEL and FILM_CRITIC_MODEL choose the models of the two
+# roles (for example "sonnet"); unset, each uses the session default.
+#
 # Run from the repository root. Set WGPU_BACKEND (for example to "gl" under
 # WSL) before calling if the default backend does not find the GPU.
 set -euo pipefail
@@ -75,11 +78,15 @@ PY
 export BASH_DEFAULT_TIMEOUT_MS=600000
 export BASH_MAX_TIMEOUT_MS=600000
 
+# A production may take several sessions; each keeps its own record.
+session=$(($(find "$root/$id" -maxdepth 1 -name 'director-run-*.json' | wc -l) + 1))
+
 claude -p "/fractal-film $id" \
     --settings "$settings" \
     --tools "Bash,Read,Write,Edit" \
     --permission-mode dontAsk \
     --max-turns 600 \
-    --output-format json >"$root/$id/director-run.json"
+    ${FILM_DIRECTOR_MODEL:+--model "$FILM_DIRECTOR_MODEL"} \
+    --output-format json >"$root/$id/director-run-$session.json"
 
 "$harness" next "$id"
