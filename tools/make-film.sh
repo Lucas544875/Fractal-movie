@@ -13,7 +13,9 @@
 # WSL) before calling if the default backend does not find the GPU.
 set -euo pipefail
 source tools/film-agent.sh
-film_select_backend
+film_parse_options "$@"
+set -- "${FILM_REMAINING_ARGS[@]}"
+film_configure
 
 if [[ $# -lt 1 ]]; then
     echo "usage: tools/make-film.sh <production-id> [init options...]" >&2
@@ -107,15 +109,19 @@ print("Use Codex image viewing for Read of images and apply_patch for Write/Edit
       "Do not run init, ledger, measure, tuning write, vocabulary, produce, encode, or review submit.")
 PYPROMPT
 )
-    film_codex director "$prompt" "${FILM_DIRECTOR_MODEL:-${FILM_CODEX_MODEL:-}}" \
+    film_codex director "$prompt" "${FILM_RESOLVED_DIRECTOR_MODEL}" \
         >"$root/$id/director-run-$session.json"
 else
+model_args=()
+if [[ -n $FILM_RESOLVED_DIRECTOR_MODEL ]]; then
+    model_args=(--model "$FILM_RESOLVED_DIRECTOR_MODEL")
+fi
 claude -p "/fractal-film $id" \
     --settings "$settings" \
     --tools "Bash,Read,Write,Edit" \
     --permission-mode dontAsk \
     --max-turns 600 \
-    ${FILM_DIRECTOR_MODEL:+--model "$FILM_DIRECTOR_MODEL"} \
+    "${model_args[@]}" \
     --output-format json >"$root/$id/director-run-$session.json"
 fi
 

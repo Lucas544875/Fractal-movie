@@ -7,7 +7,9 @@
 # simply confirm what the director intended.
 set -euo pipefail
 source tools/film-agent.sh
-film_select_backend
+film_parse_options "$@"
+set -- "${FILM_REMAINING_ARGS[@]}"
+film_configure
 
 if [[ $# -ne 1 ]]; then
     echo "usage: tools/film-critic.sh <production-id>" >&2
@@ -134,14 +136,18 @@ if [[ $FILM_AGENT_BACKEND == codex ]]; then
     prompt+=$'\n\nReport:\n'
     prompt+=$(cat "${materials[1]}")
     prompt+=$'\nUse the attached images and report only. Do not read other files or run commands. Return only the requested JSON verdict.'
-    response=$(film_codex critic "$prompt" "${FILM_CRITIC_MODEL:-${FILM_CODEX_MODEL:-}}" "${images[@]}")
+    response=$(film_codex critic "$prompt" "${FILM_RESOLVED_CRITIC_MODEL}" "${images[@]}")
 else
+model_args=()
+if [[ -n $FILM_RESOLVED_CRITIC_MODEL ]]; then
+    model_args=(--model "$FILM_RESOLVED_CRITIC_MODEL")
+fi
 response=$(claude -p "$prompt" \
     --settings "$settings" \
     --tools "Read" \
     --permission-mode dontAsk \
     --max-turns 40 \
-    ${FILM_CRITIC_MODEL:+--model "$FILM_CRITIC_MODEL"} \
+    "${model_args[@]}" \
     --output-format json)
 fi
 

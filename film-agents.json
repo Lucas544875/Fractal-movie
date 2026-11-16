@@ -1,0 +1,12 @@
+{
+  "codex": {
+    "model": "",
+    "director_model": "",
+    "critic_model": ""
+  },
+  "claude": {
+    "model": "",
+    "director_model": "",
+    "critic_model": ""
+  }
+}

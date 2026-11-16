@@ -637,14 +637,36 @@ WGPU_BACKEND=gl cargo run --release -p fractal-renderer-cli -- render \
 選択は子プロセスへ引き継がれ、`tools/film-critic.sh` も同じバックエンドを使います。
 `FILM_AGENT_BACKEND=codex|claude` で明示的に変更できます。
 
-Codex のモデルは CLI の既定設定を使います。親チャットのモデル名は自動継承しません。
-`FILM_CODEX_MODEL` で両担当の共通モデルを指定でき、`FILM_DIRECTOR_MODEL` と
-`FILM_CRITIC_MODEL` は各担当の指定として優先されます。Claude 用モデル名を
-設定している場合は、バックエンドの変更時に更新してください。
+モデルは [film-agents.json](film-agents.json) にバックエンド別に保存できます。
+`model` が共通設定、`director_model` と `critic_model` が担当別の設定です。
+空文字列は未指定として扱い、すべて未指定なら各 CLI の既定モデルを使います。
+親チャットのモデル名は自動継承しません。モデル名は各 CLI が対応する名前を指定してください。
+
+```json
+{
+  "codex": {"director_model": "gpt-6-astra", "critic_model": "gpt-6-astra"},
+  "claude": {"director_model": "sonnet", "critic_model": "opus"}
+}
+```
+
+起動オプションは制作IDの前後どちらにも指定できます。
 
 ```bash
-FILM_AGENT_BACKEND=codex WGPU_BACKEND=gl tools/make-film.sh my-film --seed 7
+WGPU_BACKEND=gl tools/make-film.sh my-film --agent-backend claude --director-model sonnet --critic-model opus --seed 7
+WGPU_BACKEND=gl tools/make-film.sh my-film --agent-backend codex --model gpt-6-astra
 ```
+
+`--agent-config path.json` または `FILM_AGENT_CONFIG` で別の設定ファイルを選べます。
+既定は作業ディレクトリの `film-agents.json` です。
+同じオプションは `tools/film-critic.sh <production-id>` にも指定できます。
+
+優先順位は、担当別環境変数 → 共通環境変数 `FILM_MODEL` →
+バックエンド別共通環境変数 `FILM_CODEX_MODEL` / `FILM_CLAUDE_MODEL` →
+設定ファイルの担当別 → 設定ファイルの共通 → CLI既定値です。
+`--director-model` / `--critic-model` / `--model` は、それぞれ対応する環境変数を
+上書きします。`--model` を指定しても担当別環境変数があればそちらが優先されます。
+選択したバックエンドと起動時の上書きは子の批評担当にも引き継がれます。
+推論強度などモデル名以外の設定は各CLIの設定を使います。
 
 Codex の監督は workspace-write、批評担当は read-only sandbox で実行します。
 Claude のファイル別・コマンド別 allow/deny と同等の制限ではありません。
