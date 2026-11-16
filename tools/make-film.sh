@@ -53,6 +53,9 @@ print(json.dumps({"permissions": {
         "Bash(./target/release/fractal-harness ledger *)",
         "Bash(./target/release/fractal-harness measure *)",
         "Bash(./target/release/fractal-harness tuning write *)",
+        # Production runs without the director; see the end of this script.
+        "Bash(./target/release/fractal-harness produce *)",
+        "Bash(./target/release/fractal-harness encode *)",
         # Formulas, cameras, and quality the harness derived.
         f"Read({own}/compiled/**)",
         # Past work and other productions.
@@ -81,12 +84,25 @@ export BASH_MAX_TIMEOUT_MS=600000
 # A production may take several sessions; each keeps its own record.
 session=$(($(find "$root/$id" -maxdepth 1 -name 'director-run-*.json' | wc -l) + 1))
 
+# The director designs the film. A session can end early, for example at a
+# usage limit; everything it decided is on disk, so running this script
+# again continues where it stopped.
 claude -p "/fractal-film $id" \
     --settings "$settings" \
     --tools "Bash,Read,Write,Edit" \
     --permission-mode dontAsk \
     --max-turns 600 \
     ${FILM_DIRECTOR_MODEL:+--model "$FILM_DIRECTOR_MODEL"} \
-    --output-format json >"$root/$id/director-run-$session.json"
+    --output-format json >"$root/$id/director-run-$session.json" || true
 
+# Rendering and encoding involve no decisions, so no model is involved.
+stage() {
+    "$harness" next "$id" | python3 -c 'import json, sys; print(json.load(sys.stdin)["stage"])'
+}
+if [[ $(stage) == production ]]; then
+    "$harness" produce "$id" >"$root/$id/produce.json"
+fi
+if [[ $(stage) == encode ]]; then
+    "$harness" encode "$id" >"$root/$id/encode.json"
+fi
 "$harness" next "$id"

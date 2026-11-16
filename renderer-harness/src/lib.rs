@@ -27,6 +27,7 @@ pub mod production;
 pub mod proof;
 pub mod quality;
 pub mod rng;
+pub mod schema;
 pub mod scout;
 pub mod shape;
 pub mod sheet;

@@ -40,6 +40,11 @@ pub struct CommandReport {
 pub struct Limits {
     pub revisions_used: u32,
     pub revisions_allowed: u32,
+    /// Revisions of the whole concept, over all design stages.
+    pub concept_revisions_used: u32,
+    pub concept_revisions_allowed: u32,
+    /// Revisions this stage may still spend, by either limit.
+    pub revisions_remaining: u32,
     pub kills_used: u32,
     pub kills_allowed: u32,
 }
@@ -182,19 +187,20 @@ const fn guide(stage: Stage) -> StageGuide {
             read: &["proof/", "reviews/"],
         },
         Stage::Production => StageGuide {
-            instruction: "本番レンダリングを起動し、完了まで監視する。設計は変更できない。中断時は同じコマンドで再開する。",
-            commands: &[
-                ("produce", "カット単位で本番フレームを描画する", true),
-                ("status", "進捗と残り時間の見積もりを返す", true),
-            ],
+            instruction: "設計は完了した。本番レンダリングとエンコードは起動スクリプトが自動で行うので、ここで作業を終えて報告する。",
+            commands: &[(
+                "status",
+                "本番レンダリングの進捗と残り時間の見積もりを返す",
+                true,
+            )],
             write: &[],
-            read: &["jobs/"],
+            read: &[],
         },
         Stage::Encode => StageGuide {
-            instruction: "動画を合成し、QC を通す。",
-            commands: &[("encode", "MP4 の合成、QC、台帳への追記", true)],
+            instruction: "本番レンダリングは完了した。エンコードは起動スクリプトが自動で行うので、ここで作業を終えて報告する。",
+            commands: &[("status", "本番レンダリングの結果を返す", true)],
             write: &[],
-            read: &["final/"],
+            read: &[],
         },
         Stage::Done => StageGuide {
             instruction: "制作は完了している。成果物は final/ にある。",
@@ -202,6 +208,20 @@ const fn guide(stage: Stage) -> StageGuide {
             write: &[],
             read: &["final/"],
         },
+    }
+}
+
+/// How much going back the production has left.
+#[must_use]
+pub fn limits(state: &State) -> Limits {
+    Limits {
+        revisions_used: state.revisions.get(&state.stage).copied().unwrap_or(0),
+        revisions_allowed: state.limits.revisions_per_stage,
+        concept_revisions_used: state.concept_revisions(),
+        concept_revisions_allowed: state.limits.revisions_per_concept,
+        revisions_remaining: state.revisions_remaining(),
+        kills_used: state.kills,
+        kills_allowed: state.limits.kills,
     }
 }
 
@@ -260,12 +280,7 @@ pub fn report(
         commands,
         write: guide.write.to_vec(),
         read: guide.read.to_vec(),
-        limits: Limits {
-            revisions_used: state.revisions.get(&state.stage).copied().unwrap_or(0),
-            revisions_allowed: state.limits.revisions_per_stage,
-            kills_used: state.kills,
-            kills_allowed: state.limits.kills,
-        },
+        limits: limits(state),
         compromised: state.compromised,
         banned_locations: state.banned_locations.clone(),
         budget: BudgetReport {

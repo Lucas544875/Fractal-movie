@@ -143,7 +143,7 @@ impl MotionSpec {
         }
     }
 
-    fn validate(&self, duration_seconds: f64, max_cut_seconds: f64) -> Result<()> {
+    pub(crate) fn validate(&self, duration_seconds: f64, max_cut_seconds: f64) -> Result<()> {
         let within = |name: &str, value: f64, low: f64, high: f64| {
             if value.is_finite() && (low..=high).contains(&value) {
                 Ok(())

@@ -12,12 +12,12 @@ use crate::{
     budget::Budget,
     film::{Encoding, FilmWriter, Rate, decode_frames},
     gpu::{GpuOptions, SceneProbe, apply_settings, frame_config},
-    look::GradedManifest,
+    look::{GradedManifest, LOOK_FILE},
     metrics::{Frame, difference, flicker, flicker_luma},
     production::Production,
     quality::{self, Decision, Estimate, FrameLimits, Settings},
     sheet::{self, Cell},
-    shotlist::{CompiledCut, Manifest},
+    shotlist::{CompiledCut, Manifest, SHOTLIST_FILE},
     stage::{Stage, State},
     tuning::ProofRules,
 };
@@ -123,6 +123,9 @@ pub fn run(
         duty_cycle_percent: Some(duty_cycle),
         ..gpu.clone()
     };
+    // The previous proof is kept, traced to the files that made it.
+    production.archive("proof")?;
+    production.snapshot_inputs("proof", &[SHOTLIST_FILE, LOOK_FILE])?;
     state.reset_gates();
     let _ = fs::remove_file(production.path(FINAL_MANIFEST_FILE));
 

@@ -53,6 +53,18 @@ pub enum Rejection {
     Dark,
 }
 
+impl Rejection {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cost => "cost",
+            Self::Cluttered => "cluttered",
+            Self::Empty => "empty",
+            Self::Dark => "dark",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ViewRecord {
@@ -175,6 +187,8 @@ pub struct RunReport {
     pub viewpoints_rendered: usize,
     pub rejected: BTreeMap<Rejection, usize>,
     pub sheets: Vec<String>,
+    /// Sheets of the views screening turned away, one set per reason.
+    pub rejected_sheets: Vec<String>,
     pub candidates: Vec<Candidate>,
     pub gpu_seconds: f64,
     pub design_remaining_gpu_seconds: f64,
@@ -242,6 +256,8 @@ pub fn run(
     let mut rejected: BTreeMap<Rejection, usize> = BTreeMap::new();
     // Thumbnails shown on sheets, in sheet order.
     let mut shown: Vec<(Candidate, Vec<u8>)> = Vec::new();
+    // Thumbnails that screening turned away, kept for review by reason.
+    let mut turned_away: BTreeMap<Rejection, Vec<(String, Vec<u8>)>> = BTreeMap::new();
 
     // One GPU device serves the whole round; only the shader is swapped.
     let mut renderer: Option<Renderer> = None;
@@ -317,7 +333,12 @@ pub fn run(
                 image.pixels(),
             )?;
 
-            if rejection.is_none() {
+            if let Some(reason) = rejection {
+                turned_away.entry(reason).or_default().push((
+                    format!("{number}-{}", view_index + 1),
+                    image.pixels().to_vec(),
+                ));
+            } else {
                 shown.push((
                     Candidate {
                         label: format!("{number}-{}", view_index + 1),
@@ -411,6 +432,31 @@ pub fn run(
         sheets.push(name);
     }
 
+    // Rejected views get their own sheets, named by reason, so the
+    // screening can be audited. They are never offered for selection.
+    let mut rejected_sheets = Vec::new();
+    for (reason, thumbnails) in &turned_away {
+        for (page, chunk) in thumbnails.chunks(SHEET_COLUMNS * SHEET_ROWS).enumerate() {
+            let name = format!(
+                "{round_directory}/rejected-{}-{:02}.png",
+                reason.as_str(),
+                page + 1
+            );
+            let cells: Vec<Cell<'_>> = chunk
+                .iter()
+                .map(|(label, rgba)| Cell { label, rgba })
+                .collect();
+            sheet::compose(
+                &cells,
+                SHEET_COLUMNS,
+                THUMBNAIL_WIDTH as usize,
+                THUMBNAIL_HEIGHT as usize,
+            )?
+            .save_png(&production.path(&name))?;
+            rejected_sheets.push(name);
+        }
+    }
+
     index.rounds = round;
     index.save(production)?;
     budget.spent.design_gpu_seconds += gpu_seconds;
@@ -423,6 +469,7 @@ pub fn run(
         viewpoints_rendered,
         rejected,
         sheets,
+        rejected_sheets,
         candidates: shown.into_iter().map(|(candidate, _)| candidate).collect(),
         gpu_seconds,
         design_remaining_gpu_seconds: budget.design_remaining_seconds(),

@@ -517,6 +517,9 @@ pub fn preview(
         duty_cycle_percent: Some(duty_cycle),
         ..gpu.clone()
     };
+    // The previous preview is kept, traced to the look that made it.
+    production.archive("look")?;
+    production.snapshot_inputs("look", &[LOOK_FILE])?;
 
     // A changed look voids every earlier judgement of it.
     state.reset_gates();
@@ -786,7 +789,7 @@ fn clipping_problems(label: &str, measured: &Legibility, rules: &LookRules) -> V
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         axes::{FormulaFamily, ScaleRegime},
@@ -820,7 +823,7 @@ effects_requested:
         serde_yaml_ng::from_str(text).unwrap()
     }
 
-    fn compiled_cut(regime: ScaleRegime) -> LoadedScene {
+    pub(crate) fn compiled_cut(regime: ScaleRegime) -> LoadedScene {
         let (viewpoint, survey) = viewpoint_scene(FormulaFamily::JuliaBox, regime, 3);
         cut::compile(
             &viewpoint,

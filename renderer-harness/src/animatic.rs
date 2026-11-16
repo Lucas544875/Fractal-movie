@@ -16,7 +16,7 @@ use crate::{
     production::Production,
     quality::Settings,
     sheet::{self, Cell},
-    shotlist::Manifest,
+    shotlist::{Manifest, SHOTLIST_FILE},
     stage::{Stage, State},
     tuning::LegibilityLimits,
 };
@@ -87,6 +87,9 @@ pub fn run(
         duty_cycle_percent: Some(duty_cycle),
         ..gpu.clone()
     };
+    // The previous animatic is kept, traced to the shot list that made it.
+    production.archive("animatic")?;
+    production.snapshot_inputs("animatic", &[SHOTLIST_FILE])?;
 
     let format = manifest.format;
     let width = LEGIBILITY_WIDTH;

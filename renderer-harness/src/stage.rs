@@ -376,12 +376,9 @@ impl State {
                 Ok(ReviewOutcome::Passed)
             }
             Verdict::Revise => {
-                let used = self.revisions.entry(self.stage).or_insert(0);
-                if *used >= self.limits.revisions_per_stage {
+                let Some(remaining) = self.spend_revision() else {
                     return self.accept_at_limit();
-                }
-                *used += 1;
-                let remaining = self.limits.revisions_per_stage - *used;
+                };
                 // Reworked artifacts must be measured again.
                 self.gates.clear();
                 self.set_gate(CRITIC_GATE, false, notes)?;
@@ -417,6 +414,34 @@ impl State {
         Ok(self.limits.kills - self.kills)
     }
 
+    /// Revisions spent on the current concept, over all stages.
+    #[must_use]
+    pub fn concept_revisions(&self) -> u32 {
+        self.revisions.values().sum()
+    }
+
+    /// Revisions the current stage may still spend: the smaller of what is
+    /// left for the stage and what is left for the concept.
+    #[must_use]
+    pub fn revisions_remaining(&self) -> u32 {
+        let stage = self.revisions.get(&self.stage).copied().unwrap_or(0);
+        self.limits.revisions_per_stage.saturating_sub(stage).min(
+            self.limits
+                .revisions_per_concept
+                .saturating_sub(self.concept_revisions()),
+        )
+    }
+
+    /// Spends one revision of the current stage. Returns how many remain
+    /// afterwards, or `None` when none was left to spend.
+    fn spend_revision(&mut self) -> Option<u32> {
+        if self.revisions_remaining() == 0 {
+            return None;
+        }
+        *self.revisions.entry(self.stage).or_insert(0) += 1;
+        Some(self.revisions_remaining())
+    }
+
     /// Returns to an earlier design stage so its file can be changed, for
     /// example when the proof shows that a cut has to go.
     ///
@@ -434,16 +459,14 @@ impl State {
                 self.stage.as_str()
             );
         }
-        let allowed = self.limits.revisions_per_stage;
-        let used = self.revisions.entry(self.stage).or_insert(0);
-        if *used >= allowed {
+        let Some(remaining) = self.spend_revision() else {
             bail!(
-                "stage {} has used all {allowed} of its revisions",
-                self.stage.as_str()
+                "stage {} has no revision left ({} per stage, {} per concept)",
+                self.stage.as_str(),
+                self.limits.revisions_per_stage,
+                self.limits.revisions_per_concept
             );
-        }
-        *used += 1;
-        let remaining = allowed - *used;
+        };
         self.history.push(Event::Reopened {
             from: self.stage,
             to: target,
@@ -645,6 +668,10 @@ mod tests {
         state.validate().unwrap();
     }
 
+    fn state_limits() -> Limits {
+        Limits::default()
+    }
+
     #[test]
     fn revise_resets_measurements_and_counts_down() {
         let mut state = at(Stage::Shotlist);
@@ -653,7 +680,9 @@ mod tests {
             state
                 .review(Verdict::Revise, "cut 2 is unreadable")
                 .unwrap(),
-            ReviewOutcome::Revise { remaining: 2 }
+            ReviewOutcome::Revise {
+                remaining: state_limits().revisions_per_stage - 1
+            }
         );
         assert_eq!(state.unmet_gates(), Stage::Shotlist.gates());
         assert!(state.advance().is_err());
@@ -828,6 +857,7 @@ mod tests {
     fn limits_come_from_the_production_not_from_constants() {
         let strict = Limits {
             revisions_per_stage: 1,
+            revisions_per_concept: 4,
             kills: 0,
             mandate_redraws: 0,
         };
@@ -893,8 +923,58 @@ mod tests {
             clear_stage(&mut state);
         }
         let error = state.reopen(Stage::Look, "again").unwrap_err().to_string();
-        assert!(error.contains("used all"), "{error}");
+        assert!(error.contains("no revision left"), "{error}");
         assert_eq!(state.stage, Stage::Proof);
+    }
+
+    #[test]
+    fn revisions_are_also_limited_over_the_whole_concept() {
+        let limits = Limits {
+            revisions_per_stage: 2,
+            revisions_per_concept: 3,
+            ..Limits::default()
+        };
+        let mut state = State::with_limits("film", limits);
+        while state.stage != Stage::Shotlist {
+            clear_stage(&mut state);
+        }
+        pass_measured(&mut state);
+        assert_eq!(
+            state.review(Verdict::Revise, "").unwrap(),
+            ReviewOutcome::Revise { remaining: 1 }
+        );
+        clear_stage(&mut state);
+        // The look has two revisions of its own but the concept only two left.
+        pass_measured(&mut state);
+        assert_eq!(state.revisions_remaining(), 2);
+        assert_eq!(
+            state.review(Verdict::Revise, "").unwrap(),
+            ReviewOutcome::Revise { remaining: 1 }
+        );
+        clear_stage(&mut state);
+        // In the proof, a return to the look spends the last one.
+        assert_eq!(state.reopen(Stage::Look, "regrade").unwrap(), 0);
+        while state.stage != Stage::Proof {
+            clear_stage(&mut state);
+        }
+        assert!(state.reopen(Stage::Look, "again").is_err());
+        pass_measured(&mut state);
+        assert_eq!(
+            state.review(Verdict::Revise, "").unwrap(),
+            ReviewOutcome::LimitReached
+        );
+        assert!(state.compromised);
+
+        // A new concept starts with the full allowance again.
+        let mut state = State::with_limits("film", limits);
+        while state.stage != Stage::Shotlist {
+            clear_stage(&mut state);
+        }
+        pass_measured(&mut state);
+        state.review(Verdict::Revise, "").unwrap();
+        pass_measured(&mut state);
+        state.review(Verdict::Kill, "").unwrap();
+        assert_eq!(state.concept_revisions(), 0);
     }
 
     #[test]

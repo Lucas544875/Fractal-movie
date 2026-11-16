@@ -160,6 +160,102 @@ impl Production {
     }
 }
 
+impl Production {
+    /// Records which versions of the authored files a measuring command is
+    /// about to use, so that its outputs can later be traced to them. The
+    /// copies live under `compiled/`, out of the critic's reach.
+    pub fn snapshot_inputs(&self, stage_directory: &str, files: &[&str]) -> Result<()> {
+        let directory = self.path(&format!("compiled/inputs/{stage_directory}"));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory)
+            .with_context(|| format!("could not create {}", directory.display()))?;
+        for file in files {
+            let source = self.path(file);
+            if source.is_file() {
+                fs::copy(&source, directory.join(file))
+                    .with_context(|| format!("could not record {file}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Moves the outputs of an earlier measurement out of the way before
+    /// they are replaced, together with the inputs that produced them.
+    /// Returns the history directory, or `None` when there was nothing to
+    /// keep.
+    pub fn archive(&self, stage_directory: &str) -> Result<Option<String>> {
+        let source = self.path(stage_directory);
+        let entries: Vec<_> = match fs::read_dir(&source) {
+            Ok(entries) => entries.filter_map(|entry| entry.ok()).collect(),
+            Err(_) => return Ok(None),
+        };
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        let relative = self.next_history(stage_directory)?;
+        let target = self.path(&relative);
+        for entry in entries {
+            fs::rename(entry.path(), target.join(entry.file_name()))
+                .with_context(|| format!("could not move {} to history", entry.path().display()))?;
+        }
+        let inputs = self.path(&format!("compiled/inputs/{stage_directory}"));
+        if let Ok(files) = fs::read_dir(&inputs) {
+            let kept = target.join("inputs");
+            fs::create_dir_all(&kept).context("could not create the history inputs")?;
+            for file in files.filter_map(|entry| entry.ok()) {
+                fs::copy(file.path(), kept.join(file.file_name()))
+                    .context("could not keep the inputs of a measurement")?;
+            }
+        }
+        Ok(Some(relative))
+    }
+
+    /// Keeps the design files of a concept that is being abandoned, with the
+    /// reason, and moves its measurements to history.
+    pub fn archive_concept(&self, reason: &str) -> Result<String> {
+        let relative = self.next_history("concept")?;
+        let target = self.path(&relative);
+        for file in AUTHORED_FILES {
+            let source = self.path(file);
+            if source.is_file() {
+                fs::copy(&source, target.join(file))
+                    .with_context(|| format!("could not keep {file}"))?;
+            }
+        }
+        fs::write(target.join("reason.txt"), format!("{reason}\n"))
+            .context("could not record why the concept was abandoned")?;
+        for stage_directory in ["animatic", "look", "proof"] {
+            self.archive(stage_directory)?;
+        }
+        Ok(relative)
+    }
+
+    /// Creates `history/<name>-NNN` with the next free number.
+    fn next_history(&self, name: &str) -> Result<String> {
+        let history = self.path("history");
+        fs::create_dir_all(&history).context("could not create the history directory")?;
+        let prefix = format!("{name}-");
+        let number = fs::read_dir(&history)
+            .context("could not read the history directory")?
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                entry
+                    .file_name()
+                    .to_str()?
+                    .strip_prefix(&prefix)?
+                    .parse::<u32>()
+                    .ok()
+            })
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let relative = format!("history/{name}-{number:03}");
+        fs::create_dir(self.path(&relative))
+            .with_context(|| format!("could not create {relative}"))?;
+        Ok(relative)
+    }
+}
+
 /// Ids become directory names and ledger keys, so they are restricted to a
 /// portable subset that cannot escape the production root.
 pub fn validate_id(id: &str) -> Result<()> {
@@ -302,6 +398,76 @@ mod tests {
         assert!(leftovers.is_empty());
 
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn measurements_are_archived_with_the_inputs_that_made_them() {
+        let root = temp_root("archive");
+        let production =
+            Production::create(&root, "film", &Ledger::default(), 1, Budget::default()).unwrap();
+        // Nothing to keep yet.
+        assert_eq!(production.archive("animatic").unwrap(), None);
+
+        fs::write(production.path("shotlist.yaml"), "first").unwrap();
+        production
+            .snapshot_inputs("animatic", &["shotlist.yaml"])
+            .unwrap();
+        fs::create_dir_all(production.path("animatic")).unwrap();
+        fs::write(production.path("animatic/sheet.png"), "sheet one").unwrap();
+
+        // The director edits the file, then measures again.
+        fs::write(production.path("shotlist.yaml"), "second").unwrap();
+        let kept = production.archive("animatic").unwrap().unwrap();
+        assert_eq!(kept, "history/animatic-001");
+        assert_eq!(
+            fs::read_to_string(production.path("history/animatic-001/sheet.png")).unwrap(),
+            "sheet one"
+        );
+        // The archived version is traced to the input that produced it.
+        assert_eq!(
+            fs::read_to_string(production.path("history/animatic-001/inputs/shotlist.yaml"))
+                .unwrap(),
+            "first"
+        );
+        assert_eq!(
+            fs::read_dir(production.path("animatic")).unwrap().count(),
+            0
+        );
+
+        fs::write(production.path("animatic/sheet.png"), "sheet two").unwrap();
+        assert_eq!(
+            production.archive("animatic").unwrap().unwrap(),
+            "history/animatic-002"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_abandoned_concept_keeps_its_files_and_reason() {
+        let root = temp_root("concept");
+        let production =
+            Production::create(&root, "film", &Ledger::default(), 1, Budget::default()).unwrap();
+        fs::write(production.path("brief.yaml"), "brief").unwrap();
+        fs::write(production.path("shotlist.yaml"), "shots").unwrap();
+        fs::create_dir_all(production.path("look")).unwrap();
+        fs::write(production.path("look/sheet.png"), "look").unwrap();
+
+        let kept = production
+            .archive_concept("pillars cannot be staged")
+            .unwrap();
+        assert_eq!(kept, "history/concept-001");
+        assert_eq!(
+            fs::read_to_string(production.path("history/concept-001/brief.yaml")).unwrap(),
+            "brief"
+        );
+        assert!(!production.path("history/concept-001/look.yaml").exists());
+        assert!(
+            fs::read_to_string(production.path("history/concept-001/reason.txt"))
+                .unwrap()
+                .contains("pillars")
+        );
+        assert!(production.path("history/look-001/sheet.png").is_file());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

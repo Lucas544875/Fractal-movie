@@ -63,6 +63,10 @@ impl Default for Diversity {
 pub struct Limits {
     /// Critic `revise` verdicts accepted per stage.
     pub revisions_per_stage: u32,
+    /// Revisions, including returns to earlier stages, accepted over all
+    /// design stages of one concept. A new concept after a kill starts
+    /// afresh.
+    pub revisions_per_concept: u32,
     /// Times a production may be sent back to scouting.
     pub kills: u32,
     /// Times an unrealisable mandate assignment is replaced.
@@ -72,7 +76,8 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            revisions_per_stage: 3,
+            revisions_per_stage: 2,
+            revisions_per_concept: 4,
             kills: 2,
             mandate_redraws: 2,
         }

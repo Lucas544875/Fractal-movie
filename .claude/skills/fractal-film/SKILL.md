@@ -15,9 +15,13 @@ disable-model-invocation: true
 2. 返ってきた `instruction` と `gates` に従って作業する。
 3. `complete` が `true` になるまで 1 に戻って繰り返す。途中で止まって確認を求めない。
 
-すべてのコマンドは stdout に JSON を1個返す。`ok` が `false` のときは `error` を読んで原因を直す。同じコマンドをそのまま繰り返さない。
+すべてのコマンドは stdout に短い JSON を1個返す。`ok` が `false` のときは `error` を読んで原因を直す。同じコマンドをそのまま繰り返さない。
 
-制作のファイルは `productions/$ARGUMENTS/` にある。最初に `./target/release/fractal-harness describe` で、軸の値、カットの役割、トランジションの語彙を確認する。
+- コマンドは1回に1つ、そのまま実行する。出力は必要な分だけに絞ってあるので、パイプ（`|`）、`&&`、`;`、リダイレクトで加工しない。許可されていない組み合わせは拒否される。
+- 設計ファイルは Write か Edit で書く。`sed` や `cat >` は使わない。
+- 現在地と全体像（指定制約、過去作品の軸、予算）を知りたいときだけ `next` を使う。各コマンドの返り値にも、現在の工程とゲートは入っている。
+
+制作のファイルは `productions/$ARGUMENTS/` にある。
 
 ## あなたが書くファイル
 
@@ -27,7 +31,7 @@ disable-model-invocation: true
 - `shotlist.yaml`: カット割り。ロケ地と視点は ID で指定し、カメラ座標は書かない。
 - `look.yaml`: マテリアル、光、グレード。光はカメラ基準の方位と仰角で書く。
 
-書式が分からないときは、まずファイルを書いて対応するチェックコマンドを実行し、返ってくる `schema_errors` に従って直す。
+**書く前に必ず書式を見る**: `./target/release/fractal-harness schema brief $ARGUMENTS`（`shotlist`、`look` も同様）が、使える値と範囲をすべて注釈した見本を返す。わざと誤った値を書いてエラーから書式を探らない。
 
 ## 工程ごとの要点
 
@@ -36,8 +40,7 @@ disable-model-invocation: true
 - **カット割り**: `shotlist check` が通ったら `animatic` を実行し、`animatic/sheet.png` を見る。ゲートが落ちたら、落ちた理由に挙がったカットを直す。
 - **ルック**: `look preview` の後、`look/sheet.png` を見る。主題が背景から分離して見えること、色が濁っていないことを自分の目で確かめてから批評に出す。
 - **プルーフ**: `proof` は数分かかる。落ちたゲートがカットやルックに原因を持つなら、`reopen --stage shotlist` か `reopen --stage look` で戻って直す。
-- **本番**: `produce $ARGUMENTS --max-frames 150` を、返ってくる `produce.complete` が `true` になるまで繰り返す。1回は数分かかる。中断しても同じコマンドで続きから描画される。
-- **エンコード**: `encode` を実行する。
+- **本番とエンコード**: あなたの仕事ではない。工程が `production` になったら、起動スクリプトが自動で描画とエンコードを行うので、そこで終える。
 
 ## 批評
 
@@ -48,6 +51,8 @@ disable-model-invocation: true
 ```
 
 別の批評役が画像を見て `pass` / `revise` / `kill` を登録し、その理由を返す。`revise` なら `notes` に挙がった点を直して測り直し、もう一度批評に出す。`kill` ならロケハンからやり直しになる。
+
+やり直しには上限がある。返り値の `limits.revisions_remaining` が、この工程であと何回 `revise` や `reopen` ができるかを示す（工程ごとの上限と、企画全体の通算上限の小さいほう）。0 になると、次の `revise` はそのまま先へ進められ、作品は妥協扱いになる。指摘をまとめて1回で直すこと。
 
 ## 企画を捨てる判断
 
@@ -64,4 +69,4 @@ disable-model-invocation: true
 
 ## 終わり方
 
-`next` の `complete` が `true` になったら、完成ファイルのパス（`productions/$ARGUMENTS/final/`）、作品の尺、使った GPU 時間、`compromised` かどうかを短く報告して終える。
+工程が `production` になったら、題名、主題、カット数と尺、`compromised` かどうか、批評で最後に指摘された点を短く報告して終える。

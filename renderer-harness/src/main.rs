@@ -21,7 +21,7 @@ use fractal_renderer_harness::{
     proof,
     quality::{FrameLimits, decide},
     scout, shotlist,
-    stage::{ReviewOutcome, Stage, Verdict},
+    stage::{InfeasibleOutcome, ReviewOutcome, Stage, Verdict},
     tuning::{DEFAULT_TUNING_FILE, Tuning},
 };
 use serde_json::{Value, json};
@@ -215,6 +215,14 @@ enum Command {
     Ledger {
         #[command(subcommand)]
         command: LedgerCommand,
+    },
+
+    /// Print an annotated template of brief.yaml, shotlist.yaml, or
+    /// look.yaml with this production's limits.
+    Schema {
+        /// brief, shotlist, or look.
+        file: String,
+        id: String,
     },
 
     /// Show or export the tuning: every threshold, limit, and window.
@@ -440,6 +448,15 @@ fn run(cli: Cli) -> Result<Value> {
         Command::Describe => Ok(
             json!({ "ok": true, "vocabulary": describe(&general_tuning(tuning_file.as_ref())?) }),
         ),
+        Command::Schema { file, id } => {
+            let production = Production::open(&cli.root, &id)?;
+            let template = fractal_renderer_harness::schema::template(
+                &file,
+                &production.load_tuning()?,
+                &production.load_budget()?,
+            )?;
+            Ok(json!({ "ok": true, "file": format!("{file}.yaml"), "template": template }))
+        }
         Command::Tuning {
             command: TuningCommand::Show,
         } => Ok(json!({ "ok": true, "tuning": general_tuning(tuning_file.as_ref())? })),
@@ -555,7 +572,24 @@ fn run(cli: Cli) -> Result<Value> {
             )?;
             // An unrealisable family assignment changes the stage record.
             production.save_state(&state)?;
-            let mut value = serde_json::to_value(report).context("could not serialize report")?;
+            // One short line per candidate, grouped by the sheet it is on;
+            // measurements stay in scout/index.json.
+            let mut by_sheet: std::collections::BTreeMap<&str, Vec<String>> =
+                std::collections::BTreeMap::new();
+            for candidate in &report.candidates {
+                by_sheet.entry(&candidate.sheet).or_default().push(format!(
+                    "{} {} {} {} {}",
+                    candidate.label,
+                    candidate.location,
+                    candidate.viewpoint,
+                    candidate.family.as_str(),
+                    candidate.scale_regime.as_str()
+                ));
+            }
+            let candidates =
+                serde_json::to_value(&by_sheet).context("could not serialize report")?;
+            let mut value = serde_json::to_value(&report).context("could not serialize report")?;
+            value["candidates"] = candidates;
             value["ok"] = json!(true);
             value["directory"] = json!(production.directory());
             Ok(value)
@@ -574,10 +608,7 @@ fn run(cli: Cli) -> Result<Value> {
                 &locations,
             )?;
             production.save_state(&state)?;
-            let mut value = next_report(&production, &ledger)?;
-            value["selected"] =
-                serde_json::to_value(selected).context("could not serialize selection")?;
-            Ok(value)
+            with_report(&production, "selected", &selected, &[])
         }
         Command::Brief {
             command: BriefCommand::Check { id },
@@ -588,58 +619,79 @@ fn run(cli: Cli) -> Result<Value> {
             let mut mandate = production.load_mandate()?;
             let report = brief::check(&production, &mut state, &mut mandate, &ledger)?;
             production.save_state(&state)?;
-            let mut value = next_report(&production, &ledger)?;
-            value["brief"] = serde_json::to_value(report).context("could not serialize report")?;
-            Ok(value)
+            if let Some(infeasible) = &report.infeasible
+                && infeasible.outcome == InfeasibleOutcome::Killed
+            {
+                production.archive_concept(&format!(
+                    "mandate cannot be realised: {}",
+                    infeasible.reason
+                ))?;
+            }
+            with_report(&production, "brief", &report, &[])
         }
         Command::Shotlist {
             command: ShotlistCommand::Check { id },
         } => {
-            let ledger = Ledger::load(&cli.ledger)?;
             let production = Production::open(&cli.root, &id)?;
             let mut state = production.load_state()?;
             let mut budget = production.load_budget()?;
             let report = shotlist::check(&production, &mut state, &mut budget)?;
             production.save_state(&state)?;
-            let mut value = next_report(&production, &ledger)?;
-            value["shotlist"] =
-                serde_json::to_value(report).context("could not serialize report")?;
-            Ok(value)
+            with_report(&production, "shotlist", &report, &[])
         }
         Command::Animatic { id, gpu } => {
-            let ledger = Ledger::load(&cli.ledger)?;
             let production = Production::open(&cli.root, &id)?;
             let mut state = production.load_state()?;
             let mut budget = production.load_budget()?;
             let report = animatic::run(&production, &mut state, &mut budget, &gpu.options())?;
             production.save_state(&state)?;
-            let mut value = next_report(&production, &ledger)?;
-            value["animatic"] =
-                serde_json::to_value(report).context("could not serialize report")?;
-            Ok(value)
+            with_report(&production, "animatic", &report, &[])
         }
         Command::Look {
             command: LookCommand::Preview { id, gpu },
         } => {
-            let ledger = Ledger::load(&cli.ledger)?;
             let production = Production::open(&cli.root, &id)?;
             let mut state = production.load_state()?;
             let mut budget = production.load_budget()?;
             let report = look::preview(&production, &mut state, &mut budget, &gpu.options())?;
             production.save_state(&state)?;
-            let mut value = next_report(&production, &ledger)?;
-            value["look"] = serde_json::to_value(report).context("could not serialize report")?;
-            Ok(value)
+            with_report(&production, "look", &report, &["frames"])
         }
         Command::Proof { id, gpu } => {
-            let ledger = Ledger::load(&cli.ledger)?;
             let production = Production::open(&cli.root, &id)?;
             let mut state = production.load_state()?;
             let mut budget = production.load_budget()?;
             let report = proof::run(&production, &mut state, &mut budget, &gpu.options())?;
             production.save_state(&state)?;
-            let mut value = next_report(&production, &ledger)?;
-            value["proof"] = serde_json::to_value(report).context("could not serialize report")?;
+            let mut value = with_report(&production, "proof", &report, &["decisions", "cuts"])?;
+            // Per cut, only what a director can act on.
+            value["proof"]["cuts"] = report
+                .cuts
+                .iter()
+                .map(|cut| {
+                    json!({
+                        "id": cut.id,
+                        "estimated_gpu_seconds": cut.estimated_gpu_seconds.round(),
+                        "flicker": cut.flicker,
+                        "delivery_ssim": cut.delivery_ssim,
+                    })
+                })
+                .collect();
+            value["proof"]["quality"] = report
+                .decisions
+                .iter()
+                .map(|(location, decision)| {
+                    (
+                        location.clone(),
+                        json!({
+                            "settings": decision.settings,
+                            "fits_budget": decision.fits_budget,
+                            "degradations": decision.degradations,
+                        }),
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>()
+                .into();
             Ok(value)
         }
         Command::Produce {
@@ -647,7 +699,6 @@ fn run(cli: Cli) -> Result<Value> {
             max_frames,
             gpu,
         } => {
-            let ledger = Ledger::load(&cli.ledger)?;
             let production = Production::open(&cli.root, &id)?;
             let mut state = production.load_state()?;
             let mut budget = production.load_budget()?;
@@ -661,10 +712,7 @@ fn run(cli: Cli) -> Result<Value> {
                 },
             )?;
             production.save_state(&state)?;
-            let mut value = next_report(&production, &ledger)?;
-            value["produce"] =
-                serde_json::to_value(report).context("could not serialize report")?;
-            Ok(value)
+            with_report(&production, "produce", &report, &[])
         }
         Command::Status { id } => {
             let production = Production::open(&cli.root, &id)?;
@@ -683,12 +731,9 @@ fn run(cli: Cli) -> Result<Value> {
                 &cli.ledger,
             )?;
             production.save_state(&state)?;
-            let mut value = next_report(&production, &ledger)?;
-            value["encode"] = serde_json::to_value(report).context("could not serialize report")?;
-            Ok(value)
+            with_report(&production, "encode", &report, &[])
         }
         Command::Reopen { id, stage, reason } => {
-            let ledger = Ledger::load(&cli.ledger)?;
             let production = Production::open(&cli.root, &id)?;
             let mut state = production.load_state()?;
             let target = match stage {
@@ -697,14 +742,13 @@ fn run(cli: Cli) -> Result<Value> {
             };
             let remaining = state.reopen(target, reason)?;
             production.save_state(&state)?;
-            let mut value = next_report(&production, &ledger)?;
+            let mut value = step_report(&production)?;
             value["revisions_remaining"] = json!(remaining);
             Ok(value)
         }
         Command::Review {
             command: ReviewCommand::Submit { id, verdict, notes },
         } => {
-            let ledger = Ledger::load(&cli.ledger)?;
             let production = Production::open(&cli.root, &id)?;
             let mut state = production.load_state()?;
             // The verdict must come from the critic's own process. A director
@@ -721,6 +765,7 @@ fn run(cli: Cli) -> Result<Value> {
             if matches!(outcome, ReviewOutcome::Killed { .. }) {
                 // The dropped concept's locations may not be chosen again.
                 state.ban_locations(scout::Index::load(&production)?.selected);
+                production.archive_concept(&format!("critic: {notes}"))?;
             }
             let advanced_to = state.advance_if_ready()?;
 
@@ -753,7 +798,7 @@ fn run(cli: Cli) -> Result<Value> {
             .context("could not record the review")?;
             production.save_state(&state)?;
 
-            let mut value = next_report(&production, &ledger)?;
+            let mut value = step_report(&production)?;
             value["review"] = record;
             value["advanced_to"] = json!(advanced_to);
             Ok(value)
@@ -835,11 +880,61 @@ fn run(cli: Cli) -> Result<Value> {
             let mut state = production.load_state()?;
             // The abandoned concept's locations may not be chosen again.
             let abandoned = scout::Index::load(&production)?.selected;
-            state.kill(reason, abandoned)?;
+            state.kill(reason.clone(), abandoned)?;
             production.save_state(&state)?;
-            next_report(&production, &ledger)
+            let kept = production.archive_concept(&reason)?;
+            let mut value = next_report(&production, &ledger)?;
+            value["archived"] = json!(kept);
+            Ok(value)
         }
     }
+}
+
+/// The short report every step command returns: where the production now
+/// stands and which gates still stand in the way. The full picture, with
+/// diversity constraints and budget, is `next`.
+fn step_report(production: &Production) -> Result<Value> {
+    let state = production.load_state()?;
+    let gates: Vec<Value> = state
+        .stage
+        .gates()
+        .iter()
+        .map(|gate| match state.gates.get(*gate) {
+            Some(record) => json!({
+                "gate": gate,
+                "status": if record.passed { "passed" } else { "failed" },
+                "detail": record.detail,
+            }),
+            None => json!({ "gate": gate, "status": "pending" }),
+        })
+        .collect();
+    Ok(json!({
+        "ok": true,
+        "stage": state.stage,
+        "complete": state.stage == Stage::Done,
+        "gates": gates,
+        "limits": next::limits(&state),
+        "compromised": state.compromised,
+    }))
+}
+
+/// Merges `report` into a step report under `key`, dropping fields that are
+/// written to the stage's report file and would only crowd the output.
+fn with_report<T: serde::Serialize>(
+    production: &Production,
+    key: &str,
+    report: &T,
+    drop: &[&str],
+) -> Result<Value> {
+    let mut report = serde_json::to_value(report).context("could not serialize report")?;
+    if let Some(fields) = report.as_object_mut() {
+        for field in drop {
+            fields.remove(*field);
+        }
+    }
+    let mut value = step_report(production)?;
+    value[key] = report;
+    Ok(value)
 }
 
 fn next_report(production: &Production, ledger: &Ledger) -> Result<Value> {
