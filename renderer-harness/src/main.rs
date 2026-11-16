@@ -8,7 +8,9 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use fractal_renderer_core::load_scene;
 use fractal_renderer_harness::{
-    animatic, brief,
+    animatic,
+    axes::FormulaFamily,
+    brief,
     budget::Budget,
     describe::describe,
     encode,
@@ -20,7 +22,7 @@ use fractal_renderer_harness::{
     production::{DEFAULT_LEDGER, DEFAULT_ROOT, Production},
     proof,
     quality::{FrameLimits, decide},
-    scout, shotlist,
+    sample, scout, shotlist,
     stage::{InfeasibleOutcome, ReviewOutcome, Stage, Verdict},
     storyboard,
     tuning::{DEFAULT_TUNING_FILE, Tuning},
@@ -165,6 +167,14 @@ enum Command {
         /// What is missing.
         #[arg(long)]
         need: String,
+    },
+
+    /// Work through vocabulary requests: list them, record decisions, and
+    /// sample what a formula family yields. For vocabulary development, not
+    /// for productions.
+    Vocabulary {
+        #[command(subcommand)]
+        command: VocabularyCommand,
     },
 
     /// Check shotlist.yaml: compile every cut, walk its camera route, and
@@ -374,6 +384,57 @@ enum ReviewCommand {
         #[arg(long)]
         notes: String,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum VocabularyCommand {
+    /// List requests with their standing.
+    List {
+        /// Only requests nobody has decided about yet.
+        #[arg(long)]
+        open: bool,
+    },
+
+    /// Record the decision about an open request.
+    Resolve {
+        /// Number of the request, as `vocabulary list` shows it.
+        request: u32,
+
+        #[arg(long, value_enum)]
+        status: ResolutionStatus,
+
+        /// What was added and how to use it, or why the request is declined.
+        #[arg(long)]
+        note: String,
+    },
+
+    /// Generate formulas of one family, render the views scouting finds,
+    /// and report how many are usable and what they cost.
+    Sample {
+        /// Formula family, as `describe` lists it.
+        #[arg(long)]
+        family: String,
+
+        /// Formulas to generate.
+        #[arg(long, default_value_t = 30)]
+        formulas: usize,
+
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+
+        /// Directory the contact sheets are written to.
+        #[arg(long)]
+        out: PathBuf,
+
+        #[command(flatten)]
+        gpu: GpuArgs,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ResolutionStatus {
+    Implemented,
+    Declined,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -692,9 +753,10 @@ fn run(cli: Cli) -> Result<Value> {
             need,
         } => {
             let production = Production::open(&cli.root, &id)?;
-            let count = vocabulary::record(
+            let number = vocabulary::record(
                 &cli.ledger,
                 &vocabulary::Request {
+                    id: 0,
                     production: id,
                     stage: production.load_state()?.stage,
                     kind: kind.into(),
@@ -704,9 +766,63 @@ fn run(cli: Cli) -> Result<Value> {
             )?;
             Ok(json!({
                 "ok": true,
-                "recorded": count,
+                "request": number,
                 "note": "the request is kept for later; continue with the vocabulary that exists",
             }))
+        }
+        Command::Vocabulary {
+            command: VocabularyCommand::List { open },
+        } => {
+            let entries: Vec<_> = vocabulary::list(&cli.ledger)?
+                .into_iter()
+                .filter(|entry| !open || entry.status == vocabulary::Status::Open)
+                .collect();
+            Ok(json!({ "ok": true, "requests": entries }))
+        }
+        Command::Vocabulary {
+            command:
+                VocabularyCommand::Resolve {
+                    request,
+                    status,
+                    note,
+                },
+        } => {
+            vocabulary::resolve(
+                &cli.ledger,
+                &vocabulary::Resolution {
+                    request,
+                    status: match status {
+                        ResolutionStatus::Implemented => vocabulary::Status::Implemented,
+                        ResolutionStatus::Declined => vocabulary::Status::Declined,
+                    },
+                    note,
+                },
+            )?;
+            Ok(json!({ "ok": true, "request": request }))
+        }
+        Command::Vocabulary {
+            command:
+                VocabularyCommand::Sample {
+                    family,
+                    formulas,
+                    seed,
+                    out,
+                    gpu,
+                },
+        } => {
+            let Some(family) = FormulaFamily::parse(&family) else {
+                anyhow::bail!("unknown formula family {family:?}; `describe` lists the families");
+            };
+            let tuning = general_tuning(tuning_file.as_ref())?;
+            let mut options = gpu.options();
+            // The same ceiling productions scout under.
+            options.duty_cycle_percent = options
+                .duty_cycle_percent
+                .or(Some(Budget::default().max_gpu_duty_cycle));
+            let report = sample::family(family, formulas, seed, &out, &options, &tuning)?;
+            let mut value = serde_json::to_value(report).context("could not serialize report")?;
+            value["ok"] = json!(true);
+            Ok(value)
         }
         Command::Shotlist {
             command: ShotlistCommand::Check { id },

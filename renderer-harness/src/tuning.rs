@@ -26,6 +26,7 @@ pub struct Tuning {
     pub look: LookRules,
     pub proof: ProofRules,
     pub encode: EncodeRules,
+    pub vocabulary: VocabularyRules,
     pub quality: QualityRules,
 }
 
@@ -357,6 +358,26 @@ impl Default for EncodeRules {
     }
 }
 
+/// What new shape vocabulary must show before it is offered to directors.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VocabularyRules {
+    /// Smallest share of generated formulas that must survey as a usable
+    /// shape.
+    pub min_shape_yield: f64,
+    /// Smallest share of rendered views that must pass screening.
+    pub min_offered_share: f64,
+}
+
+impl Default for VocabularyRules {
+    fn default() -> Self {
+        Self {
+            min_shape_yield: 0.2,
+            min_offered_share: 0.3,
+        }
+    }
+}
+
 /// How the render quality of a cut is decided.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -576,6 +597,14 @@ impl Tuning {
             bail!("proof clip settings are out of range");
         }
 
+        for (name, value) in [
+            ("min_shape_yield", self.vocabulary.min_shape_yield),
+            ("min_offered_share", self.vocabulary.min_offered_share),
+        ] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                bail!("vocabulary {name} must be in 0..=1");
+            }
+        }
         if self.encode.master_crf > 51 {
             bail!("encode master_crf must be in 0..=51");
         }
@@ -673,6 +702,7 @@ mod tests {
             |tuning| tuning.look.max_clipped_high = 2.0,
             |tuning| tuning.proof.region_fraction = 0.0,
             |tuning| tuning.proof.compare_every = 0,
+            |tuning| tuning.vocabulary.min_shape_yield = 1.5,
             |tuning| tuning.encode.master_crf = 60,
             |tuning| tuning.quality.spp_ladder = vec![8, 4],
             |tuning| tuning.quality.spp_ladder = Vec::new(),

@@ -78,6 +78,9 @@ proof:
   compare_every: 3
 encode:
   master_crf: 16
+vocabulary:
+  min_shape_yield: 0.2
+  min_offered_share: 0.3
 quality:
   reference_spp: 64
   ablation_spp: 16

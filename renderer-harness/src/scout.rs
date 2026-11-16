@@ -478,7 +478,7 @@ pub fn run(
 }
 
 /// Decides whether a thumbnail is worth an agent's attention.
-fn screen(
+pub(crate) fn screen(
     measured: &Legibility,
     estimated_seconds: f64,
     cost_ceiling: f64,

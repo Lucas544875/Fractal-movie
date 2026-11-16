@@ -432,3 +432,96 @@ fn only_the_critic_role_may_submit_a_verdict() {
         "{value}"
     );
 }
+
+#[test]
+fn vocabulary_requests_are_recorded_listed_and_resolved() {
+    let sandbox = Sandbox::new("vocabulary");
+    sandbox.run(&["init", "film"]);
+
+    let (ok, value) = sandbox.run(&[
+        "request",
+        "film",
+        "--kind",
+        "motion",
+        "--beat",
+        "rise above the towers",
+        "--need",
+        "a vertical crane move",
+    ]);
+    assert!(ok, "{value}");
+    assert_eq!(value["request"], 1);
+    sandbox.run(&[
+        "request",
+        "film",
+        "--kind",
+        "material",
+        "--beat",
+        "the walls glow",
+        "--need",
+        "emissive surfaces",
+    ]);
+
+    let (_, listed) = sandbox.run(&["vocabulary", "list"]);
+    let requests = listed["requests"].as_array().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["status"], "open");
+    assert_eq!(requests[0]["production"], "film");
+    assert_eq!(requests[1]["kind"], "material");
+
+    let (ok, _) = sandbox.run(&[
+        "vocabulary",
+        "resolve",
+        "1",
+        "--status",
+        "implemented",
+        "--note",
+        "motion crane: { kind: crane, rise: 0.5 }",
+    ]);
+    assert!(ok);
+    // A decision is recorded once.
+    let (ok, value) = sandbox.run(&[
+        "vocabulary",
+        "resolve",
+        "1",
+        "--status",
+        "declined",
+        "--note",
+        "changed my mind",
+    ]);
+    assert!(!ok);
+    assert!(
+        value["error"]
+            .as_str()
+            .unwrap()
+            .contains("already resolved")
+    );
+
+    let (_, open) = sandbox.run(&["vocabulary", "list", "--open"]);
+    let open = open["requests"].as_array().unwrap();
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0]["id"], 2);
+    let (_, all) = sandbox.run(&["vocabulary", "list"]);
+    assert_eq!(all["requests"][0]["status"], "implemented");
+    assert!(
+        all["requests"][0]["note"]
+            .as_str()
+            .unwrap()
+            .contains("crane")
+    );
+
+    let (ok, value) = sandbox.run(&[
+        "vocabulary",
+        "sample",
+        "--family",
+        "no-such-family",
+        "--out",
+        "/nonexistent",
+    ]);
+    assert!(!ok);
+    assert!(
+        value["error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown formula family")
+    );
+}

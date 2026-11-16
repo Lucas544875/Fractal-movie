@@ -53,6 +53,9 @@ print(json.dumps({"permissions": {
         "Bash(./target/release/fractal-harness ledger *)",
         "Bash(./target/release/fractal-harness measure *)",
         "Bash(./target/release/fractal-harness tuning write *)",
+        # Requests are filed with `request`; deciding about them is not the
+        # director's business.
+        "Bash(./target/release/fractal-harness vocabulary *)",
         # Production runs without the director; see the end of this script.
         "Bash(./target/release/fractal-harness produce *)",
         "Bash(./target/release/fractal-harness encode *)",
