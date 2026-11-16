@@ -82,6 +82,19 @@ pub enum MotionSpec {
         #[serde(default = "unit_distance")]
         distance: f64,
     },
+    /// Retreat from the viewpoint's subject along the line of sight,
+    /// revealing what surrounds it.
+    PullBack {
+        /// Final camera distance as a multiple of the starting distance.
+        factor: f64,
+        /// Seconds to hold the starting frame before moving.
+        #[serde(default)]
+        hold_seconds: f64,
+        /// Starting distance from the subject, as a multiple of the
+        /// viewpoint's own distance.
+        #[serde(default = "unit_distance")]
+        distance: f64,
+    },
     /// Glide over a surface the harness finds on the shape. The viewpoint
     /// only supplies the light; bounded shapes only.
     Flyover {
@@ -112,6 +125,7 @@ impl MotionSpec {
         match self {
             Self::Orbit { .. } => Motion::Orbit,
             Self::Dive { .. } => Motion::Dive,
+            Self::PullBack { .. } => Motion::PullBack,
             Self::Flyover { .. } => Motion::Flyover,
             Self::MultiDive { .. } => Motion::MultiDive,
         }
@@ -128,6 +142,11 @@ impl MotionSpec {
             },
             Motion::Dive => Self::Dive {
                 depth: 0.3,
+                hold_seconds: 0.0,
+                distance: 1.0,
+            },
+            Motion::PullBack => Self::PullBack {
+                factor: 3.0,
                 hold_seconds: 0.0,
                 distance: 1.0,
             },
@@ -172,6 +191,20 @@ impl MotionSpec {
                     duration_seconds * 0.5,
                 )?;
                 within("dive distance", distance, 0.2, 4.0)
+            }
+            Self::PullBack {
+                factor,
+                hold_seconds,
+                distance,
+            } => {
+                within("pull-back factor", factor, 1.1, 20.0)?;
+                within(
+                    "pull-back hold_seconds",
+                    hold_seconds,
+                    0.0,
+                    duration_seconds * 0.5,
+                )?;
+                within("pull-back distance", distance, 0.2, 4.0)
             }
             Self::Flyover {
                 travel,
@@ -232,7 +265,9 @@ pub fn compile(
     // Orbits and dives may start nearer to or further from the subject than
     // the scouted viewpoint, along the same line of sight.
     let framing = match *motion {
-        MotionSpec::Orbit { distance, .. } | MotionSpec::Dive { distance, .. } => distance,
+        MotionSpec::Orbit { distance, .. }
+        | MotionSpec::Dive { distance, .. }
+        | MotionSpec::PullBack { distance, .. } => distance,
         MotionSpec::Flyover { .. } | MotionSpec::MultiDive { .. } => 1.0,
     };
     if framing != 1.0 {
@@ -266,6 +301,28 @@ pub fn compile(
             overview_duration: hold_seconds,
             dive_duration: duration_seconds - hold_seconds,
         }),
+        MotionSpec::PullBack {
+            factor,
+            hold_seconds,
+            ..
+        } => {
+            // Retreating multiplies the distance; the march must reach the
+            // subject from the far end, and fog is set for the middle.
+            let far = subject_distance * factor;
+            reframe(
+                &mut config,
+                0.0,
+                (subject_distance * far).sqrt(),
+                subject_fog,
+            );
+            config.render.max_distance = config.render.max_distance.max((far * 12.0) as f32);
+            AnimationPath::ExponentialDive(ExponentialDivePath {
+                overview_distance: Qf32::from_f64(subject_distance),
+                minimum_distance: Qf32::from_f64(far),
+                overview_duration: hold_seconds,
+                dive_duration: duration_seconds - hold_seconds,
+            })
+        }
         MotionSpec::Flyover {
             travel,
             height,
@@ -751,6 +808,54 @@ pub(crate) mod tests {
         assert!((distance_at(30) - start).abs() < start * 1.0e-5);
         assert!(distance_at(90) < start * 0.9);
         assert!((distance_at(150) - start * 0.25).abs() < start * 1.0e-4);
+    }
+
+    #[test]
+    fn pull_back_retreats_along_the_line_of_sight() {
+        let (viewpoint, survey) = viewpoint_scene(FormulaFamily::Mandelbox, ScaleRegime::Deep, 4);
+        let cut = compile(
+            &viewpoint,
+            &survey,
+            &MotionSpec::PullBack {
+                factor: 4.0,
+                hold_seconds: 1.0,
+                distance: 1.0,
+            },
+            5.0,
+            &HD30,
+            "cut",
+        )
+        .unwrap();
+        let target = viewpoint.config.camera.target.to_f64();
+        let start = distance(viewpoint.config.camera.position.to_f64(), target);
+        let distance_at = |frame| distance(camera(&cut, frame).0, target);
+        assert!((distance_at(0) - start).abs() < start * 1.0e-5);
+        assert!((distance_at(30) - start).abs() < start * 1.0e-5);
+        assert!(distance_at(90) > start * 1.2);
+        assert!((distance_at(150) - start * 4.0).abs() < start * 1.0e-4);
+        // The march reaches the subject from the far end.
+        assert!(f64::from(cut.config.render.max_distance) > start * 4.0);
+        assert_eq!(
+            MotionSpec::typical(Motion::PullBack).motion(),
+            Motion::PullBack
+        );
+        for factor in [1.0, 25.0] {
+            assert!(
+                compile(
+                    &viewpoint,
+                    &survey,
+                    &MotionSpec::PullBack {
+                        factor,
+                        hold_seconds: 0.0,
+                        distance: 1.0
+                    },
+                    5.0,
+                    &HD30,
+                    "cut",
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

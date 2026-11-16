@@ -578,7 +578,7 @@ pub(crate) mod tests {
         .unwrap();
         fs::write(
             production.path(brief::BRIEF_FILE),
-            "version: 1\ntitle: T\nsubject: S.\naxes:\n  scale_regime: overview\n  motion: orbit\n  palette: { primary_hue: teal, key: mid }\n  light: top\n  pacing: medium\nlocations: [loc-0001]\narc: A.\n",
+            "version: 1\ntitle: T\nsubject: S.\naxes:\n  scale_regime: overview\n  motion: orbit\n  palette: { primary_hue: teal, key: mid }\n  light: top\n  pacing: medium\nlocations: [loc-0001]\narc: A.\nbeats:\n  - { text: The whole shape., location: loc-0001, viewpoint: vp-1, motion: { kind: orbit, revolutions: 0.2 } }\n  - { text: Closer., location: loc-0001, viewpoint: vp-2, motion: { kind: dive, depth: 0.6 } }\n",
         )
         .unwrap();
         brief::save_axes(

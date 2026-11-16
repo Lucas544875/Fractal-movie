@@ -137,13 +137,25 @@ const fn guide(stage: Stage) -> StageGuide {
             read: &["scout/"],
         },
         Stage::Brief => StageGuide {
-            instruction: "brief.yaml を書く。主題を一文で述べ、指定制約と軸差分ルールを満たすこと。",
+            instruction: "brief.yaml を書く。主題を一文で述べ、アークを場面（beats）の列に分け、各場面にロケ地・視点・運動を割り当てる。brief check → storyboard → 批評の順に通す。語彙で表せない場面は request で記録し、表せる形に書き直す。",
             commands: &[
-                ("brief check", "スキーマ、指定制約、軸差分を検証する", true),
+                ("schema", "brief.yaml の注釈つき見本を返す", true),
+                (
+                    "brief check",
+                    "スキーマ、指定制約、軸差分、各場面が撮れるかを検証する",
+                    true,
+                ),
+                ("storyboard", "各場面の始点と終点を描いたシートを作る", true),
+                REVIEW,
+                (
+                    "request",
+                    "語彙に足りない表現（運動、形状、マテリアル、光）を記録する。制作はいまの語彙で続ける",
+                    true,
+                ),
                 KILL,
             ],
             write: &["brief.yaml"],
-            read: &["scout/", "mandate.json"],
+            read: &["scout/", "storyboard/", "reviews/", "mandate.json"],
         },
         Stage::Shotlist => StageGuide {
             instruction: "shotlist.yaml を書く。ロケ地と視点は ID で指定する。アニマティックを作り、批評役に渡す。",

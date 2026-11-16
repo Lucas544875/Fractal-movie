@@ -111,6 +111,7 @@ productions/<id>/
 | `shotlist` | トランジションの長さ、カット尺の範囲、連続カットに必要な差分数、経路の余裕の下限 |
 | `encode` | 最終ファイルの CRF |
 | `proof` | 測定領域の大きさ、プルーフ動画の幅とカットあたりの秒数、想定する配信ビットレート、圧縮後の SSIM の下限 |
+| `storyboard` | 場面を計画する標準の尺、絵コンテの幅と spp、場面数の下限 |
 | `look` | プレビューの解像度と spp、色相数と白飛び・黒潰れの上限、効果の到達距離と開口の被写体距離比、効果の初期ステップ数 |
 | `quality` | 基準 spp、有無比較の spp、spp と epsilon の段、各知覚差の閾値 |
 
@@ -142,7 +143,7 @@ S0 開始 → S1 ロケハン → S2 ブリーフ → S3 カット割り → S4 
 |---|---|---|---|
 | S0 開始 | `init` を実行 | `mandate.json`、`budget.json` | なし |
 | S1 ロケハン | コンタクトシートを見てロケ地を選ぶ | 候補サムネイル、候補ごとの指標とコスト | 選んだ全ロケ地が新規性ゲート（6.4）とコスト上限（8.2）を通過 |
-| S2 ブリーフ | `brief.yaml` を書く | 軸値の検証結果 | スキーマ、指定制約の充足、軸差分ルール（6.3） |
+| S2 ブリーフ | `brief.yaml` を書く（アークを場面の列に分ける） | 軸値の検証結果、各場面が撮れるかの検査、絵コンテ | スキーマ、指定制約の充足、軸差分ルール（6.3）、場面の撮影可否、絵コンテ、批評の合格 |
 | S3 カット割り | `shotlist.yaml` を書く | 経路検査、アニマティック動画、指標 | 経路の安全性、作品内の重複禁止（7.2）、読みやすさ指標（9章）、批評の合格 |
 | S4 ルック | `look.yaml` を書く | ルック確認用プレビュー | 色相数、白飛び・黒潰れ、批評の合格 |
 | S5 プルーフと予算 | 効果を要求する。超過時は尺や内容を見直す | 効果の有無比較、品質決定、時間見積もり、プルーフ動画 | 予算（8.1）、圧縮耐性、フリッカー、批評の最終合格 |
@@ -186,17 +187,50 @@ title: "…"
 subject: "一文で言える主題"        # 批評役が画像と照合する。1行、120字以内
 axes:
   scale_regime: mid                 # overview | mid | deep
-  motion: flyover                   # dive | orbit | multi-dive | flyover
+  motion: pull-back                 # dive | pull-back | orbit | multi-dive | flyover
   palette: { primary_hue: amber, key: high }
   light: backlit                    # frontal | raking | top | backlit
   pacing: medium                    # slow | medium | fast
 locations: [loc-0142, loc-0377]     # S1 で選んだ ID。先頭が主ロケ地
 arc: "導入で全体像、中盤で内部、終盤で引いて終わる"
+beats:                              # アークを場面の列で書く。2〜作品の最大カット数
+  - text: "群れ全体が闇に浮かぶ"   # その視点と運動で実際に映るものを1行で
+    location: loc-0142
+    viewpoint: vp-1
+    motion: { kind: orbit, revolutions: 0.15 }   # shotlist と同じ運動の語彙
+  - text: "引いて隣の塊が現れる"
+    location: loc-0142
+    viewpoint: vp-2
+    motion: { kind: pull-back, factor: 3.0 }
 ```
 
 `formula_family` は書かない。主ロケ地（`locations` の先頭）の形状族がそのまま作品の値になる。
 
 ブリーフの `axes` は宣言であり、S2 では宣言値に対して指定制約と軸差分ルールを判定する。確定した6軸は `axes.json`（ハーネス所有）に保存し、S3 と S4 で成果物から算出した値がこれと一致することを検証する。一致しなければ、その工程のゲートを不合格にする。
+
+### 5.1.1 場面と絵コンテ
+
+自由文のアークはハーネスに読めないので、企画が語彙で実現できるかを確かめられない。`auto-001` では、アークが約束した「柱の群れへ引いて終わる」を撮る運動も視点もなく、カット割りで3回やり直した末に企画を破棄した。これをブリーフの段階で止めるため、アークを場面の列で書かせる。
+
+S2 のゲートは次の6つで、順に通す。
+
+| ゲート | 判定 | コマンド |
+|---|---|---|
+| `schema` | 書式、場面の数、各場面のロケ地がブリーフにあり視点が選別を通っていること | `brief check` |
+| `mandate` / `axis-diff` | 6.2・6.3 のとおり | `brief check` |
+| `beats` | 各場面を、その視点と運動で、標準の尺（調整用設定 `storyboard.beat_seconds`、既定8秒）で経路として計画でき、経路検査（7.2）を通ること。GPU は使わない | `brief check` |
+| `storyboard` | 各場面の始点と終点を、中立の灰色・幅320・2spp で描いたシート `storyboard/sheet.png`（1行が1場面）を作る | `storyboard` |
+| `critic` | 批評役が、各場面の2枚がその `text` を表しているか、アークの結びが成立しているかを判定する | `tools/film-critic.sh` |
+
+`brief check` はブリーフのハッシュを記録し、`storyboard` は検査後に書き換えられたブリーフを拒否する。
+
+実測（3場面）では、絵コンテの描画が GPU 0.56秒、批評が実時間21秒だった。試験用のブリーフで「1つのブロックが画面を満たす」と書いた場面が実際には細部の塊だったことを、批評役が指摘した。
+
+### 5.1.2 語彙の要望
+
+表したい場面が語彙で表せないとき、監督は `request <id> --kind motion|shape|material|light|other --beat "場面" --need "足りないもの"` で記録し、いまの語彙で表せる場面に書き換える。その場面なしに企画が成り立たなければ `kill` する。
+
+要望は台帳と同じディレクトリの `vocabulary-requests.jsonl` に溜まる。制作は要望の実装を待たない。語彙の追加は制作の外で、別のエージェントか人が、型付き DSL の手順（AST、検証、CPU 側の距離関数、WGSL 生成、テスト）に従って行う。この開発工程は、要望がある程度溜まった時点で設計する。
 
 ### 5.2 `shotlist.yaml`
 
@@ -219,6 +253,7 @@ cuts:
 |---|---|---|
 | `orbit` | `revolutions`（符号つき、絶対値0.01〜1）、`distance`（省略時1） | 視点の位置から、視点の被写体を中心に周回する |
 | `dive` | `depth`（終了距離/開始距離、0.001〜0.9）、`hold_seconds`（省略時0）、`distance`（省略時1） | 視点の位置から、視線に沿って被写体へ寄る |
+| `pull-back` | `factor`（終了距離/開始距離、1.1〜20）、`hold_seconds`、`distance` | 視点の位置から、視線に沿って被写体から離れ、周囲を見せる |
 | `flyover` | `travel`、`height`（いずれも形状の半径比）、`look_ahead` | ハーネスが探した表面の上を滑空する。視点は光源だけを与える。有界な形状のみ |
 | `multi-dive` | `depth`、`dives`（1〜4） | ハーネスが探した複数の特徴へ、暗転を挟んで順に寄る。有界な形状のみ |
 
@@ -306,7 +341,7 @@ effects_requested:             # 既定はすべてなし
 |---|---|---|
 | `formula_family` | `mandelbulb`、`mandelbox`、`rotated-mandelbox`、`julia-box`、`amazing-surf`、`mandelbox-julia`、`amazing-hybrid` | orbit 命令の集合から自動分類 |
 | `scale_regime` | `overview`、`mid`、`deep` | カメラ距離と形状の外接半径の比から自動分類 |
-| `motion` | `dive`、`orbit`、`multi-dive`、`flyover` | 尺が最長の経路種別 |
+| `motion` | `dive`、`pull-back`、`orbit`、`multi-dive`、`flyover` | 尺が最長の運動 |
 | `palette` | 主色相 `red`、`amber`、`green`、`teal`、`blue`、`violet`、`neutral` | `look.yaml` から自動抽出。明度キー（`low`、`mid`、`high`）も記録するが、軸の比較は主色相だけで行う |
 | `light` | `frontal`、`raking`、`top`、`backlit` | 光の向きと視線の関係から自動分類。レンダラーの光源は向きだけを持つため、色温度は `palette` 側で扱う |
 | `pacing` | `slow`、`medium`、`fast` | 平均カット尺から自動分類 |
@@ -592,7 +627,7 @@ YouTube の SDR アップロード推奨に合わせる。
 | `init` | S0 | 制作ディレクトリ、指定制約、予算の作成。調整用設定をスナップショットする |
 | `next` | 全 | 現在の工程、未達条件、実行可能なコマンド |
 | `scout run` / `scout select` | S1 | ロケハン。近傍の再探索は `scout run --around <loc>` |
-| `brief check` | S2 | スキーマ、指定制約、軸差分。全合格で S3 へ進む |
+| `brief check` | S2 | スキーマ、指定制約、軸差分、各場面の撮影可否 |
 | `shotlist check` | S3 | カットのコンパイル、スキーマとブリーフとの一致、経路検査、重複禁止 |
 | `animatic` | S3 | 全尺の低解像度動画と指標 |
 | `look preview` | S4 | ルックの適用、確認画像とシート、スキーマ・色相数・白飛びの判定 |
@@ -601,6 +636,8 @@ YouTube の SDR アップロード推奨に合わせる。
 | `kill` | S2〜S5 | 破棄して S1 へ戻る |
 | `reopen` | S4〜S5 | `shotlist` か `look` の工程へ戻る |
 | `schema <file> <id>` | S2〜S5 | 設計ファイルの注釈つき見本 |
+| `storyboard` | S2 | 各場面の始点と終点を描いた絵コンテ |
+| `request` | S2〜S5 | 語彙の要望の記録 |
 | `produce` / `status` | S6 | 本番フレームの描画（中断・再開可）と進捗。`produce` は起動スクリプトが実行する |
 | `encode` | S7 | 最終ファイルの合成、QC、台帳への追記。起動スクリプトが実行する |
 | `ledger import` / `ledger list` / `ledger sheet <png>` | — | 台帳の初期登録、一覧、直近作品のキーフレームのシート |

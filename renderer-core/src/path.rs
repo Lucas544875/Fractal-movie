@@ -262,6 +262,8 @@ impl<D: DistanceEstimator + HighPrecisionDistanceEstimator> TargetPicker<'_, D> 
 }
 
 /// Reusable overview-then-exponential-dive timing curve from the portfolio.
+/// A `minimum_distance` beyond `overview_distance` runs the same curve
+/// outwards, as a pull-back.
 #[derive(Clone, Copy, Debug)]
 pub struct ExponentialDivePath {
     pub overview_distance: Qf32,
@@ -278,9 +280,8 @@ impl ExponentialDivePath {
         if !self.minimum_distance.is_finite() || self.minimum_distance <= Qf32::ZERO {
             bail!("minimum_distance must be finite and greater than zero");
         }
-        if self.minimum_distance > self.overview_distance {
-            bail!("minimum_distance must not exceed overview_distance");
-        }
+        // A final distance beyond the start is a pull-back: the same
+        // logarithmic curve, run outwards.
         if !self.overview_duration.is_finite() || self.overview_duration < 0.0 {
             bail!("overview_duration must be finite and non-negative");
         }
@@ -474,6 +475,10 @@ impl MultiTargetDivePath {
             dive_duration: self.dive_duration,
         }
         .validate()?;
+        // Each cycle dives in towards a feature; it never pulls back.
+        if self.minimum_distance > self.overview_distance {
+            bail!("minimum_distance must not exceed overview_distance");
+        }
         if !self.transition_duration.is_finite() || self.transition_duration <= 0.0 {
             bail!("transition_duration must be finite and greater than zero");
         }
@@ -1043,6 +1048,20 @@ mod tests {
         assert_eq!(path.distance_at(1.0), 10.0);
         assert!((path.distance_at(4.0) - 1.0).abs() < 1.0e-7);
         assert!((path.distance_at(10.0) - 0.1).abs() < 1.0e-7);
+    }
+
+    #[test]
+    fn the_same_curve_runs_outwards_as_a_pull_back() {
+        let path = ExponentialDivePath {
+            overview_distance: Qf32::from_f32(0.1),
+            minimum_distance: Qf32::from_f32(10.0),
+            overview_duration: 0.0,
+            dive_duration: 4.0,
+        };
+        path.validate().unwrap();
+        assert!((path.distance_at(0.0) - 0.1).abs() < 1.0e-7);
+        assert!((path.distance_at(2.0) - 1.0).abs() < 1.0e-6);
+        assert!((path.distance_at(4.0) - 10.0).abs() < 1.0e-5);
     }
 
     #[test]

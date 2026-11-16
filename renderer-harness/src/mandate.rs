@@ -434,12 +434,15 @@ mod tests {
             retired: Vec::new(),
         };
 
-        // In the portfolio dive and orbit are used; multi-dive is the only
-        // unused motion left once flyover is retired.
+        // In the portfolio dive and orbit are used; once flyover is retired,
+        // multi-dive and pull-back are the unused motions, in either order.
         let first = mandate.redraw(&ledger, AxisId::Motion).unwrap();
-        assert_eq!(first.value, "multi-dive");
+        let second_unused = mandate.redraw(&ledger, AxisId::Motion).unwrap();
+        let mut unused = [first.value.as_str(), second_unused.value.as_str()];
+        unused.sort_unstable();
+        assert_eq!(unused, ["multi-dive", "pull-back"]);
         assert_eq!(mandate.assigned_value(AxisId::Light), Some("backlit"));
-        assert_eq!(mandate.retired.len(), 1);
+        assert_eq!(mandate.retired.len(), 2);
 
         // Then the least used of the remaining values: orbit, used once.
         let second = mandate.redraw(&ledger, AxisId::Motion).unwrap();

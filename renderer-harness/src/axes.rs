@@ -56,6 +56,7 @@ axis_enum!(
     /// Camera motion that occupies the most screen time.
     Motion {
         Dive => "dive",
+        PullBack => "pull-back",
         Orbit => "orbit",
         MultiDive => "multi-dive",
         Flyover => "flyover",

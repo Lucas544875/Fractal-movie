@@ -86,7 +86,14 @@ impl Stage {
     pub const fn gates(self) -> &'static [&'static str] {
         match self {
             Self::Scout => &["locations-selected", "novelty", "cost-ceiling"],
-            Self::Brief => &["schema", "mandate", "axis-diff"],
+            Self::Brief => &[
+                "schema",
+                "mandate",
+                "axis-diff",
+                "beats",
+                "storyboard",
+                CRITIC_GATE,
+            ],
             Self::Shotlist => &[
                 "schema",
                 "route-safety",

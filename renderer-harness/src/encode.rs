@@ -352,7 +352,7 @@ mod tests {
         write(LOOK_FILE, "look".to_owned());
         write(
             brief::BRIEF_FILE,
-            "version: 1\ntitle: Test Film\nsubject: S.\naxes:\n  scale_regime: mid\n  motion: orbit\n  palette: { primary_hue: teal, key: mid }\n  light: top\n  pacing: fast\nlocations: [loc-0001]\narc: A.\n".to_owned(),
+            "version: 1\ntitle: Test Film\nsubject: S.\naxes:\n  scale_regime: mid\n  motion: orbit\n  palette: { primary_hue: teal, key: mid }\n  light: top\n  pacing: fast\nlocations: [loc-0001]\narc: A.\nbeats:\n  - { text: The whole shape., location: loc-0001, viewpoint: vp-1, motion: { kind: orbit, revolutions: 0.2 } }\n  - { text: Closer., location: loc-0001, viewpoint: vp-2, motion: { kind: dive, depth: 0.6 } }\n".to_owned(),
         );
         brief::save_axes(
             &production,

@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     axes::{Axes, AxisId, Light, Motion, Pacing, Palette, ScaleRegime},
+    budget::Budget,
     cut::{self, Format, MotionSpec},
     ledger::{AxisDiffViolation, Ledger},
     mandate::{InfeasibleReport, Mandate, MandateViolation, resolve_infeasible},
@@ -29,7 +30,7 @@ const MAX_TITLE_CHARS: usize = 80;
 const MAX_SUBJECT_CHARS: usize = 120;
 const MAX_ARC_CHARS: usize = 400;
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Brief {
     pub version: u32,
@@ -43,6 +44,97 @@ pub struct Brief {
     pub locations: Vec<String>,
     /// How the film develops from first cut to last.
     pub arc: String,
+    /// The arc as a sequence of moments, each tied to a scouted view and a
+    /// motion from the vocabulary, so that it can be checked and drawn
+    /// before any cut is planned.
+    pub beats: Vec<Beat>,
+}
+
+/// One moment of the arc.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Beat {
+    /// What the viewer sees and feels at this moment, in one line.
+    pub text: String,
+    pub location: String,
+    pub viewpoint: String,
+    pub motion: MotionSpec,
+}
+
+/// What the beat check found for one beat.
+#[derive(Clone, Debug, Serialize)]
+pub struct BeatCheck {
+    pub beat: usize,
+    pub motion: Motion,
+    /// Empty when the beat can be filmed as written.
+    pub problems: Vec<String>,
+}
+
+/// Hash of the brief the last successful check judged.
+pub const CHECKED_HASH_FILE: &str = "compiled/brief.hash";
+
+/// The brief, provided it is the one the last `brief check` judged.
+pub fn load_checked(production: &Production) -> Result<Brief> {
+    let text = fs::read_to_string(production.path(BRIEF_FILE))
+        .with_context(|| format!("could not read {BRIEF_FILE}"))?;
+    let checked = fs::read_to_string(production.path(CHECKED_HASH_FILE)).unwrap_or_default();
+    if checked.trim() != crate::shotlist::content_hash(&text) {
+        bail!("{BRIEF_FILE} changed after it was checked; run `brief check` again");
+    }
+    serde_yaml_ng::from_str(&text)
+        .with_context(|| format!("{BRIEF_FILE} does not match the brief schema"))
+}
+
+/// Compiles every beat on its location with a nominal duration and walks
+/// its route, so that a beat the vocabulary cannot film is found before
+/// anything is rendered.
+pub fn check_beats(
+    production: &Production,
+    brief: &Brief,
+    index: &Index,
+    tuning: &Tuning,
+) -> Vec<BeatCheck> {
+    brief
+        .beats
+        .iter()
+        .enumerate()
+        .map(|(position, beat)| {
+            let mut problems = Vec::new();
+            let result = (|| -> Result<cut::Route> {
+                let record = &index.locations[&beat.location];
+                let viewpoint = load_scene(scout::viewpoint_scene_path(
+                    production,
+                    &beat.location,
+                    &beat.viewpoint,
+                ))?;
+                let scene = cut::compile(
+                    &viewpoint,
+                    &record.survey(),
+                    &beat.motion,
+                    tuning.storyboard.beat_seconds,
+                    &PROBE_FORMAT,
+                    "beat",
+                    tuning,
+                )?;
+                cut::check_route(&scene, &record.survey(), tuning)
+            })();
+            match result {
+                Ok(route) if route.safe => {}
+                Ok(route) => problems.push(format!(
+                    "the camera comes within {:.4} of the subject distance of a surface at frame {}; at least {} is needed",
+                    route.min_clearance_ratio,
+                    route.worst_frame,
+                    tuning.shotlist.min_clearance_ratio
+                )),
+                Err(error) => problems.push(format!("{error:#}")),
+            }
+            BeatCheck {
+                beat: position + 1,
+                motion: beat.motion.motion(),
+                problems,
+            }
+        })
+        .collect()
 }
 
 /// Axes a director chooses. The formula family is not among them: it follows
@@ -64,6 +156,8 @@ pub struct BriefReport {
     pub axes: Option<Axes>,
     pub mandate_violations: Vec<MandateViolation>,
     pub axis_diff_violations: Vec<AxisDiffViolation>,
+    /// Beats the vocabulary cannot film as written.
+    pub beat_problems: Vec<BeatCheck>,
     /// Set when the mandated motion cannot be realised on any selected
     /// location; the brief was not judged further.
     pub infeasible: Option<InfeasibleReport>,
@@ -93,6 +187,7 @@ pub fn check(
         axes: None,
         mandate_violations: Vec::new(),
         axis_diff_violations: Vec::new(),
+        beat_problems: Vec::new(),
         infeasible: None,
         advanced_to: None,
     };
@@ -104,7 +199,7 @@ pub fn check(
             return Ok(report);
         }
     };
-    report.schema_errors = schema_errors(&brief, &index);
+    report.schema_errors = schema_errors(&brief, &index, &tuning, &production.load_budget()?);
     if !report.schema_errors.is_empty() {
         state.record_gate("schema", false, report.schema_errors.join("; "))?;
         return Ok(report);
@@ -162,14 +257,42 @@ pub fn check(
         },
     )?;
 
+    let checks = check_beats(production, &brief, &index, &tuning);
+    report.beat_problems = checks
+        .into_iter()
+        .filter(|check| !check.problems.is_empty())
+        .collect();
+    state.record_gate(
+        "beats",
+        report.beat_problems.is_empty(),
+        if report.beat_problems.is_empty() {
+            format!("all {} beats can be filmed as written", brief.beats.len())
+        } else {
+            report
+                .beat_problems
+                .iter()
+                .map(|check| format!("beat {}: {}", check.beat, check.problems.join("; ")))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        },
+    )?;
+
     save_axes(production, &axes)?;
+    let text = fs::read_to_string(production.path(BRIEF_FILE))
+        .with_context(|| format!("could not read {BRIEF_FILE}"))?;
+    fs::write(
+        production.path(CHECKED_HASH_FILE),
+        crate::shotlist::content_hash(&text),
+    )
+    .context("could not record the checked brief")?;
     report.axes = Some(axes);
+    // The storyboard and the critic still have to see the beats.
     report.advanced_to = state.advance_if_ready()?;
     Ok(report)
 }
 
 /// Raster used to probe whether a motion can be planned at all.
-const PROBE_FORMAT: Format = Format {
+pub(crate) const PROBE_FORMAT: Format = Format {
     width: 1920,
     height: 1080,
     fps: 30,
@@ -183,7 +306,7 @@ fn motion_feasible(
     motion: Motion,
     tuning: &Tuning,
 ) -> Result<bool> {
-    if matches!(motion, Motion::Orbit | Motion::Dive) {
+    if matches!(motion, Motion::Orbit | Motion::Dive | Motion::PullBack) {
         // These start from a scouted viewpoint and always plan.
         return Ok(true);
     }
@@ -237,7 +360,7 @@ pub(crate) fn save_axes(production: &Production, axes: &Axes) -> Result<()> {
     fs::write(&path, text).with_context(|| format!("could not write {}", path.display()))
 }
 
-fn schema_errors(brief: &Brief, index: &Index) -> Vec<String> {
+fn schema_errors(brief: &Brief, index: &Index, tuning: &Tuning, budget: &Budget) -> Vec<String> {
     let mut errors = Vec::new();
     if brief.version != BRIEF_VERSION {
         errors.push(format!(
@@ -274,6 +397,38 @@ fn schema_errors(brief: &Brief, index: &Index) -> Vec<String> {
             ));
         }
     }
+
+    let (fewest, most) = (tuning.storyboard.min_beats, budget.film.max_cuts);
+    if !(fewest..=most).contains(&brief.beats.len()) {
+        errors.push(format!(
+            "the brief has {} beats; it must have {fewest} to {most}",
+            brief.beats.len()
+        ));
+    }
+    for (position, beat) in brief.beats.iter().enumerate() {
+        let number = position + 1;
+        let length = beat.text.trim().chars().count();
+        if length == 0 || length > MAX_SUBJECT_CHARS || beat.text.trim().contains('\n') {
+            errors.push(format!(
+                "beat {number}: text must be one line of 1 to {MAX_SUBJECT_CHARS} characters"
+            ));
+        }
+        if !brief.locations.contains(&beat.location) {
+            errors.push(format!(
+                "beat {number}: location {} is not named in locations",
+                beat.location
+            ));
+        } else if let Some(record) = index.locations.get(&beat.location)
+            && !record
+                .usable_viewpoints()
+                .any(|view| view.id == beat.viewpoint)
+        {
+            errors.push(format!(
+                "beat {number}: {} has no usable viewpoint {}",
+                beat.location, beat.viewpoint
+            ));
+        }
+    }
     errors
 }
 
@@ -301,6 +456,15 @@ axes:
   pacing: medium
 locations: [loc-0001, loc-0003]
 arc: Open on the whole reef, descend between the plates, end looking back out.
+beats:
+  - text: The pale reef seen whole.
+    location: loc-0001
+    viewpoint: vp-2
+    motion: { kind: orbit, revolutions: 0.1 }
+  - text: Pulling back from the plates.
+    location: loc-0003
+    viewpoint: vp-1
+    motion: { kind: pull-back, factor: 1.5 }
 ";
 
     /// A production in the brief stage with loc-0001 and loc-0003 selected.
@@ -313,6 +477,7 @@ arc: Open on the whole reef, descend between the plates, end looking back out.
         let production =
             Production::create(&root, "film", &Ledger::default(), 1, Budget::default()).unwrap();
         seed_index(&production);
+        seed_scenes(&production);
         let mut state = production.load_state().unwrap();
         crate::scout::select(
             &production,
@@ -324,6 +489,46 @@ arc: Open on the whole reef, descend between the plates, end looking back out.
         .unwrap();
         assert_eq!(state.stage, Stage::Brief);
         (production, state, root)
+    }
+
+    /// Gives the usable seeded viewpoints real scenes, so beats on them can
+    /// be compiled. All of them show one generated julia-box shape.
+    fn seed_scenes(production: &Production) {
+        use crate::{rng::Rng, shape, tuning::Scouting};
+        let mut rng = Rng::new(21);
+        let (shape, viewpoint) = loop {
+            let Some(shape) = shape::discover(&mut rng, crate::axes::FormulaFamily::JuliaBox)
+            else {
+                continue;
+            };
+            if !shape.survey.bounded {
+                continue;
+            }
+            if let Some(viewpoint) = shape::viewpoints(&mut rng, &shape, &Scouting::default())
+                .into_iter()
+                .find(|viewpoint| viewpoint.scale_regime == ScaleRegime::Mid)
+            {
+                break (shape, viewpoint);
+            }
+        };
+        let config = shape::thumbnail_config(&shape, &viewpoint, 320, 180, 1, &Scouting::default());
+        for (location, view) in [
+            ("loc-0000", "vp-1"),
+            ("loc-0001", "vp-2"),
+            ("loc-0003", "vp-1"),
+        ] {
+            scout::save_viewpoint_scene(production, location, view, &config).unwrap();
+        }
+        // The seeded records describe this shape.
+        let mut index = Index::load(production).unwrap();
+        for record in index.locations.values_mut() {
+            record.radius = shape.survey.radius;
+        }
+        fs::write(
+            production.path("scout/index.json"),
+            serde_json::to_string(&index).unwrap(),
+        )
+        .unwrap();
     }
 
     fn write_brief(production: &Production, text: &str) {
@@ -340,7 +545,7 @@ arc: Open on the whole reef, descend between the plates, end looking back out.
     }
 
     #[test]
-    fn a_valid_brief_passes_and_advances() {
+    fn a_valid_brief_passes_its_concept_gates() {
         let (production, mut state, root) = brief_stage("valid");
         write_brief(&production, VALID_BRIEF);
         let report = check(
@@ -352,8 +557,12 @@ arc: Open on the whole reef, descend between the plates, end looking back out.
         .unwrap();
 
         assert!(report.schema_errors.is_empty(), "{report:?}");
-        assert_eq!(report.advanced_to, Some(Stage::Shotlist));
-        assert_eq!(state.stage, Stage::Shotlist);
+        assert!(report.beat_problems.is_empty(), "{report:?}");
+        // The concept passes; the storyboard and the critic come next.
+        assert_eq!(report.advanced_to, None);
+        assert_eq!(state.stage, Stage::Brief);
+        assert_eq!(state.unmet_gates(), vec!["storyboard", "critic"]);
+        assert!(load_checked(&production).is_ok());
         // The seeded locations are julia-box; the family comes from them.
         let axes = report.axes.unwrap();
         assert_eq!(axes.formula_family, FormulaFamily::JuliaBox);
@@ -490,8 +699,8 @@ arc: Open on the whole reef, descend between the plates, end looking back out.
             banned_families: Vec::new(),
             ..mandate
         };
-        let report = check(&production, &mut state, &mut mandate, &ledger).unwrap();
-        assert_eq!(report.advanced_to, Some(Stage::Shotlist));
+        check(&production, &mut state, &mut mandate, &ledger).unwrap();
+        assert_eq!(state.unmet_gates(), vec!["storyboard", "critic"]);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -532,6 +741,84 @@ arc: Open on the whole reef, descend between the plates, end looking back out.
         // The redrawn mandate is what later commands will read.
         assert_eq!(production.load_mandate().unwrap(), mandate);
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn beats_the_vocabulary_cannot_film_fail_their_gate() {
+        let (production, mut state, root) = brief_stage("beats");
+        // A flyover needs a bounded shape; mark the location as space filling.
+        let mut index = Index::load(&production).unwrap();
+        index.locations.get_mut("loc-0003").unwrap().bounded = false;
+        fs::write(
+            production.path("scout/index.json"),
+            serde_json::to_string(&index).unwrap(),
+        )
+        .unwrap();
+        write_brief(
+            &production,
+            &VALID_BRIEF.replace(
+                "motion: { kind: pull-back, factor: 1.5 }",
+                "motion: { kind: flyover, travel: 0.5, height: 0.3 }",
+            ),
+        );
+        let report = check(
+            &production,
+            &mut state,
+            &mut no_mandate(),
+            &Ledger::default(),
+        )
+        .unwrap();
+        assert!(report.schema_errors.is_empty(), "{report:?}");
+        assert_eq!(report.beat_problems.len(), 1);
+        assert_eq!(report.beat_problems[0].beat, 2);
+        assert!(report.beat_problems[0].problems[0].contains("bounded shape"));
+        assert!(!state.gates["beats"].passed);
+        assert!(state.gates["beats"].detail.starts_with("beat 2:"));
+        // The rest of the concept is still judged.
+        assert!(state.gates["mandate"].passed && state.gates["axis-diff"].passed);
+
+        // Editing the brief invalidates the check until it is run again.
+        write_brief(&production, VALID_BRIEF);
+        assert!(load_checked(&production).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn beats_must_name_scouted_views_and_fit_the_film() {
+        let (production, mut state, root) = brief_stage("beat-schema");
+        let errors = |state: &mut State, text: &str| {
+            write_brief(&production, text);
+            check(&production, state, &mut no_mandate(), &Ledger::default())
+                .unwrap()
+                .schema_errors
+                .join("\n")
+        };
+        let found = errors(
+            &mut state,
+            &VALID_BRIEF.replace("viewpoint: vp-2", "viewpoint: vp-9"),
+        );
+        assert!(
+            found.contains("beat 1: loc-0001 has no usable viewpoint vp-9"),
+            "{found}"
+        );
+        let found = errors(
+            &mut state,
+            &VALID_BRIEF.replace("location: loc-0003", "location: loc-0000"),
+        );
+        assert!(
+            found.contains("beat 2: location loc-0000 is not named"),
+            "{found}"
+        );
+        let one_beat = &VALID_BRIEF[..VALID_BRIEF.find("  - text: Pulling").unwrap()];
+        let found = errors(&mut state, one_beat);
+        assert!(found.contains("1 beats; it must have 2 to"), "{found}");
+        // Motions outside the vocabulary are rejected by the schema itself.
+        let found = errors(
+            &mut state,
+            &VALID_BRIEF.replace("kind: pull-back", "kind: crane"),
+        );
+        assert!(found.contains("schema"), "{found}");
         fs::remove_dir_all(root).unwrap();
     }
 

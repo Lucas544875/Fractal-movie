@@ -22,6 +22,7 @@ pub struct Tuning {
     pub legibility: LegibilityLimits,
     pub classification: Classification,
     pub shotlist: ShotlistRules,
+    pub storyboard: StoryboardRules,
     pub look: LookRules,
     pub proof: ProofRules,
     pub encode: EncodeRules,
@@ -230,6 +231,31 @@ impl Default for ShotlistRules {
             max_cut_seconds: 60.0,
             min_cut_differences: 2,
             min_clearance_ratio: 0.02,
+        }
+    }
+}
+
+/// How the beats of a brief are checked and drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StoryboardRules {
+    /// Duration a beat's motion is planned with before the shot list fixes
+    /// real durations.
+    pub beat_seconds: f64,
+    /// Width of storyboard frames.
+    pub width: u32,
+    pub samples_per_pixel: u32,
+    /// Fewest beats a brief may have; the most is the film's cut limit.
+    pub min_beats: usize,
+}
+
+impl Default for StoryboardRules {
+    fn default() -> Self {
+        Self {
+            beat_seconds: 8.0,
+            width: 320,
+            samples_per_pixel: 2,
+            min_beats: 2,
         }
     }
 }
@@ -486,6 +512,18 @@ impl Tuning {
             bail!("legibility negative-space limits must be ordered within 0..=1");
         }
 
+        let storyboard = &self.storyboard;
+        if !(storyboard.beat_seconds.is_finite()
+            && (self.shotlist.min_cut_seconds..=self.shotlist.max_cut_seconds)
+                .contains(&storyboard.beat_seconds))
+            || storyboard.width < 64
+            || storyboard.samples_per_pixel == 0
+            || storyboard.samples_per_pixel > fractal_renderer_core::MAX_SAMPLES_PER_PIXEL
+            || storyboard.min_beats == 0
+        {
+            bail!("storyboard settings are out of range; beat_seconds must be a valid cut length");
+        }
+
         let look = &self.look;
         let steps_limit = fractal_renderer_core::MAX_SECONDARY_RAY_STEPS;
         if look.preview_width < 64
@@ -628,6 +666,8 @@ mod tests {
             |tuning| tuning.classification.medium_cut_seconds = 20.0,
             |tuning| tuning.shotlist.min_cut_differences = 4,
             |tuning| tuning.shotlist.min_transition_cut_seconds = 0.5,
+            |tuning| tuning.storyboard.beat_seconds = 600.0,
+            |tuning| tuning.storyboard.min_beats = 0,
             |tuning| tuning.look.preview_effect_steps = 0,
             |tuning| tuning.look.aperture_ratio = 0.0,
             |tuning| tuning.look.max_clipped_high = 2.0,

@@ -22,7 +22,9 @@ use fractal_renderer_harness::{
     quality::{FrameLimits, decide},
     scout, shotlist,
     stage::{InfeasibleOutcome, ReviewOutcome, Stage, Verdict},
+    storyboard,
     tuning::{DEFAULT_TUNING_FILE, Tuning},
+    vocabulary,
 };
 use serde_json::{Value, json};
 
@@ -138,6 +140,31 @@ enum Command {
     Brief {
         #[command(subcommand)]
         command: BriefCommand,
+    },
+
+    /// Draw the first and last frame of every beat of the checked brief.
+    Storyboard {
+        id: String,
+
+        #[command(flatten)]
+        gpu: GpuArgs,
+    },
+
+    /// Record vocabulary a beat needed and the harness lacks. The
+    /// production carries on with what exists.
+    Request {
+        id: String,
+
+        #[arg(long, value_enum)]
+        kind: RequestKind,
+
+        /// The moment of the film that could not be expressed.
+        #[arg(long)]
+        beat: String,
+
+        /// What is missing.
+        #[arg(long)]
+        need: String,
     },
 
     /// Check shotlist.yaml: compile every cut, walk its camera route, and
@@ -347,6 +374,27 @@ enum ReviewCommand {
         #[arg(long)]
         notes: String,
     },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum RequestKind {
+    Motion,
+    Shape,
+    Material,
+    Light,
+    Other,
+}
+
+impl From<RequestKind> for vocabulary::Kind {
+    fn from(kind: RequestKind) -> Self {
+        match kind {
+            RequestKind::Motion => Self::Motion,
+            RequestKind::Shape => Self::Shape,
+            RequestKind::Material => Self::Material,
+            RequestKind::Light => Self::Light,
+            RequestKind::Other => Self::Other,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -628,6 +676,37 @@ fn run(cli: Cli) -> Result<Value> {
                 ))?;
             }
             with_report(&production, "brief", &report, &[])
+        }
+        Command::Storyboard { id, gpu } => {
+            let production = Production::open(&cli.root, &id)?;
+            let mut state = production.load_state()?;
+            let mut budget = production.load_budget()?;
+            let report = storyboard::run(&production, &mut state, &mut budget, &gpu.options())?;
+            production.save_state(&state)?;
+            with_report(&production, "storyboard", &report, &[])
+        }
+        Command::Request {
+            id,
+            kind,
+            beat,
+            need,
+        } => {
+            let production = Production::open(&cli.root, &id)?;
+            let count = vocabulary::record(
+                &cli.ledger,
+                &vocabulary::Request {
+                    production: id,
+                    stage: production.load_state()?.stage,
+                    kind: kind.into(),
+                    beat,
+                    need,
+                },
+            )?;
+            Ok(json!({
+                "ok": true,
+                "recorded": count,
+                "note": "the request is kept for later; continue with the vocabulary that exists",
+            }))
         }
         Command::Shotlist {
             command: ShotlistCommand::Check { id },

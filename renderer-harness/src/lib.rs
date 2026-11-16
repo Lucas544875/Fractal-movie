@@ -33,4 +33,6 @@ pub mod shape;
 pub mod sheet;
 pub mod shotlist;
 pub mod stage;
+pub mod storyboard;
 pub mod tuning;
+pub mod vocabulary;

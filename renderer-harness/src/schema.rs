@@ -12,7 +12,7 @@ pub const FILES: [&str; 3] = ["brief", "shotlist", "look"];
 /// The template of `file`, with the limits of this production filled in.
 pub fn template(file: &str, tuning: &Tuning, budget: &Budget) -> Result<String> {
     Ok(match file {
-        "brief" => brief(tuning),
+        "brief" => brief(tuning, budget),
         "shotlist" => shotlist(tuning, budget),
         "look" => look(),
         other => bail!("there is no template for {other:?}; choose one of {FILES:?}"),
@@ -23,7 +23,7 @@ fn values(axis: AxisId) -> String {
     axis.domain().join(" | ")
 }
 
-fn brief(tuning: &Tuning) -> String {
+fn brief(tuning: &Tuning, budget: &Budget) -> String {
     let scouting = &tuning.scouting;
     format!(
         "\
@@ -46,6 +46,25 @@ locations: [loc-0007, loc-0004] # {fewest} to {most} selected locations; the fir
                                 # primary location and must get the most screen time
 arc: Circle the block city, glide over its roofs, and pull back out.
                                 # at most 400 characters
+beats:                          # the arc as {fewest_beats} to {most_beats} moments, in order. Each is
+                                # checked and drawn before any cut is planned, so
+                                # write only what a location and a motion can show.
+  - text: The whole city floats in the dark.     # one line, at most 120 characters
+    location: loc-0007          # a location named above
+    viewpoint: vp-1             # a viewpoint of it shown on a contact sheet
+    motion: {{ kind: orbit, revolutions: 0.15 }}
+                                # any motion of the shot list vocabulary; see
+                                # `schema shotlist` for the kinds and their ranges
+  - text: Gliding low over the rooftops.
+    location: loc-0007
+    viewpoint: vp-2
+    motion: {{ kind: flyover, travel: 0.6, height: 0.3, look_ahead: 0.3 }}
+  - text: Pulling back until the neighbouring cube enters the frame.
+    location: loc-0004
+    viewpoint: vp-1
+    motion: {{ kind: pull-back, factor: 3.0 }}
+# A beat that no motion or location can show cannot be filmed. Rewrite it, and
+# record what was missing with `request` so the vocabulary can grow later.
 ",
         scale = values(AxisId::ScaleRegime),
         motion = values(AxisId::Motion),
@@ -56,6 +75,8 @@ arc: Circle the block city, glide over its roofs, and pull back out.
         medium = tuning.classification.medium_cut_seconds,
         fewest = 1,
         most = scouting.max_selected,
+        fewest_beats = tuning.storyboard.min_beats,
+        most_beats = budget.film.max_cuts,
     )
 }
 
@@ -82,7 +103,7 @@ cuts:
     transition_out: crossfade # cut | fade-black | crossfade; the last cut must use cut.
                               # A cut next to a fade or crossfade lasts at least {transition_cut} s.
 
-# The four motions. distance scales the start's distance from the subject
+# The five motions. distance scales the start's distance from the subject
 # relative to the viewpoint (below 1 frames it tighter) and keeps the view
 # direction. Moving the camera too close to a surface fails route-safety.
 #
@@ -92,6 +113,9 @@ cuts:
 #   {{ kind: dive, depth: 0.3, hold_seconds: 0, distance: 1.0 }}
 #       approach the subject; depth = end distance / start distance, 0.001..0.9;
 #       hold_seconds 0..half the cut; distance 0.2..4
+#   {{ kind: pull-back, factor: 3.0, hold_seconds: 0, distance: 1.0 }}
+#       retreat from the subject; factor = end distance / start distance,
+#       1.1..20; hold_seconds 0..half the cut; distance 0.2..4
 #   {{ kind: flyover, travel: 0.6, height: 0.3, look_ahead: 0.3 }}
 #       glide over a surface the harness finds; travel 0.05..2 and height
 #       0.02..1 in shape radii; look_ahead 0 (straight down)..2.
@@ -181,6 +205,10 @@ mod tests {
     fn every_template_parses_as_its_file() {
         let brief: Brief = serde_yaml_ng::from_str(&render("brief")).unwrap();
         assert_eq!(brief.locations.len(), 2);
+        assert_eq!(brief.beats.len(), 3);
+        for beat in &brief.beats {
+            beat.motion.validate(8.0, 60.0).unwrap();
+        }
         let shotlist: Shotlist = serde_yaml_ng::from_str(&render("shotlist")).unwrap();
         shotlist.format.validate().unwrap();
         let look: Look = serde_yaml_ng::from_str(&render("look")).unwrap();
@@ -200,7 +228,7 @@ mod tests {
             .lines()
             .filter_map(|line| line.trim_start_matches(['#', ' ']).strip_prefix("{ kind:"))
             .collect();
-        assert_eq!(motions.len(), 4);
+        assert_eq!(motions.len(), 5);
         for motion in motions {
             let spec: crate::cut::MotionSpec =
                 serde_yaml_ng::from_str(&format!("{{ kind:{motion}")).unwrap();

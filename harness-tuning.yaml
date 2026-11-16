@@ -50,6 +50,11 @@ shotlist:
   max_cut_seconds: 60.0
   min_cut_differences: 2
   min_clearance_ratio: 0.02
+storyboard:
+  beat_seconds: 8.0
+  width: 320
+  samples_per_pixel: 2
+  min_beats: 2
 look:
   preview_width: 480
   preview_samples_per_pixel: 8

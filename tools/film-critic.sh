@@ -21,6 +21,16 @@ production=$root/$id
 stage=$("$harness" --root "$root" --ledger "$ledger" next "$id" |
     python3 -c 'import json, sys; print(json.load(sys.stdin)["stage"])')
 case "$stage" in
+brief)
+    materials=("$production/storyboard/sheet.png" "$production/storyboard/report.json")
+    rubric='1. 各場面について、始点（左）から終点（右）への2枚が、report.json の text の内容を表しているか。とくに運動の向き（寄る、引く、回り込む、滑る）と、写るべきもの（例：「柱の群れ」なら柱が複数並んで見えるか）を確かめる。
+2. 場面を順に並べたとき、主題とアークが成立しているか。とくに最後の場面が、アークの結びとして機能しているか。
+3. 過去作品のキーフレームと比べて焼き直しに見えないか。
+4. 場面同士が、スケールや構図で明確に違うか。
+
+この工程の画像は、形と構図だけを見るために中立の灰色で、低解像度で描かれている。色、光、画質は後の工程で判定するので、不合格の理由にしない。
+ここで不合格にすべきなのは、場面の text がこの絵では表せていない、または表せそうにないものである。その場合は、どの場面がなぜ表せていないかを具体的に書く。企画全体がこのロケ地では成り立たないなら kill にする。'
+    ;;
 shotlist)
     materials=("$production/animatic/sheet.png" "$production/animatic/report.json")
     rubric='1. 各カットの主題が一目で分かり、下の「主題」と一致するか。
