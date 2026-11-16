@@ -189,21 +189,21 @@ title: "…"
 subject: "一文で言える主題"        # 批評役が画像と照合する。1行、120字以内
 axes:
   scale_regime: mid                 # overview | mid | deep
-  motion: pull-back                 # dive | pull-back | orbit | multi-dive | flyover
+  motion: dive                      # dive | orbit | multi-dive | flyover
   palette: { primary_hue: amber, key: high }
   light: backlit                    # frontal | raking | top | backlit
   pacing: medium                    # slow | medium | fast
 locations: [loc-0142, loc-0377]     # S1 で選んだ ID。先頭が主ロケ地
-arc: "導入で全体像、中盤で内部、終盤で引いて終わる"
+arc: "導入で全体像、中盤で内部、終盤で一点へ寄って終わる"
 beats:                              # アークを場面の列で書く。2〜作品の最大カット数
   - text: "群れ全体が闇に浮かぶ"   # その視点と運動で実際に映るものを1行で
     location: loc-0142
     viewpoint: vp-1
-    motion: { kind: orbit, revolutions: 0.15 }   # shotlist と同じ運動の語彙
-  - text: "引いて隣の塊が現れる"
+    motion: { kind: orbit, revolutions: 0.3 }   # shotlist と同じ運動の語彙
+  - text: "隣の塊へ寄っていく"
     location: loc-0142
     viewpoint: vp-2
-    motion: { kind: pull-back, factor: 3.0 }
+    motion: { kind: dive, depth: 0.09 }
 ```
 
 `formula_family` は書かない。主ロケ地（`locations` の先頭）の形状族がそのまま作品の値になる。
@@ -279,11 +279,10 @@ cuts:
 
 | `motion.kind` | 指定 | 内容 |
 |---|---|---|
-| `orbit` | `revolutions`（符号つき、絶対値0.01〜1）、`distance`（省略時1） | 視点の位置から、視点の被写体を中心に周回する |
-| `dive` | `depth`（終了距離/開始距離、0.001〜0.9）、`hold_seconds`（省略時0）、`distance`（省略時1） | 視点の位置から、視線に沿って被写体へ寄る |
-| `pull-back` | `factor`（終了距離/開始距離、1.1〜20）、`hold_seconds`、`distance` | 視点の位置から、視線に沿って被写体から離れ、周囲を見せる |
-| `flyover` | `travel`、`height`（いずれも形状の半径比）、`look_ahead` | ハーネスが探した表面の上を滑空する。視点は光源だけを与える。有界な形状のみ |
-| `multi-dive` | `depth`、`dives`（1〜4） | ハーネスが探した複数の特徴へ、暗転を挟んで順に寄る。有界な形状のみ |
+| `orbit` | `revolutions`（符号つき、絶対値0.01〜2）、`distance`（省略時1） | 視点の位置から、視点の被写体を中心に周回する |
+| `dive` | `depth`（終了距離/開始距離、0.000001〜0.9）、`distance`（省略時1） | 視点の位置から、視線に沿って被写体へ寄る。最初のフレームから動き出す（静止は指定できない） |
+| `flyover` | `travel`（0.1〜4）、`height`（いずれも形状の半径比）、`look_ahead` | ハーネスが探した表面の上を滑空する。視点は光源だけを与える。有界な形状のみ |
+| `multi-dive` | `depth`（0.00000001〜0.5）、`dives`（1〜4） | ハーネスが探した複数の特徴へ、暗転を挟んで順に寄る。有界な形状のみ |
 
 `distance` は開始時のカメラ距離を、ロケハンの視点の距離に対する倍率（0.2〜4）で指定する。1未満で被写体が大きく写る。視線の向きは変わらない。寄せすぎて表面に近づいた場合は経路検査が落とす。
 
@@ -369,7 +368,7 @@ effects_requested:             # 既定はすべてなし
 |---|---|---|
 | `formula_family` | `mandelbulb`、`mandelbox`、`rotated-mandelbox`、`julia-box`、`amazing-surf`、`mandelbox-julia`、`amazing-hybrid` | orbit 命令の集合から自動分類 |
 | `scale_regime` | `overview`、`mid`、`deep` | カメラ距離と形状の外接半径の比から自動分類 |
-| `motion` | `dive`、`pull-back`、`orbit`、`multi-dive`、`flyover` | 尺が最長の運動 |
+| `motion` | `dive`、`orbit`、`multi-dive`、`flyover` | 尺が最長の運動 |
 | `palette` | 主色相 `red`、`amber`、`green`、`teal`、`blue`、`violet`、`neutral` | `look.yaml` から自動抽出。明度キー（`low`、`mid`、`high`）も記録するが、軸の比較は主色相だけで行う |
 | `light` | `frontal`、`raking`、`top`、`backlit` | 光の向きと視線の関係から自動分類。レンダラーの光源は向きだけを持つため、色温度は `palette` 側で扱う |
 | `pacing` | `slow`、`medium`、`fast` | 平均カット尺から自動分類 |
@@ -613,7 +612,7 @@ YouTube の SDR アップロード推奨に合わせる。
 - 全 PNG がデコードでき、解像度が一致する（できなければエンコードを中止し、書きかけのファイルを残さない）。
 - ffprobe の結果（コーデック、画素形式、解像度、フレームレート、色空間、色域レンジ、フレーム数）が 12.1 と一致する。
 - 描画したフレームに真っ黒なものがない。フェードで暗くなるのは合成後なので、検査は合成前のフレームで行う。
-- 最初から最後まで変化しないカットがない。意図的な静止（`dive` の `hold_seconds`）は対象外。
+- 最初から最後まで変化しないカットがない。
 
 台帳に記録する完成日は UTC の日付である。
 

@@ -306,7 +306,7 @@ fn motion_feasible(
     motion: Motion,
     tuning: &Tuning,
 ) -> Result<bool> {
-    if matches!(motion, Motion::Orbit | Motion::Dive | Motion::PullBack) {
+    if matches!(motion, Motion::Orbit | Motion::Dive) {
         // These start from a scouted viewpoint and always plan.
         return Ok(true);
     }
@@ -461,10 +461,10 @@ beats:
     location: loc-0001
     viewpoint: vp-2
     motion: { kind: orbit, revolutions: 0.1 }
-  - text: Pulling back from the plates.
+  - text: Closing in on the plates.
     location: loc-0003
     viewpoint: vp-1
-    motion: { kind: pull-back, factor: 1.5 }
+    motion: { kind: dive, depth: 0.5 }
 ";
 
     /// A production in the brief stage with loc-0001 and loc-0003 selected.
@@ -758,7 +758,7 @@ beats:
         write_brief(
             &production,
             &VALID_BRIEF.replace(
-                "motion: { kind: pull-back, factor: 1.5 }",
+                "motion: { kind: dive, depth: 0.5 }",
                 "motion: { kind: flyover, travel: 0.5, height: 0.3 }",
             ),
         );
@@ -810,13 +810,13 @@ beats:
             found.contains("beat 2: location loc-0000 is not named"),
             "{found}"
         );
-        let one_beat = &VALID_BRIEF[..VALID_BRIEF.find("  - text: Pulling").unwrap()];
+        let one_beat = &VALID_BRIEF[..VALID_BRIEF.find("  - text: Closing").unwrap()];
         let found = errors(&mut state, one_beat);
         assert!(found.contains("1 beats; it must have 2 to"), "{found}");
         // Motions outside the vocabulary are rejected by the schema itself.
         let found = errors(
             &mut state,
-            &VALID_BRIEF.replace("kind: pull-back", "kind: crane"),
+            &VALID_BRIEF.replace("kind: dive", "kind: crane"),
         );
         assert!(found.contains("schema"), "{found}");
         fs::remove_dir_all(root).unwrap();

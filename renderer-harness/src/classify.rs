@@ -117,9 +117,6 @@ pub fn scale_regime(
 #[must_use]
 pub fn motion(path: &AnimationPath) -> Motion {
     match path {
-        AnimationPath::ExponentialDive(path) if path.minimum_distance > path.overview_distance => {
-            Motion::PullBack
-        }
         AnimationPath::ExponentialDive(_) => Motion::Dive,
         AnimationPath::TargetOrbit(_) => Motion::Orbit,
         AnimationPath::MultiTargetDive(_) => Motion::MultiDive,

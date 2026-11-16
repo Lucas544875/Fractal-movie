@@ -44,7 +44,7 @@ axes:                           # the formula family follows from the first loca
                                 # slow >= {slow} s, medium >= {medium} s, fast below
 locations: [loc-0007, loc-0004] # {fewest} to {most} selected locations; the first is the
                                 # primary location and must get the most screen time
-arc: Circle the block city, glide over its roofs, and pull back out.
+arc: Circle the block city, glide over its roofs, and dive into a cube.
                                 # at most 400 characters
 beats:                          # the arc as {fewest_beats} to {most_beats} moments, in order. Each is
                                 # checked and drawn before any cut is planned, so
@@ -52,17 +52,17 @@ beats:                          # the arc as {fewest_beats} to {most_beats} mome
   - text: The whole city floats in the dark.     # one line, at most 120 characters
     location: loc-0007          # a location named above
     viewpoint: vp-1             # a viewpoint of it shown on a contact sheet
-    motion: {{ kind: orbit, revolutions: 0.15 }}
+    motion: {{ kind: orbit, revolutions: 0.3 }}
                                 # any motion of the shot list vocabulary; see
                                 # `schema shotlist` for the kinds and their ranges
   - text: Gliding low over the rooftops.
     location: loc-0007
     viewpoint: vp-2
-    motion: {{ kind: flyover, travel: 0.6, height: 0.3, look_ahead: 0.3 }}
-  - text: Pulling back until the neighbouring cube enters the frame.
+    motion: {{ kind: flyover, travel: 1.2, height: 0.3, look_ahead: 0.3 }}
+  - text: Diving into the neighbouring cube.
     location: loc-0004
     viewpoint: vp-1
-    motion: {{ kind: pull-back, factor: 3.0 }}
+    motion: {{ kind: dive, depth: 0.09 }}
 # A beat that no motion or location can show cannot be filmed. Rewrite it, and
 # record what was missing with `request` so the vocabulary can grow later.
 ",
@@ -98,31 +98,28 @@ cuts:
     role: establishing        # establishing | dive | detail | reveal | transit
     location: loc-0007        # a location named in brief.yaml
     viewpoint: vp-1           # a viewpoint of that location shown on a contact sheet
-    motion: {{ kind: orbit, revolutions: 0.15, distance: 1.0 }}
+    motion: {{ kind: orbit, revolutions: 0.3, distance: 1.0 }}
     duration_seconds: 8
     transition_out: crossfade # cut | fade-black | crossfade; the last cut must use cut.
                               # A cut next to a fade or crossfade lasts at least {transition_cut} s.
 
-# The five motions. distance scales the start's distance from the subject
+# The four motions. distance scales the start's distance from the subject
 # relative to the viewpoint (below 1 frames it tighter) and keeps the view
 # direction. Moving the camera too close to a surface fails route-safety.
 #
-#   {{ kind: orbit, revolutions: 0.15, distance: 1.0 }}
-#       circle the viewpoint's subject; revolutions is signed, |0.01..1|;
+#   {{ kind: orbit, revolutions: 0.3, distance: 1.0 }}
+#       circle the viewpoint's subject; revolutions is signed, |0.01..2|;
 #       distance 0.2..4
-#   {{ kind: dive, depth: 0.3, hold_seconds: 0, distance: 1.0 }}
-#       approach the subject; depth = end distance / start distance, 0.001..0.9;
-#       hold_seconds 0..half the cut; distance 0.2..4
-#   {{ kind: pull-back, factor: 3.0, hold_seconds: 0, distance: 1.0 }}
-#       retreat from the subject; factor = end distance / start distance,
-#       1.1..20; hold_seconds 0..half the cut; distance 0.2..4
-#   {{ kind: flyover, travel: 0.6, height: 0.3, look_ahead: 0.3 }}
-#       glide over a surface the harness finds; travel 0.05..2 and height
+#   {{ kind: dive, depth: 0.09, distance: 1.0 }}
+#       approach the subject from the first frame (no hold, no retreat);
+#       depth = end distance / start distance, 0.000001..0.9; distance 0.2..4
+#   {{ kind: flyover, travel: 1.2, height: 0.3, look_ahead: 0.3 }}
+#       glide over a surface the harness finds; travel 0.1..4 and height
 #       0.02..1 in shape radii; look_ahead 0 (straight down)..2.
 #       Bounded shapes only; the viewpoint only supplies the light.
-#   {{ kind: multi-dive, depth: 0.05, dives: 2 }}
+#   {{ kind: multi-dive, depth: 0.0025, dives: 2 }}
 #       dive towards several features in turn with fades between them;
-#       depth 0.0001..0.5; dives 1..4 with at least 3 s per dive.
+#       depth 0.00000001..0.5; dives 1..4 with at least 3 s per dive.
 #       Bounded shapes only.
 ",
         min_cuts = film.min_cuts,
@@ -228,7 +225,7 @@ mod tests {
             .lines()
             .filter_map(|line| line.trim_start_matches(['#', ' ']).strip_prefix("{ kind:"))
             .collect();
-        assert_eq!(motions.len(), 5);
+        assert_eq!(motions.len(), 4);
         for motion in motions {
             let spec: crate::cut::MotionSpec =
                 serde_yaml_ng::from_str(&format!("{{ kind:{motion}")).unwrap();

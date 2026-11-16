@@ -257,7 +257,7 @@ mod tests {
         let implemented = Resolution {
             request: 1,
             status: Status::Implemented,
-            note: "motion pull-back: { kind: pull-back, factor: 3.0 }".to_owned(),
+            note: "motion dive: { kind: dive, depth: 0.1 }".to_owned(),
         };
         resolve(&ledger, &implemented).unwrap();
         let entries = list(&ledger).unwrap();
