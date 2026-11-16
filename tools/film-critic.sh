@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Reviews the current stage of a production with a critic that runs as its
-# own Claude process, then records the verdict.
+# own model process, then records the verdict.
 #
 # The critic sees the brief's subject and the rendered images only. It never
 # sees the shot list, the look, or the director's reasoning, so it cannot
 # simply confirm what the director intended.
 set -euo pipefail
+source tools/film-agent.sh
+film_select_backend
 
 if [[ $# -ne 1 ]]; then
     echo "usage: tools/film-critic.sh <production-id>" >&2
@@ -125,6 +127,15 @@ print(json.dumps({"permissions": {
 PY
 )
 
+if [[ $FILM_AGENT_BACKEND == codex ]]; then
+    images=(--image "${materials[0]}")
+    if [[ -n $portfolio ]]; then images+=(--image "$portfolio_sheet"); fi
+    # Supply the report directly; the critic need not open design files.
+    prompt+=$'\n\nReport:\n'
+    prompt+=$(cat "${materials[1]}")
+    prompt+=$'\nUse the attached images and report only. Do not read other files or run commands. Return only the requested JSON verdict.'
+    response=$(film_codex critic "$prompt" "${FILM_CRITIC_MODEL:-${FILM_CODEX_MODEL:-}}" "${images[@]}")
+else
 response=$(claude -p "$prompt" \
     --settings "$settings" \
     --tools "Read" \
@@ -132,6 +143,7 @@ response=$(claude -p "$prompt" \
     --max-turns 40 \
     ${FILM_CRITIC_MODEL:+--model "$FILM_CRITIC_MODEL"} \
     --output-format json)
+fi
 
 # The critic answers with one JSON object; anything else is not a verdict.
 read -r verdict notes < <(python3 - "$response" <<'PY'

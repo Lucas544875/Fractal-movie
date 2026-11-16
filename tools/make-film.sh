@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Produces one film autonomously: creates the production and hands it to a
-# headless Claude director that may only run the harness, look at its own
+# headless director that may only run the harness, look at its own
 # production, and write its three design files.
 #
 # usage: tools/make-film.sh <production-id> [init options...]
@@ -12,6 +12,8 @@
 # Run from the repository root. Set WGPU_BACKEND (for example to "gl" under
 # WSL) before calling if the default backend does not find the GPU.
 set -euo pipefail
+source tools/film-agent.sh
+film_select_backend
 
 if [[ $# -lt 1 ]]; then
     echo "usage: tools/make-film.sh <production-id> [init options...]" >&2
@@ -90,13 +92,32 @@ session=$(($(find "$root/$id" -maxdepth 1 -name 'director-run-*.json' | wc -l) +
 # The director designs the film. A session can end early, for example at a
 # usage limit; everything it decided is on disk, so running this script
 # again continues where it stopped.
+if [[ $FILM_AGENT_BACKEND == codex ]]; then
+    prompt=$(python3 - "$id" <<'PYPROMPT'
+from pathlib import Path
+import sys
+text = Path('.claude/skills/fractal-film/SKILL.md').read_text()
+text = text.split('---', 2)[-1].replace('$ARGUMENTS', sys.argv[1])
+print(text)
+print("Use Codex image viewing for Read of images and apply_patch for Write/Edit. "
+      "Read only this production's artifacts, excluding compiled/. "
+      "Do not read source code, tools, docs, tuning, portfolio, scenes, or other productions. "
+      "Only edit brief.yaml, shotlist.yaml and look.yaml. "
+      "Run only the harness's permitted stage commands and tools/film-critic.sh. "
+      "Do not run init, ledger, measure, tuning write, vocabulary, produce, encode, or review submit.")
+PYPROMPT
+)
+    film_codex director "$prompt" "${FILM_DIRECTOR_MODEL:-${FILM_CODEX_MODEL:-}}" \
+        >"$root/$id/director-run-$session.json"
+else
 claude -p "/fractal-film $id" \
     --settings "$settings" \
     --tools "Bash,Read,Write,Edit" \
     --permission-mode dontAsk \
     --max-turns 600 \
     ${FILM_DIRECTOR_MODEL:+--model "$FILM_DIRECTOR_MODEL"} \
-    --output-format json >"$root/$id/director-run-$session.json" || true
+    --output-format json >"$root/$id/director-run-$session.json"
+fi
 
 # Rendering and encoding involve no decisions, so no model is involved.
 stage() {

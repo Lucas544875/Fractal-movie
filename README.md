@@ -629,3 +629,25 @@ WGPU_BACKEND=gl cargo run --release -p fractal-renderer-cli -- render \
 4. Phase 4（完了）: configurable FFmpeg integration、検証付き動画encode
 5. Phase 5（完了）: HDR accumulation、AO、soft shadow、reflection、thin-lens DOF、tone mapping
 6. Phase 6（完了）: typed fractal DSL/AST、限定的なWGSL生成とvalidation
+
+## 自律制作のモデル選択
+
+`tools/make-film.sh <production-id>` は `CODEX_THREAD_ID` または
+`CODEX_SESSION_ID` がある場合に Codex CLI を、それ以外では Claude CLI を使います。
+選択は子プロセスへ引き継がれ、`tools/film-critic.sh` も同じバックエンドを使います。
+`FILM_AGENT_BACKEND=codex|claude` で明示的に変更できます。
+
+Codex のモデルは CLI の既定設定を使います。親チャットのモデル名は自動継承しません。
+`FILM_CODEX_MODEL` で両担当の共通モデルを指定でき、`FILM_DIRECTOR_MODEL` と
+`FILM_CRITIC_MODEL` は各担当の指定として優先されます。Claude 用モデル名を
+設定している場合は、バックエンドの変更時に更新してください。
+
+```bash
+FILM_AGENT_BACKEND=codex WGPU_BACKEND=gl tools/make-film.sh my-film --seed 7
+```
+
+Codex の監督は workspace-write、批評担当は read-only sandbox で実行します。
+Claude のファイル別・コマンド別 allow/deny と同等の制限ではありません。
+監督の閲覧範囲と編集可能な3ファイルはプロンプトで指示し、批評担当には画像と
+レポートを直接渡します。Codex の sandbox 自体は指定外ファイルの読み取りを防ぎません。
+モデル実行が失敗した場合はスクリプトも失敗として終了し、制作を成功扱いしません。
