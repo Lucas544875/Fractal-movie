@@ -331,10 +331,17 @@ mod tests {
             0.0,
             "almost nothing",
         );
-        check(
-            |value| value.negative_space_ratio = 0.02,
-            0.0,
-            "detail fills",
+        let mut walled = readable();
+        walled.negative_space_ratio = 0.02;
+        assert!(problems(&walled, 0.0, &LegibilityLimits::default()).is_empty());
+        let strict = LegibilityLimits {
+            min_negative_space: 0.08,
+            ..LegibilityLimits::default()
+        };
+        assert!(
+            problems(&walled, 0.0, &strict)
+                .join("\n")
+                .contains("detail fills")
         );
         check(|value| value.high_frequency_ratio = 0.6, 0.0, "fine detail");
         check(

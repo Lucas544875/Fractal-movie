@@ -919,6 +919,15 @@ fn render_animation(
         AnimationPath::SurfaceFlyover(_) => {
             println!("Path: surface-flyover (DE normal + probed tangent)")
         }
+        AnimationPath::Flythrough(path) => match path.summary() {
+            Some(summary) => println!(
+                "Path: flythrough (zoom e^{:.1}, {:.0} scales of travel, {:.0}% enclosed)",
+                summary.zoom_e_folds,
+                summary.travel_scales,
+                summary.enclosure * 100.0
+            ),
+            None => println!("Path: flythrough"),
+        },
     }
     println!("Output: {}", output_directory.display());
     if request.frame.is_some()
@@ -1323,6 +1332,7 @@ const fn precision_label(precision: Precision) -> &'static str {
     match precision {
         Precision::F32 => "f32",
         Precision::QuadFloat => "quad-float (4xf32)",
+        Precision::CameraRelative => "camera-relative (f64 reference orbit, f32 differences)",
     }
 }
 

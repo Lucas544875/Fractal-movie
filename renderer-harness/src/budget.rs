@@ -37,9 +37,10 @@ pub struct FilmLimits {
 impl Default for FilmLimits {
     fn default() -> Self {
         Self {
+            // A single take of up to three minutes is a film too.
             min_duration_seconds: 45.0,
-            max_duration_seconds: 90.0,
-            min_cuts: 4,
+            max_duration_seconds: 180.0,
+            min_cuts: 1,
             max_cuts: 8,
         }
     }

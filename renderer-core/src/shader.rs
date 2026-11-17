@@ -39,7 +39,11 @@ pub(crate) fn fractal_source(fractal: &FractalConfig, precision: Precision) -> R
         FractalConfig::Mandelbulb(_) => MANDELBULB,
         FractalConfig::Mandelbox(_) => MANDELBOX,
         FractalConfig::Dsl(config) => {
-            generated = config.generate_wgsl()?;
+            generated = if precision == Precision::CameraRelative {
+                config.generate_relative_wgsl()?
+            } else {
+                config.generate_wgsl()?
+            };
             &generated
         }
     };

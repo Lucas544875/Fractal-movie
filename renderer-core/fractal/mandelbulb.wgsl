@@ -73,3 +73,11 @@ fn apply_fractal_atmosphere(surface: vec3<f32>, sky: vec3<f32>, travel: f32) -> 
     let fog = 1.0 - exp(-0.012 * travel * travel);
     return mix(surface, sky, fog);
 }
+
+fn fractal_glow_weight(distance: f32, travel: f32) -> f32 {
+    return 0.0;
+}
+
+fn fractal_haze(color: vec3<f32>, travel: f32, hit: bool, glow: f32) -> vec3<f32> {
+    return color;
+}

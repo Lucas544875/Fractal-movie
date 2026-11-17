@@ -103,7 +103,7 @@ cuts:
     transition_out: crossfade # cut | fade-black | crossfade; the last cut must use cut.
                               # A cut next to a fade or crossfade lasts at least {transition_cut} s.
 
-# The four motions. distance scales the start's distance from the subject
+# The five motions. distance scales the start's distance from the subject
 # relative to the viewpoint (below 1 frames it tighter) and keeps the view
 # direction. Moving the camera too close to a surface fails route-safety.
 #
@@ -121,6 +121,13 @@ cuts:
 #       dive towards several features in turn with fades between them;
 #       depth 0.00000001..0.5; dives 1..4 with at least 3 s per dive.
 #       Bounded shapes only.
+#   {{ kind: flythrough, depth: 0.001, direction: out, roll: 0.3 }}
+#       one take between a point deep inside the shape and a view of all of
+#       it, through open space the harness finds. depth is the clearance at
+#       the deep end in shape radii, 0.00000001..0.02; direction out (deep
+#       first) or in; roll is turns about the line of sight, -4..4. May last
+#       up to {max_flythrough} s. Bounded shapes only; the viewpoint only
+#       supplies the light.
 ",
         min_cuts = film.min_cuts,
         max_cuts = film.max_cuts,
@@ -128,6 +135,7 @@ cuts:
         max_seconds = film.max_duration_seconds,
         min_cut = rules.min_cut_seconds,
         max_cut = rules.max_cut_seconds,
+        max_flythrough = rules.max_flythrough_seconds,
         differences = rules.min_cut_differences,
         transition_cut = rules.min_transition_cut_seconds,
     )
@@ -160,7 +168,15 @@ material:
   metallic_specular_strength: 0 # 0..16
   metallic_shininess: 30        # 1..512
   rim_strength: 0.18            # 0..16
-atmosphere: { fog: 0.1 }        # share of sky mixed in at the subject; 0 turns fog off
+atmosphere:
+  fog: 0.1                      # share of sky mixed in at the subject; 0 turns fog off
+  # Optional. Coloured haze that swallows distant structure and keeps its look
+  # at every scale, which suits a flythrough. distance is where it has taken
+  # all but 1/e of the light, in subject distances (local scales in a
+  # flythrough); the foreground stays clear. far_color also replaces the sky.
+  haze: { distance: 30, near_color: [0.95, 0.85, 0.35], mid_color: [0.1, 0.28, 0.55], far_color: [0.85, 0.93, 1.0] }
+  # Optional. Light on silhouettes seen against the haze.
+  glow: { strength: 0.7, width_degrees: 1.2, color: [1.0, 0.85, 0.3] }
 light: { azimuth_degrees: 150, elevation_degrees: 25 }
                                 # relative to the camera: azimuth 0 = behind the
                                 # camera, 90 = its right, 180 = behind the subject
@@ -225,7 +241,7 @@ mod tests {
             .lines()
             .filter_map(|line| line.trim_start_matches(['#', ' ']).strip_prefix("{ kind:"))
             .collect();
-        assert_eq!(motions.len(), 4);
+        assert_eq!(motions.len(), 5);
         for motion in motions {
             let spec: crate::cut::MotionSpec =
                 serde_yaml_ng::from_str(&format!("{{ kind:{motion}")).unwrap();
@@ -250,7 +266,7 @@ mod tests {
         let mut budget = Budget::default();
         budget.film.max_cuts = 5;
         let text = template("shotlist", &tuning, &budget).unwrap();
-        assert!(text.contains("4 to 5 cuts"), "{text}");
+        assert!(text.contains("1 to 5 cuts"), "{text}");
         assert!(text.contains("1 to 20 s"), "{text}");
         assert!(render("brief").contains("overview | mid | deep"));
     }

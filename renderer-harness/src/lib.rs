@@ -9,6 +9,7 @@ pub mod animatic;
 pub mod axes;
 pub mod brief;
 pub mod budget;
+pub mod calibrate;
 pub mod classify;
 pub mod cut;
 pub mod describe;

@@ -7,7 +7,7 @@ use std::{collections::BTreeMap, fs};
 
 use anyhow::{Context, Result, bail};
 use fractal_renderer_core::{
-    AmbientOcclusionConfig, DslMaterial, DslPaletteStop, FractalConfig, LoadedScene,
+    AmbientOcclusionConfig, AnimationPath, DslMaterial, DslPaletteStop, FractalConfig, LoadedScene,
     PostProcessConfig, ReflectionConfig, Renderer, SoftShadowConfig, ToneMappingConfig,
     ToneMappingOperator, load_scene,
 };
@@ -133,13 +133,57 @@ const fn default_rim() -> f32 {
 pub struct Atmosphere {
     /// Share of sky mixed into the subject, as an optical depth. Zero turns
     /// fog off. It is scaled to each cut's subject distance.
+    #[serde(default = "default_fog")]
     pub fog: f64,
+    /// Coloured haze that swallows distant structure. It keeps its look as
+    /// the camera changes scale, so it suits moves that cross many levels.
+    #[serde(default)]
+    pub haze: Option<Haze>,
+    /// Light gathered along silhouettes.
+    #[serde(default)]
+    pub glow: Option<Glow>,
+}
+
+const fn default_fog() -> f64 {
+    0.1
 }
 
 impl Default for Atmosphere {
     fn default() -> Self {
-        Self { fog: 0.1 }
+        Self {
+            fog: default_fog(),
+            haze: None,
+            glow: None,
+        }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Haze {
+    /// Distance at which the haze has absorbed all but 1/e of the light, in
+    /// subject distances; in local scales for a flythrough. The foreground
+    /// stays clear.
+    pub distance: f32,
+    /// Haze colour where it is thin, half opaque, and opaque. The last also
+    /// replaces the background.
+    pub near_color: [f32; 3],
+    pub mid_color: [f32; 3],
+    pub far_color: [f32; 3],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Glow {
+    pub strength: f32,
+    /// Angular reach around a silhouette, in degrees.
+    #[serde(default = "default_glow_width")]
+    pub width_degrees: f32,
+    pub color: [f32; 3],
+}
+
+const fn default_glow_width() -> f32 {
+    1.2
 }
 
 /// Key light, relative to the camera at the middle of each cut.
@@ -261,11 +305,10 @@ pub fn grade(look: &Look, cut_id: u32, cut: &LoadedScene, tuning: &Tuning) -> Re
 
     let material_ignored = match &mut config.fractal {
         FractalConfig::Dsl(dsl) => {
-            dsl.material = look
-                .material
-                .to_material(
-                    shape::subject_fog_density(subject_distance, look.atmosphere.fog) as f32,
-                );
+            dsl.material = look.material.to_material(
+                shape::subject_fog_density(subject_distance, look.atmosphere.fog) as f32,
+                &look.atmosphere,
+            );
             false
         }
         FractalConfig::Mandelbulb(_) | FractalConfig::Mandelbox(_) => true,
@@ -326,6 +369,13 @@ pub fn grade(look: &Look, cut_id: u32, cut: &LoadedScene, tuning: &Tuning) -> Re
         },
     };
     config.camera.focus_distance = subject_distance as f32;
+    // A flythrough carries its own scale along; everything above was sized
+    // for the scale it passes through at the middle of the cut.
+    config.camera.detail_scale = if matches!(animation.path, AnimationPath::Flythrough(_)) {
+        middle.config.camera.detail_scale
+    } else {
+        subject_distance as f32
+    };
     config.camera.aperture_radius = effects.depth_of_field.map_or(0.0, |depth_of_field| {
         (f64::from(depth_of_field.strength) * rules.aperture_ratio * subject_distance) as f32
     });
@@ -350,7 +400,10 @@ pub fn grade(look: &Look, cut_id: u32, cut: &LoadedScene, tuning: &Tuning) -> Re
 }
 
 impl MaterialSpec {
-    fn to_material(&self, fog_density: f32) -> DslMaterial {
+    fn to_material(&self, fog_density: f32, atmosphere: &Atmosphere) -> DslMaterial {
+        let defaults = DslMaterial::default();
+        let haze = atmosphere.haze;
+        let glow = atmosphere.glow;
         DslMaterial {
             base_color: self.base_color,
             accent_color: self.accent_color,
@@ -378,6 +431,13 @@ impl MaterialSpec {
             metallic_shininess: self.metallic_shininess,
             rim_strength: self.rim_strength,
             fog_density,
+            haze_distance: haze.map_or(0.0, |haze| haze.distance),
+            haze_near_color: haze.map_or(defaults.haze_near_color, |haze| haze.near_color),
+            haze_mid_color: haze.map_or(defaults.haze_mid_color, |haze| haze.mid_color),
+            haze_far_color: haze.map_or(defaults.haze_far_color, |haze| haze.far_color),
+            glow_strength: glow.map_or(0.0, |glow| glow.strength),
+            glow_width: glow.map_or(defaults.glow_width, |glow| glow.width_degrees.to_radians()),
+            glow_color: glow.map_or(defaults.glow_color, |glow| glow.color),
         }
     }
 }
@@ -988,7 +1048,7 @@ effects_requested:
         assert!(clipping_problems("1-1", &measured, &rules).is_empty());
 
         measured.hue_clusters = 5;
-        measured.clipped_high_ratio = 0.1;
+        measured.clipped_high_ratio = 0.4;
         measured.clipped_low_ratio = 0.8;
         assert!(
             hue_problem("1-1", &measured, &rules)

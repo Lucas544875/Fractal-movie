@@ -1,8 +1,9 @@
 use anyhow::{Context, Result, bail};
 
 use crate::{
-    ExponentialDivePath, FractalConfig, MIN_QUAD_CAMERA_DISTANCE, MultiTargetDivePath, Precision,
-    Qf32, QfVec3, RenderConfig, SurfaceFlyoverPath, TargetOrbitPath,
+    ExponentialDivePath, FlythroughPath, FractalConfig, MIN_QUAD_CAMERA_DISTANCE,
+    MultiTargetDivePath, Precision, Qf32, QfVec3, RenderConfig, SurfaceFlyoverPath,
+    TargetOrbitPath,
 };
 
 /// Safety ceilings for scene-driven image sequences.
@@ -23,6 +24,7 @@ pub enum AnimationPath {
     TargetOrbit(TargetOrbitPath),
     MultiTargetDive(MultiTargetDivePath),
     SurfaceFlyover(SurfaceFlyoverPath),
+    Flythrough(FlythroughPath),
 }
 
 /// A complete per-frame sample, ready to pass to [`crate::Renderer`].
@@ -95,6 +97,16 @@ impl AnimationConfig {
                     }
                 }
             }
+            AnimationPath::Flythrough(path) => {
+                if base.precision == Precision::QuadFloat {
+                    bail!("flythrough requires f32 or camera-relative precision");
+                }
+                match &base.fractal {
+                    FractalConfig::Mandelbulb(fractal) => path.plan(fractal, base.seed)?,
+                    FractalConfig::Mandelbox(fractal) => path.plan(fractal, base.seed)?,
+                    FractalConfig::Dsl(fractal) => path.plan(fractal, base.seed)?,
+                }
+            }
         }
         Ok(())
     }
@@ -138,6 +150,21 @@ impl AnimationConfig {
                 }
                 path.validate().context("invalid surface-flyover path")?;
             }
+            AnimationPath::Flythrough(path) => {
+                if base.precision == Precision::QuadFloat {
+                    bail!("flythrough requires f32 or camera-relative precision");
+                }
+                path.validate().context("invalid flythrough path")?;
+                if let FractalConfig::Dsl(fractal) = &base.fractal {
+                    // The iteration limit grows with depth, which only
+                    // refines the surface when orbits stop on escape.
+                    if fractal.bailout.is_none() {
+                        bail!(
+                            "flythrough needs a DSL fractal with a bailout; use `DslFractalConfig::open_ended`"
+                        );
+                    }
+                }
+            }
         }
 
         // Validate both ends eagerly so a long render cannot fail only when it
@@ -169,6 +196,7 @@ impl AnimationConfig {
         }
         let time_seconds = self.time_for_frame(frame_index);
         let mut config = base.clone();
+        let mut tuned_by_path = false;
         let (camera_distance, fade_to_black) = match &self.path {
             AnimationPath::ExponentialDive(path) => {
                 path.validate().context("invalid exponential-dive path")?;
@@ -199,12 +227,38 @@ impl AnimationConfig {
                 config.camera.up = sample.up;
                 (sample.camera_distance, 0.0)
             }
+            AnimationPath::Flythrough(path) => {
+                let sample = path.sample(time_seconds)?;
+                let target = [0, 1, 2]
+                    .map(|axis| sample.position[axis] + sample.forward[axis] * sample.focus);
+                config.camera.position = QfVec3::from_f64(sample.position);
+                config.camera.target = QfVec3::from_f64(target);
+                config.camera.up = sample.up.map(|value| value as f32);
+                // The base configuration describes the look at its own
+                // detail scale; everything measured in world units follows
+                // the scale the camera is passing through.
+                let zoom = (sample.scale / f64::from(base.camera.detail_scale)) as f32;
+                config.camera.detail_scale = sample.scale as f32;
+                config.camera.focus_distance = sample.focus as f32;
+                config.camera.aperture_radius *= zoom;
+                config.quality.ambient_occlusion.radius *= zoom;
+                config.quality.soft_shadow.max_distance *= zoom;
+                config.quality.reflection.max_distance *= zoom;
+                config.render.epsilon = (config.render.epsilon * zoom).max(1.0e-30);
+                // The iteration limit stays as planned: the route was found
+                // in the shape this limit describes, and more iterations
+                // would fill in space the route passes through.
+                tuned_by_path = true;
+                (Qf32::from_f64(sample.focus), 0.0)
+            }
         };
         if config.precision == Precision::F32 {
             config.camera.position = QfVec3::from_f32(config.camera.position.to_f32());
             config.camera.target = QfVec3::from_f32(config.camera.target.to_f32());
         }
-        if config.precision == Precision::QuadFloat {
+        if tuned_by_path {
+            // The path set every scale-bound value itself.
+        } else if config.precision == Precision::QuadFloat {
             config
                 .tune_mandelbox_quad_zoom(camera_distance)
                 .context("could not tune quad-float Mandelbox for animation frame")?;

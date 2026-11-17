@@ -26,6 +26,11 @@ pub struct CameraConfig {
     pub aperture_radius: f32,
     /// Distance from the lens plane to the plane of sharp focus.
     pub focus_distance: f32,
+    /// World length of the detail the camera is currently framing, by
+    /// default the focus distance. Effects that must look the same at every
+    /// zoom level, such as haze, measure distance in this unit; camera paths
+    /// update it as they change scale.
+    pub detail_scale: f32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,6 +46,10 @@ pub enum Precision {
     #[default]
     F32,
     QuadFloat,
+    /// `f32` shader arithmetic in coordinates relative to the camera, whose
+    /// own orbit is followed in `f64` on the CPU. Resolves DSL fractals far
+    /// below the scale where absolute `f32` coordinates run out.
+    CameraRelative,
 }
 
 #[derive(Clone, Debug)]
@@ -86,6 +95,9 @@ impl Default for MandelboxConfig {
 }
 
 #[derive(Clone, Debug)]
+// One configuration exists per frame at most; boxing the DSL program would
+// only add indirection to every match on it.
+#[allow(clippy::large_enum_variant)]
 pub enum FractalConfig {
     Mandelbulb(MandelbulbConfig),
     Mandelbox(MandelboxConfig),
@@ -128,7 +140,15 @@ impl FractalConfig {
     /// a renderer pipeline is reused across animation frames.
     pub(crate) fn shader_compatible_with(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Dsl(left), Self::Dsl(right)) => left == right,
+            // The iteration limit is a uniform; every other part of a DSL
+            // program is compiled into the shader.
+            (Self::Dsl(left), Self::Dsl(right)) => {
+                *left
+                    == DslFractalConfig {
+                        iterations: left.iterations,
+                        ..right.clone()
+                    }
+            }
             (Self::Dsl(_), _) | (_, Self::Dsl(_)) => false,
             _ => self.kind() == other.kind(),
         }
@@ -297,6 +317,7 @@ impl Default for RenderConfig {
                 vertical_fov_degrees: 38.0,
                 aperture_radius: 0.0,
                 focus_distance: 4.0,
+                detail_scale: 4.0,
             },
             fractal: FractalConfig::default(),
             light: LightConfig {
@@ -374,6 +395,12 @@ impl RenderConfig {
         if self.precision == Precision::QuadFloat && self.fractal.kind() != FractalKind::Mandelbox {
             bail!("quad-float precision is currently supported only for Mandelbox scenes");
         }
+        if self.precision == Precision::CameraRelative {
+            let FractalConfig::Dsl(fractal) = &self.fractal else {
+                bail!("camera-relative precision is supported only for DSL fractals");
+            };
+            fractal.validate_relative()?;
+        }
         finite_positive("max_distance", render.max_distance)?;
         finite_positive("epsilon", render.epsilon)?;
         if render.epsilon >= 0.1 {
@@ -398,6 +425,7 @@ impl RenderConfig {
             bail!("camera aperture_radius must be finite and non-negative");
         }
         finite_positive("camera focus_distance", self.camera.focus_distance)?;
+        finite_positive("camera detail_scale", self.camera.detail_scale)?;
         let quality = &self.quality;
         if quality.samples_per_pixel == 0 || quality.samples_per_pixel > MAX_SAMPLES_PER_PIXEL {
             bail!("samples_per_pixel must be in 1..={MAX_SAMPLES_PER_PIXEL}");

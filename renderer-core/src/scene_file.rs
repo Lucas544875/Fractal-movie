@@ -5,11 +5,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AmbientOcclusionConfig, AnimationConfig, AnimationPath, CameraConfig, DslFractalConfig,
-    DslMaterial, DslPaletteStop, ExponentialDivePath, FractalConfig, LightConfig, MandelboxConfig,
-    MandelbulbConfig, MultiTargetDivePath, OrbitTransform, PostProcessConfig, Precision, Qf32,
-    QfVec3, QualityConfig, ReflectionConfig, RenderConfig, RenderSettings, SoftShadowConfig,
-    SurfaceFlyoverPath, TargetOrbitPath, TargetSearchConfig, ToneMappingConfig,
-    ToneMappingOperator, VideoConfig,
+    DslMaterial, DslPaletteStop, ExponentialDivePath, FlythroughDirection, FlythroughPath,
+    FractalConfig, KifsSymmetry, LightConfig, MandelboxConfig, MandelbulbConfig,
+    MultiTargetDivePath, OrbitTransform, PostProcessConfig, Precision, Qf32, QfVec3, QualityConfig,
+    ReflectionConfig, RenderConfig, RenderSettings, SoftShadowConfig, SurfaceFlyoverPath,
+    TargetOrbitPath, TargetSearchConfig, ToneMappingConfig, ToneMappingOperator, VideoConfig,
 };
 
 pub const CURRENT_SCENE_VERSION: u32 = 1;
@@ -72,6 +72,7 @@ enum ScenePrecision {
     #[default]
     F32,
     QuadFloat,
+    CameraRelative,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -85,6 +86,9 @@ struct SceneCamera {
     aperture_radius: f32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     focus_distance: Option<f32>,
+    /// Defaults to the focus distance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detail_scale: Option<f32>,
 }
 
 /// Coordinate scalars accept convenient YAML numbers, exact decimal strings,
@@ -99,6 +103,7 @@ enum SceneScalar {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", content = "parameters", rename_all = "kebab-case")]
+#[allow(clippy::large_enum_variant)]
 enum SceneFractal {
     Mandelbulb(SceneMandelbulb),
     Mandelbox(SceneMandelbox),
@@ -161,6 +166,25 @@ enum SceneOrbitTransform {
         constant: [f32; 3],
         rotation_degrees: [f32; 3],
     },
+    KifsFold {
+        start_iteration: u32,
+        stop_iteration: u32,
+        symmetry: SceneKifsSymmetry,
+        scale: f32,
+        offset: [f32; 3],
+        #[serde(default)]
+        rotation_degrees: [f32; 3],
+    },
+    MandelboxFold {
+        start_iteration: u32,
+        stop_iteration: u32,
+        fold_limit: f32,
+        min_radius_squared: f32,
+        fixed_radius_squared: f32,
+        scale: f32,
+        #[serde(default)]
+        rotation_degrees: [f32; 3],
+    },
     BoxFold {
         limit: f32,
     },
@@ -182,6 +206,34 @@ enum SceneOrbitTransform {
     Translate {
         offset: [f32; 3],
     },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum SceneKifsSymmetry {
+    Menger,
+    Octahedral,
+    Tetrahedral,
+}
+
+impl From<SceneKifsSymmetry> for KifsSymmetry {
+    fn from(symmetry: SceneKifsSymmetry) -> Self {
+        match symmetry {
+            SceneKifsSymmetry::Menger => Self::Menger,
+            SceneKifsSymmetry::Octahedral => Self::Octahedral,
+            SceneKifsSymmetry::Tetrahedral => Self::Tetrahedral,
+        }
+    }
+}
+
+impl From<KifsSymmetry> for SceneKifsSymmetry {
+    fn from(symmetry: KifsSymmetry) -> Self {
+        match symmetry {
+            KifsSymmetry::Menger => Self::Menger,
+            KifsSymmetry::Octahedral => Self::Octahedral,
+            KifsSymmetry::Tetrahedral => Self::Tetrahedral,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -206,6 +258,13 @@ struct SceneDslMaterial {
     metallic_shininess: f32,
     rim_strength: f32,
     fog_density: f32,
+    haze_distance: f32,
+    haze_near_color: [f32; 3],
+    haze_mid_color: [f32; 3],
+    haze_far_color: [f32; 3],
+    glow_strength: f32,
+    glow_width: f32,
+    glow_color: [f32; 3],
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -358,6 +417,32 @@ enum SceneAnimationPath {
     TargetOrbit(SceneTargetOrbit),
     MultiTargetDive(SceneMultiTargetDive),
     SurfaceFlyover(SceneSurfaceFlyover),
+    Flythrough(SceneFlythrough),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SceneFlythrough {
+    duration: f64,
+    direction: SceneFlythroughDirection,
+    deep_clearance: f64,
+    overview_distance: f64,
+    bound_radius: f64,
+    #[serde(default)]
+    roll_degrees: f64,
+    #[serde(default = "default_flythrough_attempts")]
+    attempts: u32,
+}
+
+const fn default_flythrough_attempts() -> u32 {
+    8
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum SceneFlythroughDirection {
+    In,
+    Out,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -460,6 +545,7 @@ impl TryFrom<SceneDocument> for LoadedScene {
         let precision = match document.precision {
             ScenePrecision::F32 => Precision::F32,
             ScenePrecision::QuadFloat => Precision::QuadFloat,
+            ScenePrecision::CameraRelative => Precision::CameraRelative,
         };
         let camera_position = parse_coordinate(document.camera.position, precision)
             .context("invalid camera position")?;
@@ -505,6 +591,7 @@ impl TryFrom<SceneDocument> for LoadedScene {
                 vertical_fov_degrees: document.camera.vertical_fov_degrees,
                 aperture_radius: document.camera.aperture_radius,
                 focus_distance,
+                detail_scale: document.camera.detail_scale.unwrap_or(focus_distance),
             },
             fractal,
             light: LightConfig {
@@ -591,6 +678,7 @@ impl From<&LoadedScene> for SceneDocument {
             precision: match scene.config.precision {
                 Precision::F32 => ScenePrecision::F32,
                 Precision::QuadFloat => ScenePrecision::QuadFloat,
+                Precision::CameraRelative => ScenePrecision::CameraRelative,
             },
             seed: scene.config.seed,
             camera: SceneCamera {
@@ -603,6 +691,9 @@ impl From<&LoadedScene> for SceneDocument {
                 vertical_fov_degrees: scene.config.camera.vertical_fov_degrees,
                 aperture_radius: scene.config.camera.aperture_radius,
                 focus_distance: Some(scene.config.camera.focus_distance),
+                detail_scale: (scene.config.camera.detail_scale
+                    != scene.config.camera.focus_distance)
+                    .then_some(scene.config.camera.detail_scale),
             },
             fractal,
             light: SceneLight {
@@ -661,6 +752,38 @@ impl From<SceneOrbitTransform> for OrbitTransform {
                 constant,
                 rotation_degrees,
             },
+            SceneOrbitTransform::KifsFold {
+                start_iteration,
+                stop_iteration,
+                symmetry,
+                scale,
+                offset,
+                rotation_degrees,
+            } => Self::KifsFold {
+                start_iteration,
+                stop_iteration,
+                symmetry: symmetry.into(),
+                scale,
+                offset,
+                rotation_degrees,
+            },
+            SceneOrbitTransform::MandelboxFold {
+                start_iteration,
+                stop_iteration,
+                fold_limit,
+                min_radius_squared,
+                fixed_radius_squared,
+                scale,
+                rotation_degrees,
+            } => Self::MandelboxFold {
+                start_iteration,
+                stop_iteration,
+                fold_limit,
+                min_radius_squared,
+                fixed_radius_squared,
+                scale,
+                rotation_degrees,
+            },
             SceneOrbitTransform::BoxFold { limit } => Self::BoxFold { limit },
             SceneOrbitTransform::SphereFold {
                 min_radius_squared,
@@ -716,6 +839,38 @@ impl From<&OrbitTransform> for SceneOrbitTransform {
                 constant: *constant,
                 rotation_degrees: *rotation_degrees,
             },
+            OrbitTransform::KifsFold {
+                start_iteration,
+                stop_iteration,
+                symmetry,
+                scale,
+                offset,
+                rotation_degrees,
+            } => Self::KifsFold {
+                start_iteration: *start_iteration,
+                stop_iteration: *stop_iteration,
+                symmetry: (*symmetry).into(),
+                scale: *scale,
+                offset: *offset,
+                rotation_degrees: *rotation_degrees,
+            },
+            OrbitTransform::MandelboxFold {
+                start_iteration,
+                stop_iteration,
+                fold_limit,
+                min_radius_squared,
+                fixed_radius_squared,
+                scale,
+                rotation_degrees,
+            } => Self::MandelboxFold {
+                start_iteration: *start_iteration,
+                stop_iteration: *stop_iteration,
+                fold_limit: *fold_limit,
+                min_radius_squared: *min_radius_squared,
+                fixed_radius_squared: *fixed_radius_squared,
+                scale: *scale,
+                rotation_degrees: *rotation_degrees,
+            },
             OrbitTransform::BoxFold { limit } => Self::BoxFold { limit: *limit },
             OrbitTransform::SphereFold {
                 min_radius_squared,
@@ -767,6 +922,13 @@ impl From<SceneDslMaterial> for DslMaterial {
             metallic_shininess: material.metallic_shininess,
             rim_strength: material.rim_strength,
             fog_density: material.fog_density,
+            haze_distance: material.haze_distance,
+            haze_near_color: material.haze_near_color,
+            haze_mid_color: material.haze_mid_color,
+            haze_far_color: material.haze_far_color,
+            glow_strength: material.glow_strength,
+            glow_width: material.glow_width,
+            glow_color: material.glow_color,
         }
     }
 }
@@ -800,6 +962,13 @@ impl From<&DslMaterial> for SceneDslMaterial {
             metallic_shininess: material.metallic_shininess,
             rim_strength: material.rim_strength,
             fog_density: material.fog_density,
+            haze_distance: material.haze_distance,
+            haze_near_color: material.haze_near_color,
+            haze_mid_color: material.haze_mid_color,
+            haze_far_color: material.haze_far_color,
+            glow_strength: material.glow_strength,
+            glow_width: material.glow_width,
+            glow_color: material.glow_color,
         }
     }
 }
@@ -994,6 +1163,21 @@ impl TryFrom<SceneAnimation> for AnimationConfig {
                     TargetSearchConfig::from(path.search),
                 ))
             }
+            SceneAnimationPath::Flythrough(path) => {
+                let mut planned = FlythroughPath::new(
+                    path.duration,
+                    match path.direction {
+                        SceneFlythroughDirection::In => FlythroughDirection::In,
+                        SceneFlythroughDirection::Out => FlythroughDirection::Out,
+                    },
+                    path.deep_clearance,
+                    path.overview_distance,
+                    path.bound_radius,
+                );
+                planned.roll_degrees = path.roll_degrees;
+                planned.attempts = path.attempts;
+                AnimationPath::Flythrough(planned)
+            }
         };
         Ok(Self {
             fps: animation.fps,
@@ -1043,6 +1227,18 @@ impl From<&AnimationConfig> for SceneAnimation {
                     search: SceneTargetSearch::from(path.search),
                 })
             }
+            AnimationPath::Flythrough(path) => SceneAnimationPath::Flythrough(SceneFlythrough {
+                duration: path.duration,
+                direction: match path.direction {
+                    FlythroughDirection::In => SceneFlythroughDirection::In,
+                    FlythroughDirection::Out => SceneFlythroughDirection::Out,
+                },
+                deep_clearance: path.deep_clearance,
+                overview_distance: path.overview_distance,
+                bound_radius: path.bound_radius,
+                roll_degrees: path.roll_degrees,
+                attempts: path.attempts,
+            }),
         };
         Self {
             fps: animation.fps,
@@ -1103,7 +1299,9 @@ fn parse_scalar(value: SceneScalar) -> Result<Qf32> {
 fn serialize_coordinate(value: QfVec3, precision: Precision) -> [SceneScalar; 3] {
     value.components().map(|component| match precision {
         Precision::F32 => SceneScalar::Number(f64::from(component.to_f32())),
-        Precision::QuadFloat => SceneScalar::Expansion(component.limbs()),
+        Precision::QuadFloat | Precision::CameraRelative => {
+            SceneScalar::Expansion(component.limbs())
+        }
     })
 }
 

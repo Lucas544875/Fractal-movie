@@ -509,15 +509,21 @@ fractal:
       shininess: 56.0
 ```
 
-利用可能なorbit命令は次の5種類です。
+利用可能なorbit命令は次の10種類です。
 
 - `box-fold`: 軸ごとのbox fold
 - `sphere-fold`: 最小・固定半径によるsphere foldとDE derivative更新
 - `scale-add-point`: `z = scale * z + p`とDE derivative更新
+- `scale-add-constant`: `z = scale * z + c`（Julia型）
 - `rotate`: 任意axisのRodrigues rotation
 - `translate`: 定数offsetの加算
+- `amazing-surf-fold`、`mandelbox-julia-fold`: 反復範囲を指定するMandelbulber由来のhybrid命令
+- `kifs-fold`: 反復範囲を指定するkaleidoscopic IFS。`symmetry`は`menger`（立方体のレース状の穴）、`octahedral`、`tetrahedral`。`scale`（1.000001〜4）、`offset`（各0〜4）、任意の`rotation_degrees`
+- `mandelbox-fold`: 反復範囲を指定し、標本点を足すMandelbox 1段。`kifs-fold`と範囲を分けると、大きな形と細部で性格の違う形状になる
 
-DSLはf32専用です。`iterations`は1〜96、orbitは1〜16命令、`scale-add-point`は正確に1個、scaleの絶対値は1.000001〜4.0へ制限されます。色、半径、角度、移動量などもfiniteな範囲内か検証し、未知fieldと`wgsl`のようなraw shader fieldはscene schemaで拒否します。AST定数は生成WGSLへ埋め込まれるため、animation中にASTを変更して既存pipelineを再利用しようとした場合もrendererが拒否します。
+反復範囲の終端を`512`にすると、反復数がいくつでもその命令が働き続けます。
+
+DSLは既定でf32です。DSLの`material`には、縮尺に追従する霞（`haze_distance`、`haze_near_color`、`haze_mid_color`、`haze_far_color`）と、霞を背にした輪郭の光（`glow_strength`、`glow_width`、`glow_color`）を指定できます。霞の距離の単位はカメラの`detail_scale`（省略時は`focus_distance`）です。`iterations`は1〜96、orbitは1〜16命令、`scale-add-point`は正確に1個、scaleの絶対値は1.000001〜4.0へ制限されます。色、半径、角度、移動量などもfiniteな範囲内か検証し、未知fieldと`wgsl`のようなraw shader fieldはscene schemaで拒否します。AST定数は生成WGSLへ埋め込まれるため、animation中にASTを変更して既存pipelineを再利用しようとした場合もrendererが拒否します。
 
 サンプルを次のコマンドで描画できます。
 
@@ -529,6 +535,30 @@ WGPU_BACKEND=gl cargo run --release -p fractal-renderer-cli -- render \
 ```
 
 Rust側の再利用可能なAST・generatorは`renderer-core/src/dsl.rs`、同じASTを解釈するCPU `DistanceEstimator`は`renderer-core/src/fractal.rs`、YAMLとの変換は`renderer-core/src/scene_file.rs`、shader moduleへの合成は`renderer-core/src/shader.rs`に分離しています。DSL programは既存の`TargetPicker`へそのまま渡せます。新しい安全な命令を追加するときは、AST variant、domain validation、CPU解釈、固定templateによるWGSL生成、scene変換を同時に追加します。
+
+## フライスルー（縮尺を横断するワンテイク）
+
+`animation.path.kind: flythrough`は、形状の深部の表面脇から外まで、空いた空間を通る経路をCPUの距離推定で探します。局所の縮尺に比例した速さで進むので、一定のペースのズームになります。視線は奥行きの重なりが大きい向きへ緩やかに振り、焦点は画面中央の表面に自動で合わせます。AO、影、反射、レンズ、march epsilonは`camera.detail_scale`を基準に毎フレーム縮尺に合わせて変わります。
+
+```yaml
+precision: camera-relative   # 深部端が形状の1e-4倍より深いとき
+animation:
+  fps: 30
+  frame_count: 1801
+  path:
+    kind: flythrough
+    parameters:
+      duration: 60.0
+      direction: out            # out: 深部から全体へ / in: その逆
+      deep_clearance: 2.0e-5    # 深部端でのカメラと表面の距離
+      overview_distance: 26.0   # 終端の原点からの距離
+      bound_radius: 10.5        # 形状の外接半径
+      roll_degrees: 120.0
+```
+
+DSL形状は反復数で形が変わるので、深部端で必要な反復数を全フレームで使ってください（ハーネスは`FlythroughPath::deep_iterations`で自動設定します）。DSLには`bailout`が必要です。
+
+`precision: camera-relative`は、カメラ自身の軌道をCPUで`f64`のまま追い、shaderは各画素の軌道とその差分だけを`f32`で反復します。折り返しの判定はCPUが求めた「参照軌道と閾値の差」を使うため、境界付近でも正確です。差分が軌道の1/64を超えた時点で通常の絶対座標の反復に引き継ぎます。f32の絶対座標では形状の1e-4倍程度の深さで面が潰れますが、この方式では1e-6倍でも形状を解像します。DSL形状でのみ使えます。
 
 ## 最初のYouTube作品用scene
 

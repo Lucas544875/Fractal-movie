@@ -853,12 +853,25 @@ pub(crate) mod tests {
             ),
             Some(Rejection::Empty)
         );
+        // A view filled by a wall whose structure reads is welcome.
         assert_eq!(
             screen(
                 &measured(0.02, 0.1, 0.3),
                 1.0,
                 ceiling,
                 &LegibilityLimits::default()
+            ),
+            None
+        );
+        assert_eq!(
+            screen(
+                &measured(0.02, 0.1, 0.3),
+                1.0,
+                ceiling,
+                &LegibilityLimits {
+                    min_negative_space: 0.08,
+                    ..LegibilityLimits::default()
+                }
             ),
             Some(Rejection::Cluttered)
         );

@@ -76,3 +76,11 @@ fn apply_fractal_atmosphere(surface: vec3<f32>, sky: vec3<f32>, travel: f32) -> 
     // Fog is disabled in the referenced portfolio effect configuration.
     return surface;
 }
+
+fn fractal_glow_weight(distance: f32, travel: f32) -> f32 {
+    return 0.0;
+}
+
+fn fractal_haze(color: vec3<f32>, travel: f32, hit: bool, glow: f32) -> vec3<f32> {
+    return color;
+}

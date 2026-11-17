@@ -52,6 +52,7 @@ impl RenderConfig {
                 vertical_fov_degrees: 30.0,
                 aperture_radius: 0.0,
                 focus_distance: 11.0,
+                detail_scale: 11.0,
             },
             fractal: FractalConfig::Mandelbox(fractal),
             light: LightConfig {
@@ -105,6 +106,7 @@ impl RenderConfig {
                 vertical_fov_degrees: 30.0,
                 aperture_radius: 0.0,
                 focus_distance: camera_distance.to_f32(),
+                detail_scale: camera_distance.to_f32(),
             },
             fractal: FractalConfig::Mandelbox(fractal),
             light: LightConfig {
@@ -170,6 +172,7 @@ impl RenderConfig {
             1.0
         };
         self.camera.focus_distance = camera_distance;
+        self.camera.detail_scale *= zoom_scale;
         self.camera.aperture_radius *= zoom_scale;
         self.quality.ambient_occlusion.radius *= zoom_scale;
         self.quality.soft_shadow.max_distance *= zoom_scale;

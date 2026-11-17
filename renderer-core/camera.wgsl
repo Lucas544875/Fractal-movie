@@ -18,7 +18,7 @@ struct RenderUniforms {
     camera_target_qf_x: vec4<f32>,
     camera_target_qf_y: vec4<f32>,
     camera_target_qf_z: vec4<f32>,
-    // x: thin-lens aperture radius, y: focus distance
+    // x: thin-lens aperture radius, y: focus distance, z: detail scale
     camera_lens: vec4<f32>,
     // x: AO radius, y: AO strength
     ambient_occlusion: vec4<f32>,

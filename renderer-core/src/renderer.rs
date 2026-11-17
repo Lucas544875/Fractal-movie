@@ -9,7 +9,10 @@ use anyhow::{Context, Result, anyhow};
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use crate::{RenderConfig, ToneMappingOperator, shader};
+use crate::{
+    FractalConfig, Precision, RenderConfig, ToneMappingOperator, relative::REFERENCE_CAPACITY,
+    shader,
+};
 
 const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 const BYTES_PER_PIXEL: u32 = 4;
@@ -114,8 +117,19 @@ struct RenderUniforms {
 
 impl RenderUniforms {
     fn new(config: &RenderConfig, frame_index: u32, time_seconds: f32) -> Self {
-        let camera_position = config.camera.position.to_f32();
-        let camera_target = config.camera.target.to_f32();
+        let (camera_position, camera_target) = if config.precision == Precision::CameraRelative {
+            // The shader's origin is the camera; only the offset to the
+            // target survives, and it is formed before rounding.
+            (
+                [0.0; 3],
+                (config.camera.target - config.camera.position).to_f32(),
+            )
+        } else {
+            (
+                config.camera.position.to_f32(),
+                config.camera.target.to_f32(),
+            )
+        };
         Self {
             resolution_time_frame: [
                 config.render.width as f32,
@@ -164,7 +178,7 @@ impl RenderUniforms {
             camera_lens: [
                 config.camera.aperture_radius,
                 config.camera.focus_distance,
-                0.0,
+                config.camera.detail_scale,
                 0.0,
             ],
             ambient_occlusion: [
@@ -312,6 +326,7 @@ pub struct Renderer {
     adapter_info: wgpu::AdapterInfo,
     config: RenderConfig,
     uniform_buffer: wgpu::Buffer,
+    reference_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     pipeline_layout: wgpu::PipelineLayout,
     render_pipeline: wgpu::RenderPipeline,
@@ -381,26 +396,40 @@ impl Renderer {
             contents: bytemuck::bytes_of(&uniforms),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
+        // The camera's reference orbit. Only camera-relative shaders declare
+        // the binding; the others ignore it.
+        let reference_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("reference-orbit-buffer"),
+            contents: &reference_bytes(&config),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let uniform_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("render-bind-group-layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
+            entries: &[uniform_entry(0), uniform_entry(1)],
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("render-bind-group"),
             layout: &bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: reference_buffer.as_entire_binding(),
+                },
+            ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("raymarch-pipeline-layout"),
@@ -438,6 +467,7 @@ impl Renderer {
             adapter_info,
             config,
             uniform_buffer,
+            reference_buffer,
             bind_group,
             pipeline_layout,
             render_pipeline,
@@ -550,6 +580,10 @@ impl Renderer {
         let uniforms = RenderUniforms::new(config, frame_index, time_seconds);
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+        if config.precision == Precision::CameraRelative {
+            self.queue
+                .write_buffer(&self.reference_buffer, 0, &reference_bytes(config));
+        }
 
         let view = self
             .target
@@ -669,6 +703,34 @@ impl Renderer {
 }
 
 /// Compiles the fractal shader of `config` into a render pipeline.
+/// Contents of the reference-orbit uniform block: its extent, the camera
+/// position, and the orbit's slots. All zero unless the configuration is
+/// camera-relative.
+fn reference_bytes(config: &RenderConfig) -> Vec<u8> {
+    let mut extent = [0_u32; 4];
+    let mut origin = [0.0_f32; 4];
+    let mut slots = vec![[0.0_f32; 4]; REFERENCE_CAPACITY];
+    if let (Precision::CameraRelative, FractalConfig::Dsl(fractal)) =
+        (config.precision, &config.fractal)
+    {
+        let position = config.camera.position.to_f64();
+        let orbit = fractal.reference_orbit(position);
+        extent = [orbit.iterations, orbit.stride, 0, 0];
+        origin = [
+            position[0] as f32,
+            position[1] as f32,
+            position[2] as f32,
+            0.0,
+        ];
+        slots = orbit.slots;
+    }
+    let mut bytes = Vec::with_capacity(32 + slots.len() * 16);
+    bytes.extend_from_slice(bytemuck::bytes_of(&extent));
+    bytes.extend_from_slice(bytemuck::bytes_of(&origin));
+    bytes.extend_from_slice(bytemuck::cast_slice(&slots));
+    bytes
+}
+
 async fn create_pipeline(
     device: &wgpu::Device,
     pipeline_layout: &wgpu::PipelineLayout,

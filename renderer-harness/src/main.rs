@@ -132,6 +132,22 @@ enum Command {
         adapter: Option<String>,
     },
 
+    /// Measure the frames of a reference film the way the harness measures
+    /// its own, and report the spread of every legibility measure. For
+    /// setting thresholds, not for productions.
+    Calibrate {
+        /// Directory of consecutive frames as PNG files, in name order.
+        frames: PathBuf,
+
+        /// Measure legibility on every n-th frame; flicker uses them all.
+        #[arg(long, default_value_t = 15)]
+        stride: usize,
+
+        /// Frames to leave out at each end, such as fades.
+        #[arg(long, default_value_t = 0)]
+        skip: usize,
+    },
+
     /// Scout locations: sample shapes and viewpoints, then choose among them.
     Scout {
         #[command(subcommand)]
@@ -624,6 +640,13 @@ fn run(cli: Cli) -> Result<Value> {
             let ledger = Ledger::load(&cli.ledger)?;
             next_report(&Production::open(&cli.root, &id)?, &ledger)
         }
+        Command::Calibrate {
+            frames,
+            stride,
+            skip,
+        } => Ok(serde_json::to_value(
+            fractal_renderer_harness::calibrate::calibrate(&frames, stride, skip)?,
+        )?),
         Command::Measure {
             scene,
             gpu_minutes_per_second,

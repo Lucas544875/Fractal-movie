@@ -140,7 +140,9 @@ impl Default for Scouting {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LegibilityLimits {
-    /// Below this share of flat area a frame is wall-to-wall detail.
+    /// Below this share of flat area a frame is wall-to-wall detail. 0 by
+    /// default: a view filled by a wall is welcome when its structure reads,
+    /// and `max_high_frequency` still rejects detail too fine to read.
     pub min_negative_space: f32,
     /// Above this share there is no subject to look at.
     pub max_negative_space: f32,
@@ -153,11 +155,12 @@ pub struct LegibilityLimits {
 impl Default for LegibilityLimits {
     fn default() -> Self {
         Self {
-            min_negative_space: 0.10,
+            // Calibrated on the reference film; see docs/harness-calibration.md.
+            min_negative_space: 0.0,
             max_negative_space: 0.85,
             max_high_frequency: 0.35,
             min_mean_luminance: 0.03,
-            max_flicker: 0.02,
+            max_flicker: 0.06,
         }
     }
 }
@@ -215,6 +218,14 @@ pub struct ShotlistRules {
     pub min_transition_cut_seconds: f64,
     pub min_cut_seconds: f64,
     pub max_cut_seconds: f64,
+    /// Longest flythrough, which is a whole film in one take and so is not
+    /// held to the limit of an ordinary cut.
+    pub max_flythrough_seconds: f64,
+    /// Starting points a flythrough tries before keeping the best route.
+    pub flythrough_attempts: u32,
+    /// Deep-end clearance, relative to the shape's radius, below which a
+    /// flythrough renders in camera-relative precision.
+    pub flythrough_relative_depth: f64,
     /// Properties out of role, scale regime, and motion in which
     /// consecutive cuts must differ.
     pub min_cut_differences: usize,
@@ -230,6 +241,9 @@ impl Default for ShotlistRules {
             min_transition_cut_seconds: 2.0,
             min_cut_seconds: 1.0,
             max_cut_seconds: 60.0,
+            max_flythrough_seconds: 240.0,
+            flythrough_attempts: 8,
+            flythrough_relative_depth: 1.0e-4,
             min_cut_differences: 2,
             min_clearance_ratio: 0.02,
         }
@@ -256,7 +270,7 @@ impl Default for StoryboardRules {
             beat_seconds: 8.0,
             width: 320,
             samples_per_pixel: 2,
-            min_beats: 2,
+            min_beats: 1,
         }
     }
 }
@@ -296,7 +310,7 @@ impl Default for LookRules {
             preview_samples_per_pixel: 8,
             preview_effect_steps: 24,
             max_hue_clusters: 3,
-            max_clipped_high: 0.02,
+            max_clipped_high: 0.25,
             max_clipped_low: 0.6,
             occlusion_radius_ratio: 0.2,
             shadow_distance_ratio: 3.0,

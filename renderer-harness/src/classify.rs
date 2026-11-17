@@ -121,6 +121,7 @@ pub fn motion(path: &AnimationPath) -> Motion {
         AnimationPath::TargetOrbit(_) => Motion::Orbit,
         AnimationPath::MultiTargetDive(_) => Motion::MultiDive,
         AnimationPath::SurfaceFlyover(_) => Motion::Flyover,
+        AnimationPath::Flythrough(_) => Motion::Flythrough,
     }
 }
 

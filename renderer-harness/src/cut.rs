@@ -4,9 +4,9 @@
 
 use anyhow::{Context, Result, bail};
 use fractal_renderer_core::{
-    AnimationConfig, AnimationPath, ExponentialDivePath, FractalConfig, LoadedScene,
-    MultiTargetDivePath, Qf32, QfVec3, RenderConfig, SurfaceFlyoverPath, TargetOrbitPath,
-    TargetSearchConfig,
+    AnimationConfig, AnimationPath, ExponentialDivePath, FlythroughDirection, FlythroughPath,
+    FractalConfig, LoadedScene, MultiTargetDivePath, Qf32, QfVec3, RenderConfig,
+    SurfaceFlyoverPath, TargetOrbitPath, TargetSearchConfig,
 };
 use serde::{Deserialize, Serialize};
 
@@ -97,6 +97,28 @@ pub enum MotionSpec {
         depth: f64,
         dives: u32,
     },
+    /// Travel in one take between a point deep inside the shape and a view
+    /// of the whole of it, through whatever open space the harness finds.
+    /// The viewpoint only supplies the light; bounded shapes only.
+    Flythrough {
+        /// Clearance at the deep end, relative to the shape's radius.
+        depth: f64,
+        /// `out` starts deep and ends on the whole shape; `in` is the
+        /// reverse.
+        #[serde(default)]
+        direction: FlythroughHeading,
+        /// Turns about the line of sight over the whole move.
+        #[serde(default)]
+        roll: f64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FlythroughHeading {
+    In,
+    #[default]
+    Out,
 }
 
 const fn unit_distance() -> f64 {
@@ -111,6 +133,16 @@ impl MotionSpec {
             Self::Dive { .. } => Motion::Dive,
             Self::Flyover { .. } => Motion::Flyover,
             Self::MultiDive { .. } => Motion::MultiDive,
+            Self::Flythrough { .. } => Motion::Flythrough,
+        }
+    }
+
+    /// Longest cut this motion may fill.
+    #[must_use]
+    pub fn max_seconds(&self, rules: &crate::tuning::ShotlistRules) -> f64 {
+        match self {
+            Self::Flythrough { .. } => rules.max_flythrough_seconds,
+            _ => rules.max_cut_seconds,
         }
     }
 
@@ -135,6 +167,11 @@ impl MotionSpec {
             Motion::MultiDive => Self::MultiDive {
                 depth: 0.0025,
                 dives: 2,
+            },
+            Motion::Flythrough => Self::Flythrough {
+                depth: 0.001,
+                direction: FlythroughHeading::Out,
+                roll: 0.0,
             },
         }
     }
@@ -179,6 +216,10 @@ impl MotionSpec {
                     max_cut_seconds,
                 )
             }
+            Self::Flythrough { depth, roll, .. } => {
+                within("flythrough depth", depth, 0.000_000_01, 0.02)?;
+                within("flythrough roll", roll, -4.0, 4.0)
+            }
         }
     }
 }
@@ -198,13 +239,13 @@ pub fn compile(
 ) -> Result<LoadedScene> {
     format.validate()?;
     let rules = &tuning.shotlist;
+    let max_seconds = motion.max_seconds(rules);
     if !duration_seconds.is_finite()
-        || !(rules.min_cut_seconds..=rules.max_cut_seconds).contains(&duration_seconds)
+        || !(rules.min_cut_seconds..=max_seconds).contains(&duration_seconds)
     {
         bail!(
-            "cut duration {duration_seconds} must be in {}..={} seconds",
+            "cut duration {duration_seconds} must be in {}..={max_seconds} seconds",
             rules.min_cut_seconds,
-            rules.max_cut_seconds
         );
     }
     motion.validate(duration_seconds, rules.max_cut_seconds)?;
@@ -218,9 +259,10 @@ pub fn compile(
     // Orbits and dives may start nearer to or further from the subject than
     // the scouted viewpoint, along the same line of sight.
     let framing = match *motion {
-        MotionSpec::Orbit { distance, .. }
-        | MotionSpec::Dive { distance, .. } => distance,
-        MotionSpec::Flyover { .. } | MotionSpec::MultiDive { .. } => 1.0,
+        MotionSpec::Orbit { distance, .. } | MotionSpec::Dive { distance, .. } => distance,
+        MotionSpec::Flyover { .. }
+        | MotionSpec::MultiDive { .. }
+        | MotionSpec::Flythrough { .. } => 1.0,
     };
     if framing != 1.0 {
         let scouted = config.camera.position.to_f64();
@@ -228,6 +270,7 @@ pub fn compile(
         config.camera.position = QfVec3::from_f64(moved);
         let moved_distance = distance(moved, target);
         config.camera.focus_distance = moved_distance as f32;
+        config.camera.detail_scale = moved_distance as f32;
         reframe(&mut config, 0.0, moved_distance, subject_fog);
     }
     let position = config.camera.position.to_f64();
@@ -283,6 +326,46 @@ pub fn compile(
                 transition,
                 search(radius),
             ))
+        }
+        MotionSpec::Flythrough {
+            depth,
+            direction,
+            roll,
+        } => {
+            let radius = bounded_radius(survey, "flythrough")?;
+            let overview_distance = radius * tuning.scouting.overview_distance_radii;
+            reframe(&mut config, radius, overview_distance, subject_fog);
+            if let FractalConfig::Dsl(dsl) = &mut config.fractal {
+                // Detail has to keep appearing as the camera goes deeper.
+                *dsl = dsl.open_ended();
+                // A fixed normal step would be coarse deep down; the
+                // projected pixel footprint sets it instead.
+                dsl.normal_epsilon = 1.0e-12;
+            }
+            // Beyond what absolute f32 coordinates resolve.
+            if depth < tuning.shotlist.flythrough_relative_depth {
+                config.precision = fractal_renderer_core::Precision::CameraRelative;
+            }
+            // March precision is stated at the scale of the whole shape and
+            // follows the camera from there.
+            config.camera.detail_scale = radius as f32;
+            config.render.epsilon = (radius * 1.0e-4) as f32;
+            let mut path = FlythroughPath::new(
+                duration_seconds,
+                match direction {
+                    FlythroughHeading::In => FlythroughDirection::In,
+                    FlythroughHeading::Out => FlythroughDirection::Out,
+                },
+                depth * radius,
+                overview_distance,
+                radius,
+            );
+            path.roll_degrees = roll * 360.0;
+            path.attempts = rules.flythrough_attempts;
+            if let FractalConfig::Dsl(dsl) = &mut config.fractal {
+                dsl.iterations = path.deep_iterations(dsl);
+            }
+            AnimationPath::Flythrough(path)
         }
     };
 
@@ -369,6 +452,9 @@ pub fn check_route(scene: &LoadedScene, survey: &Survey, tuning: &Tuning) -> Res
         frames.push(last);
     }
 
+    // A flythrough has no fixed subject; its clearance is judged against
+    // the scale of the space it is passing through.
+    let scale_relative = matches!(animation.path, AnimationPath::Flythrough(_));
     // Clearance, subject distance, and camera position of a frame.
     let camera_at = |frame: u32| -> Result<(f64, f64, [f64; 3])> {
         let sample = animation.sample(&scene.config, frame)?;
@@ -376,7 +462,11 @@ pub fn check_route(scene: &LoadedScene, survey: &Survey, tuning: &Tuning) -> Res
         let target = sample.config.camera.target.to_f64();
         Ok((
             shape::clearance(&scene.config.fractal, position),
-            distance(position, target),
+            if scale_relative {
+                f64::from(sample.config.camera.detail_scale)
+            } else {
+                distance(position, target)
+            },
             position,
         ))
     };
@@ -774,11 +864,13 @@ pub(crate) mod tests {
             5.0
         ));
         // A dive cannot hold before it moves, and a pull-back does not exist.
-        assert!(serde_json::from_str::<MotionSpec>(
-            r#"{"kind":"dive","depth":0.5,"hold_seconds":1.0}"#
-        )
-        .is_err());
-        assert!(serde_json::from_str::<MotionSpec>(r#"{"kind":"pull-back","factor":3.0}"#).is_err());
+        assert!(
+            serde_json::from_str::<MotionSpec>(r#"{"kind":"dive","depth":0.5,"hold_seconds":1.0}"#)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<MotionSpec>(r#"{"kind":"pull-back","factor":3.0}"#).is_err()
+        );
         assert!(attempt(
             MotionSpec::MultiDive {
                 depth: 0.05,
@@ -880,5 +972,173 @@ pub(crate) mod tests {
         let route = check_route(&cut, &survey).unwrap();
         assert!(route.frames_checked <= MAX_ROUTE_SAMPLES + 2);
         assert!(route.frames_checked >= MAX_ROUTE_SAMPLES / 2);
+    }
+}
+
+#[cfg(test)]
+mod flythrough_yield {
+    use super::tests::{HD30, viewpoint_scene};
+    use super::*;
+    use crate::axes::FormulaFamily;
+
+    /// Share of generated shapes a flythrough plans through, and the time it
+    /// takes. Run with `--ignored --nocapture` when tuning the planner.
+    #[test]
+    #[ignore = "slow survey of the planner; run by hand"]
+    fn flythrough_plans_through_most_generated_shapes() {
+        for family in [
+            FormulaFamily::Mandelbox,
+            FormulaFamily::Kifs,
+            FormulaFamily::KifsBox,
+            FormulaFamily::AmazingSurf,
+        ] {
+            let (mut planned, mut tried) = (0, 0);
+            let started = std::time::Instant::now();
+            for seed in 0..12 {
+                let (viewpoint, survey) = viewpoint_scene(family, ScaleRegime::Overview, seed);
+                if !survey.bounded {
+                    continue;
+                }
+                tried += 1;
+                let motion = MotionSpec::typical(Motion::Flythrough);
+                match compile(
+                    &viewpoint,
+                    &survey,
+                    &motion,
+                    60.0,
+                    &HD30,
+                    "probe",
+                    &Tuning::default(),
+                ) {
+                    Ok(scene) => {
+                        let route = check_route(&scene, &survey, &Tuning::default()).unwrap();
+                        if route.safe {
+                            planned += 1;
+                        } else {
+                            eprintln!("{family:?} seed {seed}: unsafe {route:?}");
+                        }
+                    }
+                    Err(error) => eprintln!("{family:?} seed {seed}: {error:#}"),
+                }
+            }
+            eprintln!(
+                "{family:?}: {planned}/{tried} planned, {:.1} s each",
+                started.elapsed().as_secs_f64() / f64::from(tried.max(1))
+            );
+        }
+    }
+
+    /// Writes a compiled flythrough scene for looking at by hand.
+    #[test]
+    #[ignore = "writes a scene to output/; run by hand"]
+    fn export_flythrough_scene() {
+        let family = std::env::var("FLYTHROUGH_FAMILY")
+            .ok()
+            .and_then(|label| FormulaFamily::parse(&label))
+            .unwrap_or(FormulaFamily::KifsBox);
+        let seed: u64 = std::env::var("FLYTHROUGH_SEED")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1);
+        let (viewpoint, survey) = viewpoint_scene(family, ScaleRegime::Overview, seed);
+        let motion = MotionSpec::Flythrough {
+            depth: std::env::var("FLYTHROUGH_DEPTH")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1.0e-5),
+            direction: FlythroughHeading::Out,
+            roll: std::env::var("FLYTHROUGH_ROLL")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0.3),
+        };
+        let mut scene = compile(
+            &viewpoint,
+            &survey,
+            &motion,
+            std::env::var("FLYTHROUGH_SECONDS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(20.0),
+            &HD30,
+            "flythrough",
+            &Tuning::default(),
+        )
+        .unwrap();
+        // Something near the reference film's look: pale stone, haze from
+        // gold through blue to white, and a gold glow on silhouettes.
+        let scale = scene.config.camera.detail_scale;
+        if let FractalConfig::Dsl(dsl) = &mut scene.config.fractal {
+            let material = &mut dsl.material;
+            material.base_color = [0.5, 0.5, 0.52];
+            material.accent_color = [0.85, 0.84, 0.8];
+            material.background_bottom = [0.85, 0.93, 1.0];
+            material.background_top = [0.85, 0.93, 1.0];
+            material.orbit_palette_weight = 1.0;
+            material.ambient_strength = 0.3;
+            material.diffuse_strength = 1.6;
+            material.specular_strength = 0.5;
+            material.shininess = 40.0;
+            material.rim_strength = 0.05;
+            material.fog_density = 0.0;
+            material.haze_distance = 30.0;
+            material.haze_near_color = [0.95, 0.85, 0.35];
+            material.haze_mid_color = [0.1, 0.28, 0.55];
+            material.haze_far_color = [0.85, 0.93, 1.0];
+            material.glow_strength = 0.7;
+            material.glow_width = 0.02;
+            material.glow_color = [1.0, 0.85, 0.3];
+        }
+        let quality = &mut scene.config.quality;
+        quality.samples_per_pixel = 4;
+        quality.soft_shadow.max_steps = 96;
+        quality.soft_shadow.angular_radius_degrees = 1.0;
+        quality.soft_shadow.max_distance = scale * 4.0;
+        quality.ambient_occlusion.max_steps = 32;
+        quality.ambient_occlusion.radius = scale * 0.3;
+        quality.ambient_occlusion.strength = 0.8;
+        quality.tone_mapping.enabled = true;
+        quality.tone_mapping.exposure_stops = 0.3;
+        quality.tone_mapping.white_point = 2.0;
+        quality.post_process.enabled = true;
+        quality.post_process.contrast = 1.35;
+        quality.post_process.saturation = 1.15;
+        scene.config.render.width = std::env::var("FLYTHROUGH_WIDTH")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(640);
+        scene.config.render.height = scene.config.render.width * 9 / 16;
+        let directory =
+            std::env::var("FLYTHROUGH_OUT").unwrap_or_else(|_| "../output/flythrough-test".into());
+        let path = format!("{directory}/{}-{seed}.yaml", family.as_str());
+        std::fs::write(&path, scene.to_yaml().unwrap()).unwrap();
+        eprintln!("wrote {path}");
+    }
+
+    #[test]
+    #[ignore = "diagnostic; run by hand"]
+    fn probe_flythrough_scene() {
+        let path = std::env::var("FLYTHROUGH_SCENE").unwrap();
+        let mut scene = fractal_renderer_core::load_scene(&path).unwrap();
+        let animation = scene.animation.as_mut().unwrap();
+        animation.plan(&scene.config).unwrap();
+        for frame in [0, 75, 150, 300, 450, 600] {
+            let sample = animation.sample(&scene.config, frame).unwrap();
+            let position = sample.config.camera.position.to_f64();
+            let target = sample.config.camera.target.to_f64();
+            eprintln!(
+                "frame {frame}: sampled-de {:.3e} clearance {:.3e} scale {:.3e} focus {:.3e} |p| {:.3} target-de {:.3e} iterations {}",
+                shape::clearance(&sample.config.fractal, position),
+                shape::clearance(&scene.config.fractal, position),
+                sample.config.camera.detail_scale,
+                sample.config.camera.focus_distance,
+                (position[0].powi(2) + position[1].powi(2) + position[2].powi(2)).sqrt(),
+                shape::clearance(&sample.config.fractal, target),
+                match &sample.config.fractal {
+                    FractalConfig::Dsl(dsl) => dsl.iterations,
+                    _ => 0,
+                },
+            );
+        }
     }
 }

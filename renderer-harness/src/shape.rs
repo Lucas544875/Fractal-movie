@@ -4,8 +4,8 @@
 //! perturbations of earlier ones.
 
 use fractal_renderer_core::{
-    DistanceEstimator, DslFractalConfig, DslMaterial, FractalConfig, MandelbulbConfig,
-    OrbitTransform, QfVec3, RenderConfig, RenderSettings,
+    DistanceEstimator, DslFractalConfig, DslMaterial, FractalConfig, KifsSymmetry,
+    MandelbulbConfig, OrbitTransform, QfVec3, RenderConfig, RenderSettings,
 };
 
 use crate::{
@@ -128,6 +128,7 @@ pub fn clearance(fractal: &FractalConfig, point: [f64; 3]) -> f64 {
 #[must_use]
 pub fn generate(rng: &mut Rng, family: FormulaFamily) -> FractalConfig {
     let iterations = 10 + rng.below(15) as u32;
+    let mut orbit_period = None;
     let orbit = match family {
         FormulaFamily::Mandelbulb => {
             return FractalConfig::Mandelbulb(MandelbulbConfig {
@@ -184,15 +185,48 @@ pub fn generate(rng: &mut Rng, family: FormulaFamily) -> FractalConfig {
                 mandelbox_julia(rng, switch, iterations),
             ]
         }
+        FormulaFamily::Kifs => {
+            if rng.chance(0.5) {
+                vec![kifs_fold(rng, 0, iterations)]
+            } else {
+                // Two symmetries sharing the orbit: in turn, or one shaping
+                // the large forms and the other the detail.
+                let (first, second, period) = schedule(rng, iterations);
+                orbit_period = period;
+                vec![
+                    kifs_fold(rng, first.0, first.1),
+                    kifs_fold(rng, second.0, second.1),
+                ]
+            }
+        }
+        FormulaFamily::KifsBox => {
+            let (first, second, period) = schedule(rng, iterations);
+            orbit_period = period;
+            if rng.chance(0.5) {
+                vec![
+                    kifs_fold(rng, first.0, first.1),
+                    mandelbox_fold(rng, second.0, second.1),
+                ]
+            } else {
+                vec![
+                    mandelbox_fold(rng, first.0, first.1),
+                    kifs_fold(rng, second.0, second.1),
+                ]
+            }
+        }
     };
 
     let self_recurring = matches!(
         family,
-        FormulaFamily::AmazingSurf | FormulaFamily::MandelboxJulia | FormulaFamily::AmazingHybrid
+        FormulaFamily::AmazingSurf
+            | FormulaFamily::MandelboxJulia
+            | FormulaFamily::AmazingHybrid
+            | FormulaFamily::Kifs
+            | FormulaFamily::KifsBox
     );
     FractalConfig::Dsl(DslFractalConfig {
         iterations,
-        orbit_period: None,
+        orbit_period,
         color_iterations: iterations,
         // Folds that carry their own recurrence need an explicit escape
         // radius to terminate.
@@ -242,6 +276,23 @@ pub fn mutate(rng: &mut Rng, fractal: &FractalConfig, amount: f64) -> FractalCon
                             jitter(*fixed_radius_squared).max(*min_radius_squared * 1.05 + 1.0e-3);
                         *scale = keep_expanding(jitter(*scale));
                         *constant = constant.map(&mut jitter);
+                    }
+                    OrbitTransform::KifsFold { scale, offset, .. } => {
+                        *scale = jitter(*scale).clamp(1.05, 4.0);
+                        *offset = offset.map(&mut jitter).map(|value| value.clamp(0.0, 4.0));
+                    }
+                    OrbitTransform::MandelboxFold {
+                        fold_limit,
+                        min_radius_squared,
+                        fixed_radius_squared,
+                        scale,
+                        ..
+                    } => {
+                        *fold_limit = jitter(*fold_limit);
+                        *min_radius_squared = jitter(*min_radius_squared);
+                        *fixed_radius_squared =
+                            jitter(*fixed_radius_squared).max(*min_radius_squared * 1.05 + 1.0e-3);
+                        *scale = keep_expanding(jitter(*scale));
                     }
                     OrbitTransform::BoxFold { limit } => *limit = jitter(*limit),
                     OrbitTransform::SphereFold {
@@ -319,6 +370,76 @@ fn mandelbox_julia(rng: &mut Rng, start_iteration: u32, stop_iteration: u32) -> 
         scale: round3(rng.range(1.1, 2.4) * sign(rng)),
         constant: [(); 3].map(|()| round3(rng.range(-2.0, 2.0))),
         rotation_degrees: [(); 3].map(|()| round3(rng.range(-10.0, 10.0))),
+    }
+}
+
+/// Splits the orbit between two folds. Returns each fold's iteration range
+/// and the period the ranges repeat with, if they alternate.
+fn schedule(rng: &mut Rng, iterations: u32) -> ((u32, u32), (u32, u32), Option<u32>) {
+    if rng.chance(0.5) {
+        // Alternating: every level of detail carries both folds.
+        let period = 2 + rng.below(3) as u32;
+        let first = 1 + rng.below((period - 1) as usize) as u32;
+        ((0, first), (first, period), Some(period))
+    } else {
+        // Layered: the first fold shapes the large forms and the second the
+        // detail, so the surface changes character with depth.
+        let switch = 1 + rng.below((iterations / 2) as usize) as u32;
+        ((0, switch), (switch, iterations), None)
+    }
+}
+
+fn kifs_fold(rng: &mut Rng, start_iteration: u32, stop_iteration: u32) -> OrbitTransform {
+    fn jittered(rng: &mut Rng, value: f64) -> f32 {
+        round3(value * rng.range(0.75, 1.25))
+    }
+    // Axis-aligned folds read as architecture; a small twist turns the same
+    // fold organic.
+    fn rotation(rng: &mut Rng) -> f32 {
+        match rng.below(4) {
+            0 | 1 => 0.0,
+            2 => round3(rng.range(2.0, 12.0) * sign(rng)),
+            _ => round3(rng.range(12.0, 40.0) * sign(rng)),
+        }
+    }
+    let (symmetry, scale, offset) = match rng.below(3) {
+        0 => (
+            KifsSymmetry::Menger,
+            rng.range(2.3, 3.3),
+            [(); 3].map(|()| jittered(rng, 1.0)),
+        ),
+        1 => (
+            KifsSymmetry::Octahedral,
+            rng.range(1.7, 2.6),
+            [jittered(rng, 1.0), round3(rng.range(0.0, 0.4)), 0.0],
+        ),
+        _ => (
+            KifsSymmetry::Tetrahedral,
+            rng.range(1.7, 2.4),
+            [(); 3].map(|()| jittered(rng, 1.0)),
+        ),
+    };
+    OrbitTransform::KifsFold {
+        start_iteration,
+        stop_iteration,
+        symmetry,
+        scale: round3(scale),
+        offset,
+        rotation_degrees: [(); 3].map(|()| rotation(rng)),
+    }
+}
+
+fn mandelbox_fold(rng: &mut Rng, start_iteration: u32, stop_iteration: u32) -> OrbitTransform {
+    let min_radius_squared = round3(rng.range(0.1, 0.7));
+    let scale_sign = if rng.chance(0.5) { -1.0 } else { 1.0 };
+    OrbitTransform::MandelboxFold {
+        start_iteration,
+        stop_iteration,
+        fold_limit: round3(rng.range(0.8, 1.4)),
+        min_radius_squared,
+        fixed_radius_squared: round3(f64::from(min_radius_squared) + rng.range(0.5, 2.0)),
+        scale: round3(rng.range(1.5, 2.8) * scale_sign),
+        rotation_degrees: [0.0; 3],
     }
 }
 

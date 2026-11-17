@@ -7,6 +7,12 @@ use crate::config::MAX_FRACTAL_ITERATIONS;
 pub const MAX_DSL_TRANSFORMS: usize = 16;
 pub const MAX_DSL_PALETTE_STOPS: usize = 16;
 pub const MAX_DSL_COLOR_ITERATIONS: u32 = 512;
+/// A scheduled fold whose range stops here runs for as long as the orbit
+/// does, whatever the iteration limit.
+pub const OPEN_STOP_ITERATION: u32 = MAX_DSL_COLOR_ITERATIONS;
+/// Escape radius given to programs that have none when their iteration limit
+/// is allowed to grow.
+const OPEN_ENDED_BAILOUT: f32 = 1.0e3;
 
 /// A deliberately bounded fractal program. Scene files can construct this AST
 /// but cannot inject identifiers, statements, or arbitrary WGSL source.
@@ -50,6 +56,29 @@ pub enum OrbitTransform {
         constant: [f32; 3],
         rotation_degrees: [f32; 3],
     },
+    /// One scheduled kaleidoscopic IFS step: reflections that fold space into
+    /// the fundamental domain of `symmetry`, an optional rotation, and a
+    /// scaling about `offset`. Scheduling it against other folds changes the
+    /// character of the surface from one level of detail to the next.
+    KifsFold {
+        start_iteration: u32,
+        stop_iteration: u32,
+        symmetry: KifsSymmetry,
+        scale: f32,
+        offset: [f32; 3],
+        rotation_degrees: [f32; 3],
+    },
+    /// One scheduled Mandelbox step that adds the sample point, so hybrids
+    /// keep a bounded, spatially varying body instead of a Julia-like one.
+    MandelboxFold {
+        start_iteration: u32,
+        stop_iteration: u32,
+        fold_limit: f32,
+        min_radius_squared: f32,
+        fixed_radius_squared: f32,
+        scale: f32,
+        rotation_degrees: [f32; 3],
+    },
     BoxFold {
         limit: f32,
     },
@@ -74,6 +103,18 @@ pub enum OrbitTransform {
     Translate {
         offset: [f32; 3],
     },
+}
+
+/// Reflection group applied by [`OrbitTransform::KifsFold`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KifsSymmetry {
+    /// Absolute value and a descending sort, then the Menger sponge's
+    /// fold along the smallest axis.
+    Menger,
+    /// Absolute value and a descending sort only.
+    Octahedral,
+    /// Reflections in the three planes through the tetrahedron's edges.
+    Tetrahedral,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -107,6 +148,23 @@ pub struct DslMaterial {
     pub metallic_shininess: f32,
     pub rim_strength: f32,
     pub fog_density: f32,
+    /// Distance, in units of the camera's detail scale, at which haze has
+    /// absorbed all but 1/e of the light. Absorption grows with the square
+    /// of distance, which leaves the foreground clear. Zero disables haze.
+    /// Because the unit follows the camera, haze looks the same at every
+    /// depth of a zoom.
+    pub haze_distance: f32,
+    /// Haze colour where it is thin, half opaque, and fully opaque. Rays that
+    /// leave the scene end in the last colour.
+    pub haze_near_color: [f32; 3],
+    pub haze_mid_color: [f32; 3],
+    pub haze_far_color: [f32; 3],
+    /// Light added to rays that pass close to a surface without hitting it,
+    /// which outlines silhouettes against the haze. Zero disables the glow.
+    pub glow_strength: f32,
+    /// Angular reach of the glow around a silhouette, in radians.
+    pub glow_width: f32,
+    pub glow_color: [f32; 3],
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -137,6 +195,13 @@ impl Default for DslMaterial {
             metallic_shininess: 30.0,
             rim_strength: 0.18,
             fog_density: 0.0,
+            haze_distance: 0.0,
+            haze_near_color: [0.9, 0.8, 0.35],
+            haze_mid_color: [0.12, 0.3, 0.55],
+            haze_far_color: [0.85, 0.93, 1.0],
+            glow_strength: 0.0,
+            glow_width: 0.02,
+            glow_color: [1.0, 0.85, 0.3],
         }
     }
 }
@@ -163,6 +228,52 @@ impl Default for DslFractalConfig {
 }
 
 impl DslFractalConfig {
+    /// The same program prepared for an iteration limit that grows with zoom
+    /// depth: folds scheduled up to the current limit are left open, and the
+    /// orbit is given an escape radius so that extra iterations refine the
+    /// surface instead of overflowing.
+    #[must_use]
+    pub fn open_ended(&self) -> Self {
+        let mut program = self.clone();
+        if program.orbit_period.is_none() {
+            let limit = program.iterations;
+            for transform in &mut program.orbit {
+                match transform {
+                    OrbitTransform::AmazingSurfFold { stop_iteration, .. }
+                    | OrbitTransform::MandelboxJuliaFold { stop_iteration, .. }
+                    | OrbitTransform::KifsFold { stop_iteration, .. }
+                    | OrbitTransform::MandelboxFold { stop_iteration, .. }
+                        if *stop_iteration == limit =>
+                    {
+                        *stop_iteration = OPEN_STOP_ITERATION;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        program.bailout.get_or_insert(OPEN_ENDED_BAILOUT);
+        program
+    }
+
+    /// Smallest magnification one iteration applies. Each further iteration
+    /// resolves detail smaller by at least this factor.
+    #[must_use]
+    pub fn detail_growth(&self) -> f64 {
+        self.orbit
+            .iter()
+            .filter_map(|transform| match transform {
+                OrbitTransform::AmazingSurfFold { scale, .. }
+                | OrbitTransform::MandelboxJuliaFold { scale, .. }
+                | OrbitTransform::KifsFold { scale, .. }
+                | OrbitTransform::MandelboxFold { scale, .. }
+                | OrbitTransform::ScaleAddPoint { scale }
+                | OrbitTransform::ScaleAddConstant { scale, .. } => Some(f64::from(scale.abs())),
+                _ => None,
+            })
+            .fold(f64::INFINITY, f64::min)
+            .clamp(1.05, 4.0)
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.iterations == 0 || self.iterations > MAX_FRACTAL_ITERATIONS {
             bail!("DSL iterations must be in 1..={MAX_FRACTAL_ITERATIONS}");
@@ -295,6 +406,99 @@ impl DslFractalConfig {
                         );
                     }
                 }
+                OrbitTransform::KifsFold {
+                    start_iteration,
+                    stop_iteration,
+                    symmetry: _,
+                    scale,
+                    offset,
+                    rotation_degrees,
+                } => {
+                    validate_iteration_range(
+                        index,
+                        *start_iteration,
+                        *stop_iteration,
+                        schedule_length,
+                    )?;
+                    // Reflections already supply every sign; a negative
+                    // scale would only undo the fold that precedes it.
+                    finite_range(
+                        &format!("DSL orbit[{index}] kifs-fold scale"),
+                        *scale,
+                        1.000_001,
+                        4.0,
+                    )?;
+                    finite_vec3(&format!("DSL orbit[{index}] kifs-fold offset"), *offset)?;
+                    finite_vec3(
+                        &format!("DSL orbit[{index}] kifs-fold rotation"),
+                        *rotation_degrees,
+                    )?;
+                    if offset
+                        .iter()
+                        .any(|component| !(0.0..=4.0).contains(component))
+                        || rotation_degrees
+                            .iter()
+                            .any(|degrees| degrees.abs() > 3_600.0)
+                    {
+                        bail!(
+                            "DSL orbit[{index}] kifs-fold offset must be in 0..=4 and rotation in -3600..=3600"
+                        );
+                    }
+                }
+                OrbitTransform::MandelboxFold {
+                    start_iteration,
+                    stop_iteration,
+                    fold_limit,
+                    min_radius_squared,
+                    fixed_radius_squared,
+                    scale,
+                    rotation_degrees,
+                } => {
+                    validate_iteration_range(
+                        index,
+                        *start_iteration,
+                        *stop_iteration,
+                        schedule_length,
+                    )?;
+                    finite_range(
+                        &format!("DSL orbit[{index}] mandelbox-fold limit"),
+                        *fold_limit,
+                        1.0e-6,
+                        100.0,
+                    )?;
+                    finite_range(
+                        &format!("DSL orbit[{index}] mandelbox-fold minimum radius squared"),
+                        *min_radius_squared,
+                        1.0e-12,
+                        1.0e6,
+                    )?;
+                    finite_range(
+                        &format!("DSL orbit[{index}] mandelbox-fold fixed radius squared"),
+                        *fixed_radius_squared,
+                        1.0e-12,
+                        1.0e6,
+                    )?;
+                    if fixed_radius_squared <= min_radius_squared {
+                        bail!(
+                            "DSL orbit[{index}] mandelbox-fold fixed radius squared must exceed minimum radius squared"
+                        );
+                    }
+                    if !scale.is_finite() || !(1.000_001..=4.0).contains(&scale.abs()) {
+                        bail!(
+                            "DSL orbit[{index}] mandelbox-fold scale magnitude must be in 1.000001..=4.0"
+                        );
+                    }
+                    finite_vec3(
+                        &format!("DSL orbit[{index}] mandelbox-fold rotation"),
+                        *rotation_degrees,
+                    )?;
+                    if rotation_degrees
+                        .iter()
+                        .any(|degrees| degrees.abs() > 3_600.0)
+                    {
+                        bail!("DSL orbit[{index}] mandelbox-fold rotation must be in -3600..=3600");
+                    }
+                }
                 OrbitTransform::BoxFold { limit } => {
                     finite_range(
                         &format!("DSL orbit[{index}] box-fold limit"),
@@ -373,12 +577,15 @@ impl DslFractalConfig {
         let has_self_recurrence = self.orbit.iter().any(|transform| {
             matches!(
                 transform,
-                OrbitTransform::AmazingSurfFold { .. } | OrbitTransform::MandelboxJuliaFold { .. }
+                OrbitTransform::AmazingSurfFold { .. }
+                    | OrbitTransform::MandelboxJuliaFold { .. }
+                    | OrbitTransform::KifsFold { .. }
+                    | OrbitTransform::MandelboxFold { .. }
             )
         });
         if recurrence_count > 1 || (recurrence_count == 0 && !has_self_recurrence) {
             bail!(
-                "DSL orbit must contain one affine recurrence, unless an amazing-surf-fold supplies the recurrence"
+                "DSL orbit must contain one affine recurrence, unless a scheduled fold supplies the recurrence"
             );
         }
         self.material.validate()
@@ -387,6 +594,18 @@ impl DslFractalConfig {
     /// Generates the complete fractal shader fragment consumed by the common
     /// camera, shading, and ray-marching modules.
     pub fn generate_wgsl(&self) -> Result<String> {
+        self.generate_wgsl_for(false)
+    }
+
+    /// Generates the shader fragment for camera-relative evaluation: `map`
+    /// then takes positions relative to the camera and follows the camera's
+    /// own orbit, supplied each frame, instead of absolute coordinates.
+    pub fn generate_relative_wgsl(&self) -> Result<String> {
+        self.validate_relative()?;
+        self.generate_wgsl_for(true)
+    }
+
+    fn generate_wgsl_for(&self, relative: bool) -> Result<String> {
         self.validate()?;
         let mut source = String::with_capacity(8_192);
         writeln!(
@@ -400,6 +619,8 @@ impl DslFractalConfig {
                 OrbitTransform::Rotate { .. }
                     | OrbitTransform::AmazingSurfFold { .. }
                     | OrbitTransform::MandelboxJuliaFold { .. }
+                    | OrbitTransform::KifsFold { .. }
+                    | OrbitTransform::MandelboxFold { .. }
             )
         }) {
             source.push_str(
@@ -418,15 +639,19 @@ impl DslFractalConfig {
              \x20   distance: f32,\n\
              \x20   color_coordinate: f32,\n\
              }\n\n\
-             fn dsl_orbit(\n\
+             fn dsl_orbit_from(\n\
              \x20   p: vec3<f32>,\n\
+             \x20   start_z: vec3<f32>,\n\
+             \x20   start_derivative: f32,\n\
+             \x20   start_color: f32,\n\
+             \x20   start_iteration: u32,\n\
              \x20   iteration_limit: u32,\n\
              \x20   geometry_bailout: bool,\n\
              ) -> DslOrbitResult {\n\
-             \x20   var z = p;\n\
-             \x20   var derivative = 1.0;\n\
-             \x20   var auxiliary_color = 1.0;\n\
-             \x20   for (var iteration = 0u; iteration < MAX_DSL_ORBIT_ITERATIONS; iteration += 1u) {\n\
+             \x20   var z = start_z;\n\
+             \x20   var derivative = start_derivative;\n\
+             \x20   var auxiliary_color = start_color;\n\
+             \x20   for (var iteration = start_iteration; iteration < MAX_DSL_ORBIT_ITERATIONS; iteration += 1u) {\n\
              \x20       if iteration >= iteration_limit { break; }\n",
         );
 
@@ -588,6 +813,154 @@ impl DslFractalConfig {
                     )?;
                     source.push_str("        }\n");
                 }
+                OrbitTransform::KifsFold {
+                    start_iteration,
+                    stop_iteration,
+                    symmetry,
+                    scale,
+                    offset,
+                    rotation_degrees,
+                } => {
+                    writeln!(
+                        source,
+                        "        if scheduled_iteration >= {start_iteration}u && scheduled_iteration < {stop_iteration}u {{"
+                    )?;
+                    source.push_str("            color_bailout_allowed = true;\n");
+                    match symmetry {
+                        KifsSymmetry::Menger | KifsSymmetry::Octahedral => {
+                            source.push_str(
+                                "            z = abs(z);\n\
+                                 \x20           if z.x < z.y { z = z.yxz; auxiliary_color += 0.03; }\n\
+                                 \x20           if z.x < z.z { z = z.zyx; auxiliary_color += 0.05; }\n\
+                                 \x20           if z.y < z.z { z = z.xzy; auxiliary_color += 0.07; }\n",
+                            );
+                        }
+                        KifsSymmetry::Tetrahedral => {
+                            source.push_str(
+                                "            if z.x + z.y < 0.0 { z = vec3<f32>(-z.y, -z.x, z.z); auxiliary_color += 0.03; }\n\
+                                 \x20           if z.x + z.z < 0.0 { z = vec3<f32>(-z.z, z.y, -z.x); auxiliary_color += 0.05; }\n\
+                                 \x20           if z.y + z.z < 0.0 { z = vec3<f32>(z.x, -z.z, -z.y); auxiliary_color += 0.07; }\n",
+                            );
+                        }
+                    }
+                    for (axis, degrees) in [
+                        ([1.0, 0.0, 0.0], rotation_degrees[0]),
+                        ([0.0, 1.0, 0.0], rotation_degrees[1]),
+                        ([0.0, 0.0, 1.0], rotation_degrees[2]),
+                    ] {
+                        if degrees != 0.0 {
+                            writeln!(
+                                source,
+                                "            z = dsl_rotate(z, {}, {});",
+                                wgsl_vec3(axis),
+                                wgsl_float(degrees.to_radians()),
+                            )?;
+                        }
+                    }
+                    let shift = offset.map(|component| component * (scale - 1.0));
+                    writeln!(
+                        source,
+                        "            z = {} * z - {};",
+                        wgsl_float(*scale),
+                        wgsl_vec3(shift),
+                    )?;
+                    if *symmetry == KifsSymmetry::Menger {
+                        // The sponge's shift along the smallest axis, written
+                        // as a reflection. The set is the same and the map
+                        // stays continuous, which the distance estimate and
+                        // camera-relative evaluation both rely on.
+                        writeln!(
+                            source,
+                            "            if z.z < {} {{ z.z = {} - z.z; auxiliary_color += 0.2; }}",
+                            wgsl_float(-0.5 * shift[2]),
+                            wgsl_float(-shift[2]),
+                        )?;
+                    }
+                    writeln!(source, "            derivative *= {};", wgsl_float(*scale))?;
+                    source.push_str("        }\n");
+                }
+                OrbitTransform::MandelboxFold {
+                    start_iteration,
+                    stop_iteration,
+                    fold_limit,
+                    min_radius_squared,
+                    fixed_radius_squared,
+                    scale,
+                    rotation_degrees,
+                } => {
+                    let fold_limit = wgsl_float(*fold_limit);
+                    let minimum = wgsl_float(*min_radius_squared);
+                    let fixed = wgsl_float(*fixed_radius_squared);
+                    let scale = wgsl_float(*scale);
+                    writeln!(
+                        source,
+                        "        if scheduled_iteration >= {start_iteration}u && scheduled_iteration < {stop_iteration}u {{"
+                    )?;
+                    source.push_str("            color_bailout_allowed = true;\n");
+                    writeln!(
+                        source,
+                        "            auxiliary_color += select(0.0, 0.03, abs(z.x) > {fold_limit});"
+                    )?;
+                    writeln!(
+                        source,
+                        "            auxiliary_color += select(0.0, 0.05, abs(z.y) > {fold_limit});"
+                    )?;
+                    writeln!(
+                        source,
+                        "            auxiliary_color += select(0.0, 0.07, abs(z.z) > {fold_limit});"
+                    )?;
+                    writeln!(
+                        source,
+                        "            z = clamp(z, vec3<f32>(-{fold_limit}), vec3<f32>({fold_limit})) * 2.0 - z;"
+                    )?;
+                    writeln!(
+                        source,
+                        "            let box_radius_squared_{index} = dot(z, z);"
+                    )?;
+                    writeln!(
+                        source,
+                        "            if box_radius_squared_{index} < {minimum} {{"
+                    )?;
+                    writeln!(
+                        source,
+                        "                let box_factor_{index} = {fixed} / {minimum};"
+                    )?;
+                    writeln!(source, "                z *= box_factor_{index};")?;
+                    writeln!(source, "                derivative *= box_factor_{index};")?;
+                    source.push_str("                auxiliary_color += 0.2;\n");
+                    writeln!(
+                        source,
+                        "            }} else if box_radius_squared_{index} < {fixed} {{"
+                    )?;
+                    writeln!(
+                        source,
+                        "                let box_factor_{index} = {fixed} / max(box_radius_squared_{index}, 1.0e-12);"
+                    )?;
+                    writeln!(source, "                z *= box_factor_{index};")?;
+                    writeln!(source, "                derivative *= box_factor_{index};")?;
+                    source.push_str("                auxiliary_color += 0.2;\n");
+                    source.push_str("            }\n");
+                    for (axis, degrees) in [
+                        ([1.0, 0.0, 0.0], rotation_degrees[0]),
+                        ([0.0, 1.0, 0.0], rotation_degrees[1]),
+                        ([0.0, 0.0, 1.0], rotation_degrees[2]),
+                    ] {
+                        if degrees != 0.0 {
+                            writeln!(
+                                source,
+                                "            z = dsl_rotate(z, {}, {});",
+                                wgsl_vec3(axis),
+                                wgsl_float(degrees.to_radians()),
+                            )?;
+                        }
+                    }
+                    writeln!(source, "            z = {scale} * z + p;")?;
+                    writeln!(
+                        source,
+                        "            derivative = derivative * abs({scale}) + 1.0;"
+                    )?;
+                    source.push_str("        }\n");
+                }
                 OrbitTransform::BoxFold { limit } => {
                     let limit = wgsl_float(*limit);
                     writeln!(
@@ -681,8 +1054,22 @@ impl DslFractalConfig {
              \x20       length(z) / max(abs(derivative), 1.0e-12),\n\
              \x20       fract(auxiliary_color * 0.1),\n\
              \x20   );\n\
-             }\n\n\
-             fn map(p: vec3<f32>) -> f32 {\n\
+             }\n\n",
+        );
+        if relative {
+            self.generate_relative_orbit(&mut source)?;
+        } else {
+            source.push_str(
+                "fn dsl_orbit(p: vec3<f32>, iteration_limit: u32, geometry_bailout: bool) -> DslOrbitResult {\n\
+                 \x20   return dsl_orbit_from(p, p, 1.0, 1.0, 0u, iteration_limit, geometry_bailout);\n\
+                 }\n\n\
+                 fn dsl_world_position(p: vec3<f32>) -> vec3<f32> {\n\
+                 \x20   return p;\n\
+                 }\n\n",
+            );
+        }
+        source.push_str(
+            "fn map(p: vec3<f32>) -> f32 {\n\
              \x20   return dsl_orbit(p, uniforms.limits.x, true).distance;\n\
              }\n\n",
         );
@@ -748,7 +1135,7 @@ impl DslFractalConfig {
 
         writeln!(
             source,
-            "fn shade_fractal(\n    p: vec3<f32>,\n    ray_direction: vec3<f32>,\n    normal: vec3<f32>,\n    step_ratio: f32,\n    light: vec3<f32>,\n    direct_visibility: f32,\n    ambient_visibility: f32,\n) -> vec3<f32> {{\n    let world_palette = 0.5 + 0.5 * sin(p.z * {});\n    let basis = camera_basis();\n    let camera_relative_position = (p - uniforms.camera_target.xyz)\n        / max(uniforms.camera_lens.y, 1.0e-12);\n    let camera_palette_coordinate = dot(\n        camera_relative_position,\n        0.7 * basis.right + basis.up,\n    );\n    let camera_palette = 0.5 + 0.5 * sin(camera_palette_coordinate * {});\n    let position_palette = mix(world_palette, camera_palette, {});\n    let normal_palette = 0.5 + 0.5 * normal.z;\n    let spatial_palette = mix(position_palette, normal_palette, {});\n    let orbit_palette = dsl_orbit(p, {}u, false).color_coordinate;\n    let palette = fract(mix(spatial_palette, orbit_palette, {}) + {});\n    let base = dsl_surface_palette(palette);\n    let diffuse = max(dot(normal, light), 0.0);\n    let half_vector = safe_normalize(light - ray_direction, light);\n    let half_alignment = max(dot(normal, half_vector), 0.0);\n    let specular = pow(half_alignment, {});\n    let metallic_specular = pow(half_alignment, {});\n    let rim = pow(1.0 - max(dot(normal, -ray_direction), 0.0), 2.5);\n    let march_occlusion = mix(1.0, 0.76, clamp(step_ratio, 0.0, 1.0));\n    return max(\n        base * ({} * ambient_visibility + {} * diffuse * direct_visibility) * march_occlusion\n            + {} * specular * {} * direct_visibility\n            + base * metallic_specular * {} * direct_visibility\n            + base * rim * {} * ambient_visibility,\n        vec3<f32>(0.0),\n    );\n}}\n",
+            "fn shade_fractal(\n    p: vec3<f32>,\n    ray_direction: vec3<f32>,\n    normal: vec3<f32>,\n    step_ratio: f32,\n    light: vec3<f32>,\n    direct_visibility: f32,\n    ambient_visibility: f32,\n) -> vec3<f32> {{\n    let world_palette = 0.5 + 0.5 * sin(dsl_world_position(p).z * {});\n    let basis = camera_basis();\n    let camera_relative_position = (p - uniforms.camera_target.xyz)\n        / max(uniforms.camera_lens.y, 1.0e-12);\n    let camera_palette_coordinate = dot(\n        camera_relative_position,\n        0.7 * basis.right + basis.up,\n    );\n    let camera_palette = 0.5 + 0.5 * sin(camera_palette_coordinate * {});\n    let position_palette = mix(world_palette, camera_palette, {});\n    let normal_palette = 0.5 + 0.5 * normal.z;\n    let spatial_palette = mix(position_palette, normal_palette, {});\n    let orbit_palette = dsl_orbit(p, {}u, false).color_coordinate;\n    let palette = fract(mix(spatial_palette, orbit_palette, {}) + {});\n    let base = dsl_surface_palette(palette);\n    let diffuse = max(dot(normal, light), 0.0);\n    let half_vector = safe_normalize(light - ray_direction, light);\n    let half_alignment = max(dot(normal, half_vector), 0.0);\n    let specular = pow(half_alignment, {});\n    let metallic_specular = pow(half_alignment, {});\n    let rim = pow(1.0 - max(dot(normal, -ray_direction), 0.0), 2.5);\n    let march_occlusion = mix(1.0, 0.76, clamp(step_ratio, 0.0, 1.0));\n    return max(\n        base * ({} * ambient_visibility + {} * diffuse * direct_visibility) * march_occlusion\n            + {} * specular * {} * direct_visibility\n            + base * metallic_specular * {} * direct_visibility\n            + base * rim * {} * ambient_visibility,\n        vec3<f32>(0.0),\n    );\n}}\n",
             wgsl_float(material.color_frequency),
             wgsl_float(material.color_frequency),
             wgsl_float(material.camera_palette_weight),
@@ -773,9 +1160,48 @@ impl DslFractalConfig {
         )?;
         writeln!(
             source,
-            "fn apply_fractal_atmosphere(surface: vec3<f32>, sky: vec3<f32>, travel: f32) -> vec3<f32> {{\n    let fog = 1.0 - exp(-{} * travel * travel);\n    return mix(surface, sky, fog);\n}}",
+            "fn apply_fractal_atmosphere(surface: vec3<f32>, sky: vec3<f32>, travel: f32) -> vec3<f32> {{\n    let fog = 1.0 - exp(-{} * travel * travel);\n    return mix(surface, sky, fog);\n}}\n",
             wgsl_float(material.fog_density),
         )?;
+
+        // The weight of one near miss depends only on the angle the ray
+        // cleared the surface by, so silhouettes glow alike at every scale.
+        if material.glow_strength > 0.0 {
+            writeln!(
+                source,
+                "fn fractal_glow_weight(distance: f32, travel: f32) -> f32 {{\n    return exp(-distance / max({} * travel, 1.0e-30));\n}}\n",
+                wgsl_float(material.glow_width),
+            )?;
+        } else {
+            source.push_str(
+                "fn fractal_glow_weight(distance: f32, travel: f32) -> f32 {\n    return 0.0;\n}\n\n",
+            );
+        }
+
+        source.push_str(
+            "fn fractal_haze(color: vec3<f32>, travel: f32, hit: bool, glow: f32) -> vec3<f32> {\n    var result = color;\n    var opacity = 1.0;\n",
+        );
+        if material.haze_distance > 0.0 {
+            writeln!(
+                source,
+                "    let haze_depth = travel / max({} * uniforms.camera_lens.z, 1.0e-30);\n    opacity = 1.0 - exp(-haze_depth * haze_depth);\n    if !hit {{ opacity = 1.0; }}\n    let near_tint = mix({}, {}, clamp(opacity * 2.0, 0.0, 1.0));\n    let tint = mix(near_tint, {}, clamp(opacity * 2.0 - 1.0, 0.0, 1.0));\n    result = mix(result, tint, opacity);",
+                wgsl_float(material.haze_distance),
+                wgsl_vec3(material.haze_near_color),
+                wgsl_vec3(material.haze_mid_color),
+                wgsl_vec3(material.haze_far_color),
+            )?;
+        }
+        if material.glow_strength > 0.0 {
+            // The glow is light scattered by the haze, so it shows where
+            // haze lies behind the silhouette and not on clear foreground.
+            writeln!(
+                source,
+                "    result += {} * ({} * (1.0 - exp(-glow)) * opacity);",
+                wgsl_vec3(material.glow_color),
+                wgsl_float(material.glow_strength),
+            )?;
+        }
+        source.push_str("    return result;\n}\n");
         Ok(())
     }
 }
@@ -871,7 +1297,14 @@ impl DslMaterial {
             512.0,
         )?;
         finite_range("DSL material rim_strength", self.rim_strength, 0.0, 16.0)?;
-        finite_range("DSL material fog_density", self.fog_density, 0.0, 100.0)
+        finite_range("DSL material fog_density", self.fog_density, 0.0, 100.0)?;
+        finite_range("DSL material haze_distance", self.haze_distance, 0.0, 1.0e6)?;
+        validate_color("DSL material haze_near_color", self.haze_near_color)?;
+        validate_color("DSL material haze_mid_color", self.haze_mid_color)?;
+        validate_color("DSL material haze_far_color", self.haze_far_color)?;
+        finite_range("DSL material glow_strength", self.glow_strength, 0.0, 64.0)?;
+        finite_range("DSL material glow_width", self.glow_width, 1.0e-4, 1.0)?;
+        validate_color("DSL material glow_color", self.glow_color)
     }
 }
 
@@ -887,8 +1320,12 @@ fn validate_color(name: &str, color: [f32; 3]) -> Result<()> {
 }
 
 fn validate_iteration_range(index: usize, start: u32, stop: u32, iterations: u32) -> Result<()> {
-    if start >= stop || stop > iterations {
-        bail!("DSL orbit[{index}] iteration range must satisfy start < stop <= fractal iterations");
+    // A range may also be left open at `OPEN_STOP_ITERATION`, so that the
+    // iteration limit can grow with zoom depth without the fold switching off.
+    if start >= stop || (stop > iterations && stop != OPEN_STOP_ITERATION) {
+        bail!(
+            "DSL orbit[{index}] iteration range must satisfy start < stop <= fractal iterations, or stop at {OPEN_STOP_ITERATION} to stay open"
+        );
     }
     Ok(())
 }
@@ -911,11 +1348,11 @@ fn squared_length(value: [f32; 3]) -> f32 {
     value.iter().map(|component| component * component).sum()
 }
 
-fn wgsl_float(value: f32) -> String {
+pub(crate) fn wgsl_float(value: f32) -> String {
     format!("{value:.9e}")
 }
 
-fn wgsl_vec3(value: [f32; 3]) -> String {
+pub(crate) fn wgsl_vec3(value: [f32; 3]) -> String {
     format!(
         "vec3<f32>({}, {}, {})",
         wgsl_float(value[0]),

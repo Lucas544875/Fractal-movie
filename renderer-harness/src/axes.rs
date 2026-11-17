@@ -40,6 +40,8 @@ axis_enum!(
         AmazingSurf => "amazing-surf",
         MandelboxJulia => "mandelbox-julia",
         AmazingHybrid => "amazing-hybrid",
+        Kifs => "kifs",
+        KifsBox => "kifs-box",
     }
 );
 
@@ -59,6 +61,7 @@ axis_enum!(
         Orbit => "orbit",
         MultiDive => "multi-dive",
         Flyover => "flyover",
+        Flythrough => "flythrough",
     }
 );
 
@@ -193,6 +196,18 @@ pub fn classify_family(fractal: &FractalConfig) -> FormulaFamily {
     let box_julia = has(|op| matches!(op, OrbitTransform::MandelboxJuliaFold { .. }));
     let julia = has(|op| matches!(op, OrbitTransform::ScaleAddConstant { .. }));
     let rotated = has(|op| matches!(op, OrbitTransform::Rotate { .. }));
+    let kifs = has(|op| matches!(op, OrbitTransform::KifsFold { .. }));
+    let scheduled_box = has(|op| matches!(op, OrbitTransform::MandelboxFold { .. }));
+
+    // A kaleidoscopic fold reshapes every level it touches, so it names the
+    // family whatever it is combined with.
+    if kifs {
+        return if scheduled_box {
+            FormulaFamily::KifsBox
+        } else {
+            FormulaFamily::Kifs
+        };
+    }
 
     match (amazing, box_julia) {
         (true, true) => FormulaFamily::AmazingHybrid,

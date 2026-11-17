@@ -435,11 +435,13 @@ mod tests {
         };
 
         // In the portfolio dive and orbit are used; once flyover is retired,
-        // multi-dive is the only unused motion.
+        // multi-dive and flythrough are the unused motions.
         let first = mandate.redraw(&ledger, AxisId::Motion).unwrap();
         assert_eq!(first.value, "multi-dive");
         assert_eq!(mandate.assigned_value(AxisId::Light), Some("backlit"));
         assert_eq!(mandate.retired.len(), 1);
+        let unused = mandate.redraw(&ledger, AxisId::Motion).unwrap();
+        assert_eq!(unused.value, "flythrough");
 
         // Then the least used of the remaining values: orbit, used once.
         let second = mandate.redraw(&ledger, AxisId::Motion).unwrap();

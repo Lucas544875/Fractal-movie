@@ -312,7 +312,7 @@ fn motion_feasible(
     }
     for location in &index.selected {
         let record = &index.locations[location];
-        // The automatic paths search from outside a bounding sphere.
+        // The automatic paths need a shape with an outside.
         if !record.bounded {
             continue;
         }
@@ -812,7 +812,8 @@ beats:
         );
         let one_beat = &VALID_BRIEF[..VALID_BRIEF.find("  - text: Closing").unwrap()];
         let found = errors(&mut state, one_beat);
-        assert!(found.contains("1 beats; it must have 2 to"), "{found}");
+        // A single take is one beat.
+        assert!(!found.contains("beats; it must have"), "{found}");
         // Motions outside the vocabulary are rejected by the schema itself.
         let found = errors(
             &mut state,

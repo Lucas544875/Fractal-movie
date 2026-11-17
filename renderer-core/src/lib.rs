@@ -3,9 +3,11 @@
 mod animation;
 mod config;
 mod dsl;
+mod flythrough;
 mod fractal;
 mod path;
 mod precision;
+mod relative;
 mod renderer;
 mod scene;
 mod scene_file;
@@ -22,9 +24,10 @@ pub use config::{
     RenderSettings, SoftShadowConfig, ToneMappingConfig, ToneMappingOperator,
 };
 pub use dsl::{
-    DslFractalConfig, DslMaterial, DslPaletteStop, MAX_DSL_COLOR_ITERATIONS, MAX_DSL_PALETTE_STOPS,
-    MAX_DSL_TRANSFORMS, OrbitTransform,
+    DslFractalConfig, DslMaterial, DslPaletteStop, KifsSymmetry, MAX_DSL_COLOR_ITERATIONS,
+    MAX_DSL_PALETTE_STOPS, MAX_DSL_TRANSFORMS, OPEN_STOP_ITERATION, OrbitTransform,
 };
+pub use flythrough::{FlythroughDirection, FlythroughPath, FlythroughSummary};
 pub use fractal::{DistanceEstimator, HighPrecisionDistanceEstimator};
 pub use path::{
     ExponentialDivePath, MultiTargetDivePath, PathTarget, SurfaceFlyoverPath, TargetOrbitPath,

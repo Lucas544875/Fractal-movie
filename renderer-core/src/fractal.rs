@@ -1,4 +1,6 @@
-use crate::{DslFractalConfig, MandelboxConfig, MandelbulbConfig, OrbitTransform, Qf32, QfVec3};
+use crate::{
+    DslFractalConfig, KifsSymmetry, MandelboxConfig, MandelbulbConfig, OrbitTransform, Qf32, QfVec3,
+};
 
 /// CPU-side counterpart of a shader distance estimator.
 ///
@@ -84,10 +86,24 @@ impl DistanceEstimator for MandelboxConfig {
 
 impl DistanceEstimator for DslFractalConfig {
     fn distance_estimate(&self, point: [f64; 3]) -> f64 {
-        let mut z = point;
-        let mut derivative = 1.0_f64;
+        self.continue_orbit(point, point, 1.0, 0)
+    }
+}
 
-        for iteration in 0..self.iterations {
+impl DslFractalConfig {
+    /// Runs the orbit of `point` from a given state and iteration to the
+    /// iteration limit and returns the distance estimate.
+    pub(crate) fn continue_orbit(
+        &self,
+        point: [f64; 3],
+        start: [f64; 3],
+        start_derivative: f64,
+        start_iteration: u32,
+    ) -> f64 {
+        let mut z = start;
+        let mut derivative = start_derivative;
+
+        for iteration in start_iteration..self.iterations {
             let scheduled_iteration = self
                 .orbit_period
                 .map_or(iteration, |period| iteration % period);
@@ -163,6 +179,110 @@ impl DistanceEstimator for DslFractalConfig {
                         }
                         let scale = f64::from(*scale);
                         z = add(scale_vector(z, scale), constant.map(f64::from));
+                        derivative = derivative * scale.abs() + 1.0;
+                    }
+                    OrbitTransform::KifsFold {
+                        start_iteration,
+                        stop_iteration,
+                        symmetry,
+                        scale,
+                        offset,
+                        rotation_degrees,
+                    } => {
+                        if scheduled_iteration < *start_iteration
+                            || scheduled_iteration >= *stop_iteration
+                        {
+                            continue;
+                        }
+                        match symmetry {
+                            KifsSymmetry::Menger | KifsSymmetry::Octahedral => {
+                                z = z.map(f64::abs);
+                                if z[0] < z[1] {
+                                    z.swap(0, 1);
+                                }
+                                if z[0] < z[2] {
+                                    z.swap(0, 2);
+                                }
+                                if z[1] < z[2] {
+                                    z.swap(1, 2);
+                                }
+                            }
+                            KifsSymmetry::Tetrahedral => {
+                                if z[0] + z[1] < 0.0 {
+                                    z = [-z[1], -z[0], z[2]];
+                                }
+                                if z[0] + z[2] < 0.0 {
+                                    z = [-z[2], z[1], -z[0]];
+                                }
+                                if z[1] + z[2] < 0.0 {
+                                    z = [z[0], -z[2], -z[1]];
+                                }
+                            }
+                        }
+                        for (axis, degrees) in [
+                            ([1.0, 0.0, 0.0], rotation_degrees[0]),
+                            ([0.0, 1.0, 0.0], rotation_degrees[1]),
+                            ([0.0, 0.0, 1.0], rotation_degrees[2]),
+                        ] {
+                            if degrees != 0.0 {
+                                z = rotate(z, axis, f64::from(degrees).to_radians());
+                            }
+                        }
+                        // The shift is formed in f32 first so that it is the
+                        // same constant the generated shader embeds.
+                        let shift = offset.map(|component| f64::from(component * (scale - 1.0)));
+                        let scale = f64::from(*scale);
+                        z = [
+                            scale * z[0] - shift[0],
+                            scale * z[1] - shift[1],
+                            scale * z[2] - shift[2],
+                        ];
+                        if *symmetry == KifsSymmetry::Menger && z[2] < -0.5 * shift[2] {
+                            z[2] = -shift[2] - z[2];
+                        }
+                        derivative *= scale;
+                    }
+                    OrbitTransform::MandelboxFold {
+                        start_iteration,
+                        stop_iteration,
+                        fold_limit,
+                        min_radius_squared,
+                        fixed_radius_squared,
+                        scale,
+                        rotation_degrees,
+                    } => {
+                        if scheduled_iteration < *start_iteration
+                            || scheduled_iteration >= *stop_iteration
+                        {
+                            continue;
+                        }
+                        let limit = f64::from(*fold_limit);
+                        for component in &mut z {
+                            *component = component.clamp(-limit, limit) * 2.0 - *component;
+                        }
+                        let radius_squared = dot(z, z);
+                        let minimum = f64::from(*min_radius_squared);
+                        let fixed = f64::from(*fixed_radius_squared);
+                        if radius_squared < minimum {
+                            let factor = fixed / minimum;
+                            z = scale_vector(z, factor);
+                            derivative *= factor;
+                        } else if radius_squared < fixed {
+                            let factor = fixed / radius_squared.max(1.0e-24);
+                            z = scale_vector(z, factor);
+                            derivative *= factor;
+                        }
+                        for (axis, degrees) in [
+                            ([1.0, 0.0, 0.0], rotation_degrees[0]),
+                            ([0.0, 1.0, 0.0], rotation_degrees[1]),
+                            ([0.0, 0.0, 1.0], rotation_degrees[2]),
+                        ] {
+                            if degrees != 0.0 {
+                                z = rotate(z, axis, f64::from(degrees).to_radians());
+                            }
+                        }
+                        let scale = f64::from(*scale);
+                        z = add(scale_vector(z, scale), point);
                         derivative = derivative * scale.abs() + 1.0;
                     }
                     OrbitTransform::BoxFold { limit } => {
@@ -288,7 +408,7 @@ fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     ]
 }
 
-fn rotate(value: [f64; 3], axis_value: [f64; 3], radians: f64) -> [f64; 3] {
+pub(crate) fn rotate(value: [f64; 3], axis_value: [f64; 3], radians: f64) -> [f64; 3] {
     let axis_length_squared = dot(axis_value, axis_value);
     if axis_length_squared < 1.0e-24 {
         return value;

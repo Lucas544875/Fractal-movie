@@ -13,6 +13,8 @@ struct RayHit {
     steps: u32,
     hit: bool,
     epsilon: f32,
+    // Light gathered from the surfaces the ray passed close to and missed.
+    glow: f32,
 }
 
 @vertex
@@ -27,15 +29,15 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     return output;
 }
 
-fn ray_hit_epsilon(travel: f32, pixel_angle: f32) -> f32 {
-    let epsilon = uniforms.render_params.x;
+fn ray_hit_epsilon(travel: f32, pixel_angle: f32, min_epsilon: f32) -> f32 {
+    let epsilon = max(uniforms.render_params.x, min_epsilon);
     return clamp(
         max(
             epsilon,
             travel * pixel_angle * uniforms.render_params.w,
         ),
         epsilon,
-        0.1,
+        max(0.1, epsilon),
     );
 }
 
@@ -45,12 +47,19 @@ fn trace_ray(
     max_distance: f32,
     max_steps: u32,
     pixel_angle: f32,
+    // Secondary rays inherit the precision their surface was found with;
+    // a finer test would find that same surface again.
+    min_epsilon: f32,
 ) -> RayHit {
     let epsilon = uniforms.render_params.x;
     var travel = 0.0;
     var steps = 0u;
     var hit = false;
     var hit_epsilon = epsilon;
+    var glow = 0.0;
+    var previous_distance = 1.0e30;
+    var previous_travel = 0.0;
+    var approaching = false;
 
     for (var step = 0u; step < MAX_RAY_STEPS; step += 1u) {
         if step >= max_steps {
@@ -61,17 +70,24 @@ fn trace_ray(
         if distance != distance {
             break;
         }
-        hit_epsilon = ray_hit_epsilon(travel, pixel_angle);
+        hit_epsilon = ray_hit_epsilon(travel, pixel_angle, min_epsilon);
         if distance < hit_epsilon {
             hit = true;
             break;
         }
+        // The distance turning from falling to rising marks a near miss.
+        if approaching && distance > previous_distance {
+            glow += fractal_glow_weight(previous_distance, previous_travel);
+        }
+        approaching = distance < previous_distance;
+        previous_distance = distance;
+        previous_travel = travel;
         travel += max(distance * uniforms.render_params.z, epsilon * 0.25);
         if travel > max_distance {
             break;
         }
     }
-    return RayHit(origin + direction * travel, direction, travel, steps, hit, hit_epsilon);
+    return RayHit(origin + direction * travel, direction, travel, steps, hit, hit_epsilon, glow);
 }
 
 fn trace_secondary_visibility(
@@ -81,12 +97,23 @@ fn trace_secondary_visibility(
     surface_epsilon: f32,
     max_distance: f32,
     max_steps: u32,
+    // Half-angle of the cone the ray stands for. Occluders thinner than the
+    // cone at their distance are passed by, which is what a sampled area
+    // light would average them to, without the noise of sampling them.
+    cone_angle: f32,
 ) -> f32 {
     if max_steps == 0u {
         return 1.0;
     }
     let origin = position + normal * max(surface_epsilon * 4.0, uniforms.render_params.x * 4.0);
-    let result = trace_ray(origin, direction, max_distance, max_steps, 0.0);
+    let result = trace_ray(
+        origin,
+        direction,
+        max_distance,
+        max_steps,
+        cone_angle,
+        surface_epsilon,
+    );
     return select(1.0, 0.0, result.hit);
 }
 
@@ -119,6 +146,7 @@ fn sample_camera_ray(
         uniforms.render_params.y,
         uniforms.limits.y,
         pixel_angle,
+        0.0,
     );
 }
 
@@ -128,7 +156,7 @@ fn shade_sample(pixel: vec2<f32>, sample_index: u32) -> vec3<f32> {
     let primary_direction = primary.direction;
     let sky = fractal_background(primary_direction);
     if !primary.hit {
-        return sky;
+        return fractal_haze(sky, primary.travel, false, primary.glow);
     }
 
     let normal = estimate_normal(primary.position, primary.epsilon);
@@ -146,6 +174,7 @@ fn shade_sample(pixel: vec2<f32>, sample_index: u32) -> vec3<f32> {
             primary.epsilon,
             uniforms.soft_shadow.y,
             uniforms.quality_limits.z,
+            uniforms.soft_shadow.x,
         );
     }
 
@@ -159,6 +188,7 @@ fn shade_sample(pixel: vec2<f32>, sample_index: u32) -> vec3<f32> {
             primary.epsilon,
             uniforms.ambient_occlusion.x,
             uniforms.quality_limits.y,
+            0.0,
         );
         ambient_visibility = mix(1.0, unoccluded, uniforms.ambient_occlusion.y);
     }
@@ -189,6 +219,7 @@ fn shade_sample(pixel: vec2<f32>, sample_index: u32) -> vec3<f32> {
             uniforms.reflection.z,
             min(uniforms.quality_limits.w, MAX_SECONDARY_RAY_STEPS),
             0.0,
+            primary.epsilon * 0.5,
         );
         var reflected_color = fractal_background(reflected_direction);
         if reflected.hit {
@@ -213,7 +244,12 @@ fn shade_sample(pixel: vec2<f32>, sample_index: u32) -> vec3<f32> {
         surface = mix(surface, reflected_color, uniforms.reflection.x);
     }
 
-    return apply_fractal_atmosphere(surface, sky, primary.travel);
+    return fractal_haze(
+        apply_fractal_atmosphere(surface, sky, primary.travel),
+        primary.travel,
+        true,
+        primary.glow,
+    );
 }
 
 @fragment
