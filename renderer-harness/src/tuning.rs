@@ -226,12 +226,19 @@ pub struct ShotlistRules {
     /// Deep-end clearance, relative to the shape's radius, below which a
     /// flythrough renders in camera-relative precision.
     pub flythrough_relative_depth: f64,
+    /// Haze distance, in local scales, that a flythrough gets before the
+    /// look chooses one, and keeps if the look sets none.
+    pub flythrough_haze_distance: f32,
     /// Properties out of role, scale regime, and motion in which
     /// consecutive cuts must differ.
     pub min_cut_differences: usize,
     /// Smallest ratio of camera clearance to subject distance along a
     /// route.
     pub min_clearance_ratio: f64,
+    /// Samples per pixel of the animatic. The legibility limits were
+    /// calibrated on antialiased frames; one sample would count aliasing of
+    /// intricate shapes as fine detail.
+    pub animatic_samples_per_pixel: u32,
 }
 
 impl Default for ShotlistRules {
@@ -244,8 +251,10 @@ impl Default for ShotlistRules {
             max_flythrough_seconds: 240.0,
             flythrough_attempts: 8,
             flythrough_relative_depth: 1.0e-4,
+            flythrough_haze_distance: 30.0,
             min_cut_differences: 2,
             min_clearance_ratio: 0.02,
+            animatic_samples_per_pixel: 4,
         }
     }
 }
@@ -257,6 +266,13 @@ pub struct StoryboardRules {
     /// Duration a beat's motion is planned with before the shot list fixes
     /// real durations.
     pub beat_seconds: f64,
+    /// Duration a flythrough beat is planned with. A flythrough is a whole
+    /// film in one take; planned as a short cut it would end before the
+    /// camera settles on the whole shape.
+    pub flythrough_seconds: f64,
+    /// Frames drawn per beat when the brief has a flythrough, evenly spaced
+    /// from first to last, so the passage between the ends can be judged.
+    pub flythrough_frames: usize,
     /// Width of storyboard frames.
     pub width: u32,
     pub samples_per_pixel: u32,
@@ -268,6 +284,8 @@ impl Default for StoryboardRules {
     fn default() -> Self {
         Self {
             beat_seconds: 8.0,
+            flythrough_seconds: 60.0,
+            flythrough_frames: 5,
             width: 320,
             samples_per_pixel: 2,
             min_beats: 1,
@@ -334,6 +352,11 @@ pub struct ProofRules {
     pub clip_width: u32,
     /// Seconds of each cut, around its middle, shown in the proof clip.
     pub clip_seconds_per_cut: f64,
+    /// Excerpts, each `clip_seconds_per_cut` long and spread evenly from
+    /// first frame to last, of a cut longer than an ordinary cut may be (a
+    /// one-take flythrough). Its middle alone would not show where it
+    /// starts or ends.
+    pub long_cut_excerpts: u32,
     /// Bitrate a delivery platform is assumed to give a 1920x1080 stream;
     /// scaled by pixel count for other sizes.
     pub delivery_kbps_1080p: u32,
@@ -350,6 +373,7 @@ impl Default for ProofRules {
             region_fraction: 0.5,
             clip_width: 960,
             clip_seconds_per_cut: 1.0,
+            long_cut_excerpts: 5,
             delivery_kbps_1080p: 8000,
             min_delivery_ssim: 0.90,
             compare_every: 3,
@@ -511,6 +535,10 @@ impl Tuning {
                 self.shotlist.min_clearance_ratio,
             ),
             (
+                "shotlist flythrough_haze_distance",
+                f64::from(self.shotlist.flythrough_haze_distance),
+            ),
+            (
                 "classification slow_cut_seconds",
                 self.classification.slow_cut_seconds - self.classification.medium_cut_seconds,
             ),
@@ -547,6 +575,16 @@ impl Tuning {
             bail!("legibility negative-space limits must be ordered within 0..=1");
         }
 
+        if !(1..=fractal_renderer_core::MAX_SAMPLES_PER_PIXEL)
+            .contains(&self.shotlist.animatic_samples_per_pixel)
+        {
+            bail!("shotlist animatic_samples_per_pixel is out of range");
+        }
+
+        if !(2..=8).contains(&self.proof.long_cut_excerpts) {
+            bail!("proof long_cut_excerpts must be 2..=8");
+        }
+
         let storyboard = &self.storyboard;
         if !(storyboard.beat_seconds.is_finite()
             && (self.shotlist.min_cut_seconds..=self.shotlist.max_cut_seconds)
@@ -555,8 +593,15 @@ impl Tuning {
             || storyboard.samples_per_pixel == 0
             || storyboard.samples_per_pixel > fractal_renderer_core::MAX_SAMPLES_PER_PIXEL
             || storyboard.min_beats == 0
+            || !(storyboard.flythrough_seconds.is_finite()
+                && (self.shotlist.min_cut_seconds..=self.shotlist.max_flythrough_seconds)
+                    .contains(&storyboard.flythrough_seconds))
+            || !(2..=8).contains(&storyboard.flythrough_frames)
         {
-            bail!("storyboard settings are out of range; beat_seconds must be a valid cut length");
+            bail!(
+                "storyboard settings are out of range; beat_seconds must be a valid cut length, \
+                 flythrough_seconds a valid flythrough length, and flythrough_frames 2..=8"
+            );
         }
 
         let look = &self.look;

@@ -111,7 +111,7 @@ pub fn check_beats(
                     &viewpoint,
                     &record.survey(),
                     &beat.motion,
-                    tuning.storyboard.beat_seconds,
+                    beat.motion.beat_seconds(&tuning.storyboard),
                     &PROBE_FORMAT,
                     "beat",
                     tuning,

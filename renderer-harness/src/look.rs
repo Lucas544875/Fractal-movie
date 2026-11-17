@@ -305,10 +305,27 @@ pub fn grade(look: &Look, cut_id: u32, cut: &LoadedScene, tuning: &Tuning) -> Re
 
     let material_ignored = match &mut config.fractal {
         FractalConfig::Dsl(dsl) => {
+            let compiled = dsl.material.clone();
             dsl.material = look.material.to_material(
                 shape::subject_fog_density(subject_distance, look.atmosphere.fog) as f32,
                 &look.atmosphere,
             );
+            if matches!(
+                cut.animation.as_ref().map(|animation| &animation.path),
+                Some(AnimationPath::Flythrough(_))
+            ) {
+                // A flythrough crosses many scales: fog fixed in world units
+                // would be right at one of them only, while the haze follows
+                // the camera's scale. Without a haze of the look's own, the
+                // neutral one the cut was planned with stays.
+                dsl.material.fog_density = 0.0;
+                if look.atmosphere.haze.is_none() {
+                    dsl.material.haze_distance = compiled.haze_distance;
+                    dsl.material.haze_near_color = compiled.haze_near_color;
+                    dsl.material.haze_mid_color = compiled.haze_mid_color;
+                    dsl.material.haze_far_color = compiled.haze_far_color;
+                }
+            }
             false
         }
         FractalConfig::Mandelbulb(_) | FractalConfig::Mandelbox(_) => true,
@@ -547,6 +564,8 @@ pub struct LookReport {
     pub light: Option<Light>,
     pub hue_problems: Vec<String>,
     pub clipping_problems: Vec<String>,
+    /// Cuts whose detail is too fine to read in the graded preview.
+    pub detail_problems: Vec<String>,
     pub gpu_seconds: f64,
 }
 
@@ -717,6 +736,25 @@ pub fn preview(
         .save_png(&production.path(SHEET_FILE))?;
     report.sheet = Some(SHEET_FILE);
 
+    // Fine detail depends on light, shadow, and haze, so it is judged here
+    // rather than on the neutral animatic: by the mean of each cut's frames.
+    let max_high_frequency = tuning.legibility.max_high_frequency;
+    for (chunk, cut) in frames.chunks(3).zip(&manifest.cuts) {
+        let mean = chunk
+            .iter()
+            .map(|frame| legibility(frame).high_frequency_ratio)
+            .sum::<f32>()
+            / chunk.len() as f32;
+        if mean > max_high_frequency {
+            report.detail_problems.push(format!(
+                "cut {}: too much fine detail to read (high-frequency ratio {mean:.2}; at most \
+                 {max_high_frequency}); soften it with haze, occlusion, or shadow, or choose \
+                 another location",
+                cut.id
+            ));
+        }
+    }
+
     let palette = classify::palette(&frames, &tuning.classification);
     report.palette = Some(palette);
     for (label, frame) in stills.iter().map(|(label, _)| label).zip(&frames) {
@@ -784,6 +822,12 @@ pub fn preview(
         "clipping",
         &report.clipping_problems,
         "no frame is blown out or crushed",
+    )?;
+    record(
+        state,
+        "detail",
+        &report.detail_problems,
+        "every cut's detail reads in the graded preview",
     )?;
 
     fs::create_dir_all(production.path("compiled/graded"))

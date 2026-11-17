@@ -146,6 +146,16 @@ impl MotionSpec {
         }
     }
 
+    /// Duration a beat with this motion is planned with before the shot
+    /// list fixes real durations.
+    #[must_use]
+    pub fn beat_seconds(&self, rules: &crate::tuning::StoryboardRules) -> f64 {
+        match self {
+            Self::Flythrough { .. } => rules.flythrough_seconds,
+            _ => rules.beat_seconds,
+        }
+    }
+
     /// A representative specification of each motion, used to test whether a
     /// shape supports that motion at all.
     #[must_use]
@@ -341,6 +351,22 @@ pub fn compile(
                 // A fixed normal step would be coarse deep down; the
                 // projected pixel footprint sets it instead.
                 dsl.normal_epsilon = 1.0e-12;
+                // Without haze every scale down the pores is drawn at once
+                // and deep frames read as noise. A haze in the sky's colour
+                // keeps the form legible before the look chooses its own.
+                let material = &mut dsl.material;
+                if material.haze_distance <= 0.0 {
+                    let sky = [0, 1, 2].map(|axis| {
+                        (material.background_bottom[axis] + material.background_top[axis]) * 0.5
+                    });
+                    material.haze_distance = rules.flythrough_haze_distance;
+                    material.haze_near_color = sky;
+                    material.haze_mid_color = sky;
+                    material.haze_far_color = sky;
+                }
+                // Distances in a flythrough span many scales; the haze,
+                // which follows the camera's scale, replaces fixed fog.
+                material.fog_density = 0.0;
             }
             // Beyond what absolute f32 coordinates resolve.
             if depth < tuning.shotlist.flythrough_relative_depth {

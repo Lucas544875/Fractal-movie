@@ -236,7 +236,8 @@ pub fn run(
     // Frames kept for comparison with the delivery encode: clip frame index,
     // cut position, and the frame at half size.
     let mut kept: Vec<(usize, usize, Frame)> = Vec::new();
-    let mut excerpts: Vec<Range<usize>> = Vec::with_capacity(finals.len());
+    // Per cut, the clip frames of each of its excerpts.
+    let mut excerpts: Vec<Vec<Range<usize>>> = Vec::with_capacity(finals.len());
     let mut clip_frames = 0usize;
     for (position, (final_cut, scene)) in finals.iter().enumerate() {
         let mut base = scene.config.clone();
@@ -249,44 +250,63 @@ pub fn run(
         }
         let renderer = renderer.as_ref().expect("renderer was just initialised");
 
-        let excerpt = excerpt(
-            final_cut.frame_count,
-            format.fps,
-            tuning.proof.clip_seconds_per_cut,
-        );
-        let start = clip_frames;
-        let mut history: Vec<Vec<f32>> = Vec::with_capacity(2);
+        let windows = if f64::from(final_cut.frame_count)
+            > tuning.shotlist.max_cut_seconds * f64::from(format.fps) + 1.0
+        {
+            spread_excerpts(
+                final_cut.frame_count,
+                format.fps,
+                tuning.proof.clip_seconds_per_cut,
+                tuning.proof.long_cut_excerpts,
+            )
+        } else {
+            vec![excerpt(
+                final_cut.frame_count,
+                format.fps,
+                tuning.proof.clip_seconds_per_cut,
+            )]
+        };
+        let mut shown = Vec::with_capacity(windows.len());
         let (mut flicker_sum, mut flicker_count) = (0.0f64, 0u32);
-        for index in excerpt {
-            let (config, time_seconds) = frame_config(&base, scene.animation.as_ref(), index)?;
-            let image = renderer
-                .render_frame_with_config(&config, index, time_seconds)
-                .with_context(|| format!("could not render cut {} frame {index}", final_cut.id))?;
-            gpu_seconds += image.gpu_time().as_secs_f64();
-            clip.write_frame(image.pixels())?;
-            delivery.write_frame(image.pixels())?;
+        for window in windows {
+            let start = clip_frames;
+            // Flicker compares neighbours, never frames across a jump.
+            let mut history: Vec<Vec<f32>> = Vec::with_capacity(2);
+            for index in window {
+                let (config, time_seconds) = frame_config(&base, scene.animation.as_ref(), index)?;
+                let image = renderer
+                    .render_frame_with_config(&config, index, time_seconds)
+                    .with_context(|| {
+                        format!("could not render cut {} frame {index}", final_cut.id)
+                    })?;
+                gpu_seconds += image.gpu_time().as_secs_f64();
+                clip.write_frame(image.pixels())?;
+                delivery.write_frame(image.pixels())?;
 
-            let half = Frame::from_rgba8(image.width(), image.height(), image.pixels())?.reduced(2);
-            let luma = flicker_luma(&half);
-            if let [before, middle] = history.as_slice() {
-                flicker_sum += f64::from(flicker(before, middle, &luma));
-                flicker_count += 1;
+                let half =
+                    Frame::from_rgba8(image.width(), image.height(), image.pixels())?.reduced(2);
+                let luma = flicker_luma(&half);
+                if let [before, middle] = history.as_slice() {
+                    flicker_sum += f64::from(flicker(before, middle, &luma));
+                    flicker_count += 1;
+                }
+                if history.len() == 2 {
+                    history.remove(0);
+                }
+                history.push(luma);
+                if clip_frames.is_multiple_of(tuning.proof.compare_every as usize) {
+                    kept.push((clip_frames, position, half));
+                }
+                clip_frames += 1;
             }
-            if history.len() == 2 {
-                history.remove(0);
-            }
-            history.push(luma);
-            if clip_frames.is_multiple_of(tuning.proof.compare_every as usize) {
-                kept.push((clip_frames, position, half));
-            }
-            clip_frames += 1;
+            shown.push(start..clip_frames);
         }
         cuts[position].flicker = if flicker_count == 0 {
             0.0
         } else {
             (flicker_sum / f64::from(flicker_count)) as f32
         };
-        excerpts.push(start..clip_frames);
+        excerpts.push(shown);
     }
     clip.finish()?;
     delivery.finish()?;
@@ -309,9 +329,8 @@ pub fn run(
                 *count += 1;
                 next_kept += 1;
             }
-            for (position, excerpt) in excerpts.iter().enumerate() {
-                let middle = excerpt.start + excerpt.len() / 2;
-                if [excerpt.start, middle, excerpt.end - 1].contains(&index) {
+            for (position, windows) in excerpts.iter().enumerate() {
+                if still_frames(windows).contains(&index) {
                     let shown = stills
                         .iter()
                         .filter(|(label, _)| label.starts_with(&format!("{}-", cuts[position].id)))
@@ -342,7 +361,12 @@ pub fn run(
         .iter()
         .map(|(label, rgba)| Cell { label, rgba })
         .collect();
-    sheet::compose(&cells, 3, width as usize / 2, height as usize / 2)?
+    let columns = excerpts
+        .iter()
+        .map(|windows| still_frames(windows).len())
+        .max()
+        .unwrap_or(3);
+    sheet::compose(&cells, columns, width as usize / 2, height as usize / 2)?
         .save_png(&production.path(SHEET_FILE))?;
 
     let compression_problems: Vec<String> = cuts
@@ -457,6 +481,36 @@ fn excerpt(frame_count: u32, fps: u32, seconds: f64) -> Range<u32> {
     start..start + wanted
 }
 
+/// Frames of a long cut shown in the proof clip: `count` windows of
+/// `seconds` each, spread evenly from its first frame to its last.
+fn spread_excerpts(frame_count: u32, fps: u32, seconds: f64, count: u32) -> Vec<Range<u32>> {
+    let wanted = ((seconds * f64::from(fps)).round() as u32).clamp(1, frame_count);
+    let span = frame_count - wanted;
+    let count = count.max(2);
+    (0..count)
+        .map(|step| {
+            let start = (f64::from(span) * f64::from(step) / f64::from(count - 1)).round() as u32;
+            start..start + wanted
+        })
+        .collect()
+}
+
+/// Clip frames shown on the sheet: the first, middle, and last frame of a
+/// single excerpt, or the middle frame of each of several.
+fn still_frames(windows: &[Range<usize>]) -> Vec<usize> {
+    match windows {
+        [window] => vec![
+            window.start,
+            window.start + window.len() / 2,
+            window.end - 1,
+        ],
+        windows => windows
+            .iter()
+            .map(|window| window.start + window.len() / 2)
+            .collect(),
+    }
+}
+
 /// Bitrate a delivery platform is assumed to give a stream of this size.
 fn delivery_kbps(width: u32, height: u32, rules: &ProofRules) -> u32 {
     let share = f64::from(width) * f64::from(height) / (1920.0 * 1080.0);
@@ -561,6 +615,13 @@ mod tests {
         assert_eq!(excerpt(20, 30, 1.0), 0..20);
         assert_eq!(excerpt(1, 30, 1.0), 0..1);
         assert_eq!(excerpt(100, 60, 0.5), 35..65);
+        assert_eq!(
+            spread_excerpts(2701, 30, 1.0, 5),
+            vec![0..30, 668..698, 1336..1366, 2003..2033, 2671..2701]
+        );
+        let single = vec![Range { start: 10, end: 40 }];
+        assert_eq!(still_frames(&single), vec![10, 25, 39]);
+        assert_eq!(still_frames(&[0..30, 30..60]), vec![15, 45]);
     }
 
     #[test]

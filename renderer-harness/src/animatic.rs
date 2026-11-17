@@ -77,7 +77,8 @@ pub fn run(
         );
     }
     let manifest = Manifest::load_current(production)?;
-    let limits = production.load_tuning()?.legibility;
+    let tuning = production.load_tuning()?;
+    let limits = tuning.legibility;
     if budget.design_remaining_seconds() <= 0.0 {
         bail!("the design GPU budget of this production is exhausted");
     }
@@ -97,7 +98,7 @@ pub fn run(
     let height =
         (u64::from(format.height) * u64::from(width) / u64::from(format.width)) as u32 & !1;
     let settings = Settings {
-        samples_per_pixel: 1,
+        samples_per_pixel: tuning.shotlist.animatic_samples_per_pixel,
         ambient_occlusion_steps: 0,
         soft_shadow_steps: 0,
         reflection_steps: 0,
@@ -275,12 +276,9 @@ fn problems(mean: &Legibility, flicker: f32, limits: &LegibilityLimits) -> Vec<S
             limits.min_negative_space * 100.0
         ));
     }
-    if mean.high_frequency_ratio > limits.max_high_frequency {
-        problems.push(format!(
-            "too much fine detail (high-frequency ratio {:.2}; at most {})",
-            mean.high_frequency_ratio, limits.max_high_frequency
-        ));
-    }
+    // Fine detail is judged on the look preview: in this neutral grey,
+    // without shadows or occlusion, every facet catches its own light and an
+    // intricate shape measures far busier than it will look.
     if flicker > limits.max_flicker {
         problems.push(format!(
             "shimmers in motion (flicker {flicker:.4}; at most {})",
@@ -343,7 +341,10 @@ mod tests {
                 .join("\n")
                 .contains("detail fills")
         );
-        check(|value| value.high_frequency_ratio = 0.6, 0.0, "fine detail");
+        // Fine detail is the look preview's to judge, not the animatic's.
+        let mut busy = readable();
+        busy.high_frequency_ratio = 0.6;
+        assert!(problems(&busy, 0.0, &LegibilityLimits::default()).is_empty());
         check(
             |_| {},
             LegibilityLimits::default().max_flicker * 2.0,
@@ -361,10 +362,6 @@ mod tests {
         let found = problems(&readable(), 0.005, &strict).join("\n");
         assert!(
             found.contains("shimmers") && found.contains("at most 0.001"),
-            "{found}"
-        );
-        assert!(
-            found.contains("fine detail") && found.contains("at most 0.05"),
             "{found}"
         );
         assert!(problems(&readable(), 0.005, &LegibilityLimits::default()).is_empty());

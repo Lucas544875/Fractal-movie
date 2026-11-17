@@ -13,7 +13,7 @@ use crate::{
     axes::Motion,
     brief::{self, BRIEF_FILE, PROBE_FORMAT},
     budget::Budget,
-    cut,
+    cut::{self, MotionSpec},
     gpu::{GpuOptions, apply_settings, frame_config},
     production::Production,
     quality::Settings,
@@ -101,6 +101,18 @@ pub fn run(
         pixel_epsilon_multiplier: 1.0,
     };
 
+    // A one-take flythrough rests on what happens between its ends, so a
+    // brief with one shows evenly spaced frames of every beat.
+    let has_flythrough = brief
+        .beats
+        .iter()
+        .any(|beat| matches!(beat.motion, MotionSpec::Flythrough { .. }));
+    let frames_per_beat = if has_flythrough {
+        rules.flythrough_frames
+    } else {
+        2
+    };
+
     let mut renderer: Option<Renderer> = None;
     let mut gpu_seconds = 0.0;
     let mut cells: Vec<(String, Vec<u8>)> = Vec::new();
@@ -119,12 +131,20 @@ pub fn run(
             &viewpoint,
             &record.survey(),
             &beat.motion,
-            rules.beat_seconds,
+            beat.motion.beat_seconds(&rules),
             &PROBE_FORMAT,
             "beat",
             &tuning,
         )
         .with_context(|| format!("beat {number} cannot be compiled"))?;
+        // Kept out of the critic's reach, for looking into a beat by hand.
+        let compiled = production.path("compiled/storyboard");
+        fs::create_dir_all(&compiled).context("could not create compiled/storyboard")?;
+        fs::write(
+            compiled.join(format!("beat-{number:02}.yaml")),
+            scene.to_yaml()?,
+        )
+        .with_context(|| format!("could not save the scene of beat {number}"))?;
         let mut base = scene.config.clone();
         base.render.width = width;
         base.render.height = height;
@@ -138,7 +158,12 @@ pub fn run(
             .animation
             .as_ref()
             .map_or(0, |animation| animation.frame_count - 1);
-        for (side, index) in [0, last].into_iter().enumerate() {
+        let indices: Vec<u32> = (0..frames_per_beat)
+            .map(|step| {
+                (f64::from(last) * step as f64 / (frames_per_beat - 1) as f64).round() as u32
+            })
+            .collect();
+        for (side, index) in indices.into_iter().enumerate() {
             let (mut config, time_seconds) = frame_config(&base, scene.animation.as_ref(), index)?;
             apply_settings(&mut config, &settings);
             let image = renderer
@@ -161,7 +186,7 @@ pub fn run(
         .iter()
         .map(|(label, rgba)| Cell { label, rgba })
         .collect();
-    sheet::compose(&cells, 2, width as usize, height as usize)?
+    sheet::compose(&cells, frames_per_beat, width as usize, height as usize)?
         .save_png(&production.path(SHEET_FILE))?;
 
     let report = StoryboardReport {

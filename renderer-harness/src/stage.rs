@@ -101,7 +101,7 @@ impl Stage {
                 "legibility",
                 CRITIC_GATE,
             ],
-            Self::Look => &["schema", "hue-count", "clipping", CRITIC_GATE],
+            Self::Look => &["schema", "hue-count", "clipping", "detail", CRITIC_GATE],
             Self::Proof => &["budget", "compression", "flicker", CRITIC_GATE],
             Self::Production => &["frames-complete"],
             Self::Encode => &["qc"],
